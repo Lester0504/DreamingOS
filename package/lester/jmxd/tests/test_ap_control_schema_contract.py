@@ -140,9 +140,9 @@ def test_phase0_schema_does_not_store_private_keys_or_plaintext_secrets() -> Non
     ac_db = read_required(SRC / "ac/ac_db.c")
     apd_db = read_required(SRC / "apd/apd_db.c")
     schema = c_strings(ac_db + "\n" + apd_db).lower()
+    apd_v3_start = schema.find("create table apd_node_identity_v3")
+    apd_v3 = schema[apd_v3_start:apd_v3_start + 500]
     forbidden_columns = (
-        "private_key blob",
-        "private_key text",
         "ca_private_key",
         "plaintext_password",
         "plain_password",
@@ -150,8 +150,11 @@ def test_phase0_schema_does_not_store_private_keys_or_plaintext_secrets() -> Non
     )
     found = [column for column in forbidden_columns if column in schema]
     assert not found, f"AP control schema persists forbidden secret material: {found}"
+    assert apd_v3_start >= 0 and "private_key" not in apd_v3, (
+        "APD schema v3 must keep the node private key outside SQLite"
+    )
     assert "token_hash" in schema, "pairing tokens may only be represented by a strong hash"
-    for token in ("cipher_text", "nonce", "key_id"):
+    for token in ("ciphertext", "nonce", "tag", "key_id"):
         assert token in schema, f"AC secret envelope is missing: {token}"
 
 

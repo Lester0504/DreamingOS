@@ -1,3 +1,5 @@
+import { mount as mountLxc } from '/static/desktop/lxc/lxc.js?v=20261008-lxc-08';
+import { mount as mountDocker } from '/static/desktop/docker/docker.js?v=20261005-docker-05';
 const VERSION = '20260810-front-release-01';
 const ENDPOINT = '/api/v1/container_service';
 const REFRESH_MS = 5000;
@@ -10,6 +12,8 @@ export function mount(context = {}) {
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (char) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[char]));
   const stage = root?.closest('.console-stage');
   const mode = /(?:container-lxc|\/container\/lxc)/.test(`${context.item?.id || ''} ${context.path || ''}`) ? 'lxc' : 'docker';
+  if (mode === 'docker') return mountDocker({ ...context, root, host: 'traditional' });
+  if (mode === 'lxc') return mountLxc({ ...context, root, host: 'traditional' });
 
   const state = {
     mounted: true,

@@ -13,12 +13,14 @@ import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text
 FLOWD = ROOT / "src" / "flowd"
 HEADER = (FLOWD / "flowd_nft_apply.h").read_text(encoding="utf-8")
 DB = (FLOWD / "flowd_db.c").read_text(encoding="utf-8")
 UBUS = (FLOWD / "flowd_ubus.c").read_text(encoding="utf-8")
 RUNTIME = (FLOWD / "flowd_runtime_contract.h").read_text(encoding="utf-8")
-WEBD = (ROOT / "src" / "webd" / "jmx_app_api.c").read_text(encoding="utf-8")
+WEBD = webd_dispatch_text()
 
 
 def test_no_shell_and_strict_transaction_contract() -> None:
@@ -82,7 +84,8 @@ def test_handler_job_and_capability_boundaries() -> None:
         '"nft_revision_sentinel_only"',
     ):
         assert capability in RUNTIME
-    assert '"flow_engine_apply",\n                           json_object_new_boolean(0)' in RUNTIME
+    assert '"flow_engine_apply",\n                           json_object_new_boolean(apply_available)' in RUNTIME
+    assert '"flow_engine_apply_ready",\n                           json_object_new_boolean(apply_available)' in RUNTIME
 
 
 def _fake_nft() -> str:

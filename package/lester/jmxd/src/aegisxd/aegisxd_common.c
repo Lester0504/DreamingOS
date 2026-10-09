@@ -3,6 +3,8 @@
 
 sqlite3 *g_aegisxd_config_db;
 sqlite3 *g_aegisxd_db;
+char g_aegisxd_db_path[AEGISXD_MAX_PATH] = AEGISXD_DB_PATH;
+int g_aegisxd_storage_frozen;
 struct ubus_context *g_aegisxd_ubus;
 struct blob_buf g_aegisxd_blob;
 

@@ -3,11 +3,12 @@
 #define __JMX_DB_H__
 
 #include <json-c/json.h>
+#include "jmx_dataset_path.h"
 #include <stddef.h>
 #include <stdint.h>
 #include <sqlite3.h>
 
-#define JMX_DB_PATH_DEFAULT "/etc/dreamingwrt/dreamingwrt.db"
+#define JMX_DB_PATH_DEFAULT jmx_dataset_path("core")
 #define JMX_DB_DIR_DEFAULT  "/etc/dreamingwrt"
 
 sqlite3 *jmx_db_handle(void);
@@ -28,6 +29,8 @@ struct json_object *jmx_db_api_clients_observe(struct json_object *req);
 struct json_object *jmx_db_api_client_override(struct json_object *req);
 struct json_object *jmx_db_api_client_get(struct json_object *req);
 struct json_object *jmx_db_api_clients_list(struct json_object *req);
+/* Worker-only DB snapshot.  Does not inspect runtime client_list/conntrack. */
+struct json_object *jmx_db_api_clients_list_worker(struct json_object *req);
 struct json_object *jmx_db_api_client_identity(struct json_object *req);
 
 /* How long an offline client stays in the default inventory. Randomized MACs
@@ -82,6 +85,12 @@ void jmx_db_add_wan_cumulative_bytes(struct json_object *out, const char *wan_id
                                      int64_t device_tx_bytes);
 
 int jmx_db_write_wan_health(const char *name, int latency_ms, int loss_pct);
+/* Read the newest wan_health_samples row for an interface name. Returns 0 and
+ * fills out when a sample exists, -1 when the table is missing or empty. Never
+ * logs "no such table": the caller uses the return value to decide whether
+ * health data is available. */
+int jmx_db_read_wan_health_latest(const char *name, int *latency_ms,
+                                  int *loss_pct, int64_t *ts);
 /*
  * Group many small related writes into one transaction. Nesting-safe: only the
  * outermost begin/end pair issues BEGIN/COMMIT. Pass commit=0 to roll back.
@@ -146,6 +155,9 @@ struct json_object *jmx_db_api_audit_urls(struct json_object *req);
 struct json_object *jmx_db_api_audit_apps(struct json_object *req);
 struct json_object *jmx_db_api_audit_status(struct json_object *req);
 struct json_object *jmx_db_api_line_load(struct json_object *req);
+/* Worker-only line-load projection. Uses independent read-only SQLite handles
+ * and never touches UCI, ubus, conntrack, route policy, or WAN session writes. */
+struct json_object *jmx_db_api_line_load_worker(struct json_object *req);
 
 
 /* line_health: WAN profile / session / health bucket */
@@ -175,6 +187,10 @@ void jmx_db_update_wan_health_bucket(const char *wan_id, const char *ifname,
                                       int64_t tx_rate, int online);
 int  jmx_db_flush_health_buckets(void);
 struct json_object *jmx_db_api_line_health(struct json_object *req);
+/* Worker-only line-health projection. Opens independent read-only SQLite
+ * handles and never reads the uloop-owned DB/netconfig singletons or mutable
+ * WAN profile/session caches. */
+struct json_object *jmx_db_api_line_health_worker(struct json_object *req);
 struct json_object *jmx_db_api_ipv6_load(struct json_object *req);
 struct json_object *jmx_db_api_vpn_status(struct json_object *req);
 struct json_object *jmx_db_api_client_detail(struct json_object *req);

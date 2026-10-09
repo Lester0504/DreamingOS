@@ -6,10 +6,12 @@
 # own `location = /` redirect, so this file does not affect HTTPS.
 # The :12517 LuCI server block also includes luci.locations by name.
 #
-# Only the exact root path is matched; /api/v1/*, /app/*, /login/*, and
-# every other prefix continue to work unchanged.
+# Only domain names are upgraded to HTTPS. Literal IPv4/IPv6 access stays on
+# HTTP so recovery remains possible when a self-signed certificate is not yet
+# trusted. Only the exact root path is matched; every other prefix is unchanged.
 
 location = / {
+	if ($host ~ "^[0-9]{1,3}(\\.[0-9]{1,3}){3}$") { return 302 /app/; }
+	if ($host ~ ":") { return 302 /app/; }
 	return 302 https://$host/app/;
 }
-

@@ -1,0 +1,118 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/wifi-management.css">
+  <style>
+    :root { --app-page-gutter-block:14px; --app-page-gutter-inline:14px; --app-page-gap:16px; --app-radius-card:20px; --app-radius-panel:18px; --app-radius-control:12px; --app-radius-compact:8px; --dwrt-kit-radius:20px; --dwrt-kit-text:#172033; --dwrt-kit-muted:#667085; --dwrt-kit-liquid-surface:rgba(255,255,255,.28); --dwrt-kit-liquid-backdrop:blur(3px) saturate(130%); --dwrt-glass-edge:rgba(255,255,255,.5); --dwrt-glass-shadow:0 12px 28px rgba(0,0,0,.10); }
+    * { box-sizing:border-box; }
+    html, body, .console-stage { width:100%; height:100%; margin:0; }
+    body { color:#172033; background:linear-gradient(135deg,#b9d4e5,#e6c3a0); font:13px/1.45 system-ui,sans-serif; }
+    .console-stage { display:grid; }
+    .route-preview { height:100%; }
+  </style>
+</head>
+<body>
+  <div class="console-stage"><main id="routePreview" class="route-preview"></main></div>
+  <script type="module">
+    const now = Math.floor(Date.now() / 1000);
+    const basePolicy = () => ({
+      revision: 1, weak_rssi_dbm: -75, minimum_candidate_gain_db: 10,
+      candidate_min_rssi_dbm: -82, decision_min_interval_sec: 15,
+      post_roam_cooldown_sec: 20, max_btm_attempts_per_hour: 6,
+      deauth_after_btm_failures: 2, deauth_cooldown_sec: 60,
+      domain_action_rate_limit: 12, reassoc_block_enabled: false,
+      reassoc_block_sec: 10, reassoc_block_scope: 'ap',
+      steering_preference: 'stability', high_band_steer_enabled: false,
+      force_disassoc_on_reject: false, lower_band_block_enabled: false
+    });
+    const baseDomains = () => [
+      { domain_id:'domain-a', name:'客厅与书房', revision:1, neighbor_report_enabled:true, bss_transition_enabled:true, deauth_enabled:true },
+      { domain_id:'domain-b', name:'卧室', revision:1, neighbor_report_enabled:true, bss_transition_enabled:true, deauth_enabled:true }
+    ];
+    const config = { capabilities:{ wifi:true, bands:['2g','5g','6g'], save_config:false, apply_config:false }, local_wifi:{ available:true, phy_count:1, wireless_present:true, reason:'fixture_read_only_local' }, radios:[{ id:'radio-fixture', name:'phy0', band:'5g', channel:36, width:80, tx_power:20, online:true, supported_widths:[20,40,80] }], ssids:[], speed_limits:[], global:{} };
+    let scenario = 'multi';
+    let policy = basePolicy();
+    let putCount = 0;
+    const writes = [];
+    const jsonResponse = (data, ok=true, status=200) => ({ ok, status, text:async () => JSON.stringify(ok ? { ok:true, data } : { ok:false, ...data }) });
+    const errorResponse = (status, code, reason, message) => jsonResponse({ code, reason, message }, false, status);
+    const domainsFor = () => {
+      if (scenario === 'none') return [];
+      const domains = baseDomains();
+      if (scenario === 'single') return domains.slice(0, 1);
+      if (scenario === 'capability') return [{ ...domains[0], neighbor_report_enabled:false }];
+      return domains;
+    };
+    const readPolicy = () => ({ ...policy });
+    window.__ROAMING_WRITES = writes;
+    window.fetch = async (input, init={}) => {
+      const url = new URL(String(input), location.href);
+      const method = String(init.method || 'GET').toUpperCase();
+      if (url.pathname === '/api/v1/wifi/config') return jsonResponse(config);
+      if (url.pathname === '/api/v1/ac/roaming-domains') {
+        if (scenario === 'unavailable') return errorResponse(503, 'ac_unavailable', 'ac_unavailable', 'AC unavailable');
+        if (scenario === 'read403') return errorResponse(403, 'forbidden', 'read_forbidden', 'forbidden');
+        return jsonResponse({ items:domainsFor(), observed_at:now });
+      }
+      if (url.pathname === '/api/v1/ac/roaming-policy' && method === 'GET') {
+        if (scenario === 'read403') return errorResponse(403, 'forbidden', 'read_forbidden', 'forbidden');
+        if (!url.searchParams.get('domain_id') || !domainsFor().some(item => item.domain_id === url.searchParams.get('domain_id'))) return errorResponse(400, 'invalid_domain', 'domain_required', 'domain required');
+        return jsonResponse({ policy:readPolicy() });
+      }
+      if (url.pathname === '/api/v1/ac/roaming-policy' && method === 'PUT') {
+        const body = JSON.parse(init.body || '{}');
+        writes.push(body);
+        putCount += 1;
+        if (scenario === 'readonly') return errorResponse(403, 'forbidden', 'write_forbidden', 'role viewer cannot write');
+        if (scenario === 'bad400') return errorResponse(400, 'capability_unavailable', 'btm_unavailable', 'BTM unavailable');
+        if (scenario === 'conflict' && putCount === 1) {
+          policy = { ...policy, revision:2 };
+          return errorResponse(409, 'revision_conflict', 'revision_conflict', 'revision changed');
+        }
+        policy = { ...policy, ...body, revision: scenario === 'success' ? 2 : policy.revision };
+        delete policy.domain_id; delete policy.base_revision; delete policy.updated_by;
+        return jsonResponse({ policy:readPolicy() });
+      }
+      return errorResponse(404, 'not_found', 'fixture_not_found', 'not found');
+    };
+    await import('../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.js');
+    const { mount } = await import('../../files/www/dreamingwrt/plugins/native/wifi-management.js');
+    const ui = {
+      floatingSavebarMarkup: ({ visible, busy, message }) => visible ? `<div data-dwrt-savebar><span>${message || ''}</span><button type="button" data-dwrt-savebar-discard ${busy ? 'disabled' : ''}>放弃</button><button type="button" data-dwrt-savebar-save ${busy ? 'disabled' : ''}>保存</button></div>` : ''
+    };
+    const utils = { escapeHtml:value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character])) };
+    const context = root => ({ root, item:{ id:'wifi-config' }, ui, utils });
+    let root = document.getElementById('routePreview');
+    let instance = mount(context(root));
+    window.ROAMING_FIXTURE = {
+      async ready() {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (root.querySelector('[data-wifi-config-tab="extensions"]')) return true;
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        return false;
+      },
+      async setScenario(next) {
+        instance?.unmount?.();
+        scenario = next;
+        policy = basePolicy();
+        putCount = 0;
+        writes.length = 0;
+        const nextRoot = document.createElement('main');
+        nextRoot.id = 'routePreview';
+        nextRoot.className = 'route-preview';
+        root.replaceWith(nextRoot);
+        root = nextRoot;
+        instance = mount(context(root));
+        await this.ready();
+        await root.querySelector('[data-wifi-config-tab="extensions"]').click();
+        await new Promise(resolve => setTimeout(resolve, 100));
+        return true;
+      }
+    };
+  </script>
+</body>
+</html>

@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "logd_internal.h"
+#include "../wifi/wifi_failure_event.h"
 
 static void logd_event_id(char *out, size_t out_len, int64_t ts)
 {
@@ -214,7 +215,8 @@ static void logd_promote_field_if_missing(struct json_object *body,
     json_object_object_add(body, key, json_object_new_string(value));
 }
 
-static void logd_event_row_json(struct json_object *arr, sqlite3_stmt *st)
+static void logd_event_row_json(struct json_object *arr, sqlite3_stmt *st,
+                                const char *locale)
 {
     struct json_object *o = json_object_new_object();
     const char *detail_s = logd_sqlite_text(st, 13, "{}");
@@ -242,6 +244,7 @@ static void logd_event_row_json(struct json_object *arr, sqlite3_stmt *st)
     json_object_object_add(o, "first_seen", json_object_new_int64(sqlite3_column_int64(st, 16)));
     json_object_object_add(o, "last_seen", json_object_new_int64(sqlite3_column_int64(st, 17)));
     json_object_object_add(o, "count", json_object_new_int(sqlite3_column_int(st, 18)));
+    dw_event_payload_present(o, locale);
     json_object_array_add(arr, o);
 }
 
@@ -292,20 +295,36 @@ static int logd_notifyd_enqueue(struct json_object *body)
     struct blob_buf b = {};
     struct logd_notifyd_reply reply = {};
     struct json_object *enqueued_o = NULL;
+    struct ubus_context *ctx = NULL;
     const char *s;
     uint32_t id;
     int rc;
     int notified = 0;
 
-    if (!g_logd_ubus || !body)
+    if (!body)
         return 0;
-    if (ubus_lookup_id(g_logd_ubus, "dreamingwrt.notifyd", &id) != UBUS_STATUS_OK)
+    /*
+     * Use an EPHEMERAL private ubus context, NOT the shared g_logd_ubus.
+     * logd_add_event runs inside the event_add ubus dispatch on g_logd_ubus, so
+     * a nested synchronous invoke on that same context is reentrant and never
+     * reaches notifyd (the enqueue silently fails, notified stays 0, no outbox
+     * entry). A separate-client context (mirrors otad_db temporary_ctx and the
+     * AC ac_report_device_event fix) makes this a plain outbound call. Collectors
+     * (uloop-timer origin, g_logd_ubus idle) already worked; this repairs every
+     * event_add-origin producer (AC device events, webd audit, ...).
+     */
+    ctx = ubus_connect(NULL);
+    if (!ctx)
         return 0;
+    if (ubus_lookup_id(ctx, "dreamingwrt.notifyd", &id) != UBUS_STATUS_OK) {
+        ubus_free(ctx);
+        return 0;
+    }
     s = json_object_to_json_string(body);
     blob_buf_init(&b, 0);
     if (s && s[0])
         blobmsg_add_json_from_string(&b, s);
-    rc = ubus_invoke(g_logd_ubus, id, "enqueue", b.head,
+    rc = ubus_invoke(ctx, id, "enqueue", b.head,
                      logd_notifyd_enqueue_cb, &reply, LOGD_NOTIFYD_TIMEOUT_MS);
     blob_buf_free(&b);
     if (rc == UBUS_STATUS_OK && reply.seen && reply.json && logd_json_bool(reply.json, "ok", 0)) {
@@ -313,9 +332,13 @@ static int logd_notifyd_enqueue(struct json_object *body)
             notified = json_object_get_int(enqueued_o) > 0;
         else
             notified = 1;
+        /* A Wi-Fi retry may find its notification already durably queued. */
+        if (!notified && dw_wifi_failure_event(logd_json_str(body, "event", "")))
+            notified = logd_json_int(reply.json, "deduped", 0) > 0;
     }
     if (reply.json)
         json_object_put(reply.json);
+    ubus_free(ctx);
     return notified;
 }
 
@@ -384,46 +407,48 @@ struct logd_notify_event_contract {
     const char *source_category;
     const char *source_event;
     const char *event_code;
-    const char *notify_category;
-    const char *producer;
-    const char *default_severity;
-    const char *recovery_event;
-    const char *recovers_event;
 };
 
 static const struct logd_notify_event_contract logd_notify_event_contracts[] = {
-    { "resource", "threshold_exceeded", "SYSTEM_RESOURCE_THRESHOLD", "SYSTEM",
-      "dreamingwrt.logd.collector.resource", "warning", "", "" },
-    { "port", "link_down", "PORT_LINK_DOWN", "INTERNET_AND_WAN",
-      "dreamingwrt.logd.collector.port", "warning", "PORT_LINK_UP", "" },
-    { "port", "link_up", "PORT_LINK_UP", "INTERNET_AND_WAN",
-      "dreamingwrt.logd.collector.port", "notice", "PORT_LINK_DOWN", "PORT_LINK_DOWN" },
-    { "dhcp", "lease_assigned", "CLIENT_CONNECTED_WIRED", "CLIENT_DEVICES",
-      "dreamingwrt.logd.collector.dhcp_lease", "notice", "CLIENT_DISCONNECTED", "" },
-    { "dhcp", "lease_released", "CLIENT_DISCONNECTED", "CLIENT_DEVICES",
-      "dreamingwrt.logd.collector.dhcp_lease", "notice", "CLIENT_CONNECTED_WIRED", "CLIENT_CONNECTED_WIRED" },
-    { "dhcp", "dhcp_log", "DHCP_EVENT", "CLIENT_DEVICES",
-      "dreamingwrt.logd.collector.dhcp_lease", "notice", "", "" },
-    { "wan", "wan_log", "WAN_EVENT", "INTERNET_AND_WAN",
-      "dreamingwrt.logd.collector.system_log", "notice", "", "" },
-    { "pppoe", "pppoe_log", "PPPOE_EVENT", "INTERNET_AND_WAN",
-      "dreamingwrt.logd.collector.system_log", "notice", "", "" },
-    { "audit", "auth_log", "ADMIN_AUTH_EVENT", "ADMIN",
-      "dreamingwrt.logd.collector.system_log", "warning", "", "" },
-    { "network.wan", "wan.failover.down", "WAN_FAILOVER_ACTIVE", "INTERNET_AND_WAN",
-      "dreamingwrt.routed.health", "warning", "WAN_FAILBACK", "" },
-    { "network.wan", "wan.failover.recovered", "WAN_FAILBACK", "INTERNET_AND_WAN",
-      "dreamingwrt.routed.health", "notice", "WAN_FAILOVER_ACTIVE", "WAN_FAILOVER_ACTIVE" },
-    { "network.wan", "wan.quality.degraded", "WAN_QUALITY_DEGRADED", "INTERNET_AND_WAN",
-      "dreamingwrt.routed.health", "warning", "WAN_QUALITY_RECOVERED", "" },
-    { "network.wan", "wan.quality.critical", "WAN_QUALITY_CRITICAL", "INTERNET_AND_WAN",
-      "dreamingwrt.routed.health", "critical", "WAN_QUALITY_RECOVERED", "" },
-    { "network.wan", "wan.penalty.recovering", "WAN_PENALTY_RECOVERING", "INTERNET_AND_WAN",
-      "dreamingwrt.routed.health", "notice", "WAN_QUALITY_RECOVERED", "" },
-    { "network.wan", "wan.quality.recovered", "WAN_QUALITY_RECOVERED", "INTERNET_AND_WAN",
-      "dreamingwrt.routed.health", "notice", "WAN_QUALITY_DEGRADED", "WAN_QUALITY_DEGRADED" },
-    { "network.wan", "wan.quality.critical_recovered", "WAN_QUALITY_RECOVERED", "INTERNET_AND_WAN",
-      "dreamingwrt.routed.health", "notice", "WAN_QUALITY_CRITICAL", "WAN_QUALITY_CRITICAL" },
+    { "resource", "threshold_exceeded", "SYSTEM_RESOURCE_THRESHOLD" },
+    { "port", "link_down", "PORT_LINK_DOWN" },
+    { "port", "link_up", "PORT_LINK_UP" },
+    { "port", "counter_errors", "PORT_TX_RX_ERRORS" },
+    { "port", "counter_drops", "PORT_DROPPED_TRAFFIC" },
+    { "topology.device", "device_offline", "DEVICE_OFFLINE" },
+    { "topology.device", "device_restored", "DEVICE_RESTORED" },
+    { "DEVICES", "AP_COMMIT_ERROR", "AP_COMMIT_ERROR" },
+    { "DEVICES", "AP_UNPAIR_FAILED", "AP_UNPAIR_FAILED" },
+    { "DEVICES", "AC_TRANSPORT_ERROR", "AC_TRANSPORT_ERROR" },
+    { "DEVICES", "AC_PKI_ERROR", "AC_PKI_ERROR" },
+    { "ipam", "ip_conflict", "CLIENT_IP_CONFLICT" },
+    { "security", "suricata_detection", "SECURITY_DETECTION" },
+    { "system", "application_update_failed", "APPLICATION_UPDATE_FAILED" },
+    { "kernel", "out_of_memory", "KERNEL_OUT_OF_MEMORY" },
+    { "kernel", "kernel_panic", "KERNEL_PANIC" },
+    { "kernel", "thermal_shutdown", "KERNEL_THERMAL_SHUTDOWN" },
+    { "system", "service_worker_restarted", "SERVICE_WORKER_RESTARTED" },
+    { "dhcp", "lease_assigned", "DHCP_LEASE_ASSIGNED" },
+    { "dhcp", "lease_released", "DHCP_LEASE_RELEASED" },
+    { "dhcp", "lease_changed", "DHCP_LEASE_CHANGED" },
+    { "dhcp", "lease_renewed", "DHCP_LEASE_RENEWED" },
+    { "dhcp", "dhcp_log", "DHCP_EVENT" },
+    { "wan", "wan_log", "WAN_EVENT" },
+    { "pppoe", "pppoe_log", "PPPOE_EVENT" },
+    { "audit", "auth_log", "ADMIN_AUTH_EVENT" },
+    { "security", "security_auth_log", "SECURITY_AUTH_EVENT" },
+    { "network.wan", "wan.failover.down", "WAN_FAILOVER_ACTIVE" },
+    { "network.wan", "wan.failover.recovered", "WAN_FAILBACK" },
+    { "network.wan", "wan.quality.degraded", "WAN_QUALITY_DEGRADED" },
+    { "network.wan", "wan.quality.critical", "WAN_QUALITY_CRITICAL" },
+    { "network.wan", "wan.penalty.recovering", "WAN_PENALTY_RECOVERING" },
+    { "network.wan", "wan.quality.recovered", "WAN_QUALITY_RECOVERED" },
+    { "network.wan", "wan.quality.critical_recovered", "WAN_QUALITY_RECOVERED" },
+    { "ADMIN", "CONFIG_COMMIT_FAILED", "CONFIG_COMMIT_FAILED" },
+    { "ADMIN", "WIFI_CONFIG_SAVE_FAILED", "WIFI_CONFIG_SAVE_FAILED" },
+    { "ADMIN", "WIFI_CONFIG_APPLY_FAILED", "WIFI_CONFIG_APPLY_FAILED" },
+    { "ADMIN", "WIFI_CONFIG_READBACK_MISMATCH", "WIFI_CONFIG_READBACK_MISMATCH" },
+
 };
 
 static const struct logd_notify_event_contract *
@@ -445,8 +470,11 @@ logd_notify_contract_find(const char *category, const char *event,
             return c;
         if (!strcmp(category, c->source_category) && !strcmp(event, c->source_event))
             return c;
-        if (!strcmp(category, c->notify_category) && !strcmp(event, c->event_code))
-            return c;
+        {
+            const struct dw_event_definition *def = dw_event_definition_find(c->event_code);
+            if (def && !strcmp(category, def->category) && !strcmp(event, c->event_code))
+                return c;
+        }
     }
     return NULL;
 }
@@ -513,6 +541,36 @@ static void logd_notify_dedupe_from_contract(const struct logd_notify_event_cont
         if (!value[0]) value = logd_detail_str(detail, "client_mac");
         if (!value[0]) value = ip && ip[0] ? ip : "";
         snprintf(out, out_len, "client:%s:presence", value[0] ? value : "unknown");
+    } else if (!strcmp(c->event_code, "PORT_TX_RX_ERRORS")) {
+        value = iface && iface[0] ? iface : "";
+        if (!value[0]) value = logd_detail_str(detail, "iface");
+        snprintf(out, out_len, "port:%s:counter_errors", value[0] ? value : "unknown");
+    } else if (!strcmp(c->event_code, "PORT_DROPPED_TRAFFIC")) {
+        value = iface && iface[0] ? iface : "";
+        if (!value[0]) value = logd_detail_str(detail, "iface");
+        snprintf(out, out_len, "port:%s:counter_drops", value[0] ? value : "unknown");
+    } else if (!strcmp(c->event_code, "DEVICE_OFFLINE") ||
+               !strcmp(c->event_code, "DEVICE_RESTORED")) {
+        value = logd_detail_str(detail, "node_id");
+        if (!value[0]) value = iface && iface[0] ? iface : "";
+        if (!value[0]) value = logd_detail_str(detail, "target");
+        snprintf(out, out_len, "device:%s:presence", value[0] ? value : "unknown");
+    } else if (!strcmp(c->event_code, "CLIENT_IP_CONFLICT")) {
+        value = logd_detail_str(detail, "network_id");
+        if (!value[0]) value = "unknown";
+        {
+            const char *ip_value = logd_detail_str(detail, "ip");
+            snprintf(out, out_len, "ip-conflict:%s:%s", value,
+                     ip_value[0] ? ip_value : "unknown");
+        }
+    } else if (!strcmp(c->event_code, "SECURITY_DETECTION")) {
+        value = logd_detail_str(detail, "aegis_event_id");
+        snprintf(out, out_len, "security-detection:%s",
+                 value[0] ? value : "unknown");
+    } else if (!strcmp(c->event_code, "APPLICATION_UPDATE_FAILED")) {
+        value = logd_detail_str(detail, "operation_id");
+        snprintf(out, out_len, "application-update:%s",
+                 value[0] ? value : "unknown");
     }
 }
 
@@ -530,14 +588,16 @@ static void logd_notify_add_metadata(struct json_object *detail,
 
     if (!detail || !c)
         return;
+    const struct dw_event_definition *def = dw_event_definition_find(c->event_code);
     logd_json_replace_string(detail, "event_code", c->event_code);
-    logd_json_replace_string(detail, "producer", c->producer);
+    if (def)
+        logd_json_replace_string(detail, "producer", def->producer);
     logd_json_replace_string(detail, "source_category", raw_category ? raw_category : "");
     logd_json_replace_string(detail, "source_event", raw_event ? raw_event : "");
-    if (c->recovery_event && c->recovery_event[0])
-        logd_json_replace_string(detail, "recovery_event", c->recovery_event);
-    if (c->recovers_event && c->recovers_event[0])
-        logd_json_replace_string(detail, "recovers_event", c->recovers_event);
+    if (def && def->recovery_event && def->recovery_event[0])
+        logd_json_replace_string(detail, "recovery_event", def->recovery_event);
+    if (def && def->recovers_event && def->recovers_event[0])
+        logd_json_replace_string(detail, "recovers_event", def->recovers_event);
 
     if (!json_object_object_get_ex(detail, "source_metadata", &meta) || !meta ||
         !json_object_is_type(meta, json_type_object)) {
@@ -581,18 +641,23 @@ static struct json_object *logd_notify_body_for_enqueue(struct json_object *body
             json_object_put(out);
         out = json_object_new_object();
     }
-    logd_json_replace_string(out, "category", c->notify_category);
+    const struct dw_event_definition *def = dw_event_definition_find(c->event_code);
+    if (def)
+        logd_json_replace_string(out, "category", def->category);
+    else
+        logd_json_replace_string(out, "category", "SYSTEM");
     logd_json_replace_string(out, "event", c->event_code);
     logd_json_replace_string(out, "event_code", c->event_code);
-    logd_json_replace_string(out, "producer", c->producer);
-    logd_json_replace_string(out, "severity", severity ? severity : c->default_severity);
+    if (def)
+        logd_json_replace_string(out, "producer", def->producer);
+    logd_json_replace_string(out, "severity", severity ? severity : (def ? def->default_severity : "info"));
     logd_json_replace_string(out, "dedupe_key", dedupe_key ? dedupe_key : "");
     logd_json_replace_string(out, "source_category", raw_category ? raw_category : "");
     logd_json_replace_string(out, "source_event", raw_event ? raw_event : "");
-    if (c->recovery_event && c->recovery_event[0])
-        logd_json_replace_string(out, "recovery_event", c->recovery_event);
-    if (c->recovers_event && c->recovers_event[0])
-        logd_json_replace_string(out, "recovers_event", c->recovers_event);
+    if (def && def->recovery_event && def->recovery_event[0])
+        logd_json_replace_string(out, "recovery_event", def->recovery_event);
+    if (def && def->recovers_event && def->recovers_event[0])
+        logd_json_replace_string(out, "recovers_event", def->recovers_event);
 
     if (json_object_object_get_ex(out, "detail_json", &detail) && detail &&
         json_object_is_type(detail, json_type_object)) {
@@ -617,23 +682,36 @@ static int logd_clear_recovered_events(const char *dedupe_key, const char *curre
 {
     sqlite3_stmt *st;
     int rc;
-    int changed;
+    int changed = 0;
+    size_t i;
+    const struct dw_event_definition *def = c ? dw_event_definition_find(c->event_code) : NULL;
 
-    if (!c || !c->recovers_event || !c->recovers_event[0] ||
-        !dedupe_key || !dedupe_key[0])
+    if (!def || !dedupe_key || !dedupe_key[0])
         return 0;
-    st = logd_prepare(
-        "UPDATE log_events SET state='cleared',last_seen=?1 "
-        "WHERE dedupe_key=?2 AND state!='cleared' AND id!=?3 AND event=?4");
-    if (!st)
-        return 0;
-    sqlite3_bind_int64(st, 1, logd_now_s());
-    sqlite3_bind_text(st, 2, dedupe_key, -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 3, current_id ? current_id : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 4, c->recovers_event, -1, SQLITE_TRANSIENT);
-    rc = sqlite3_step(st);
-    changed = rc == SQLITE_DONE ? sqlite3_changes(g_logd_db) : 0;
-    sqlite3_finalize(st);
+    /* Clear all events whose recovery_event matches our event code.
+     * This handles one-to-many recovery: WAN_QUALITY_RECOVERED clears
+     * WAN_QUALITY_DEGRADED, WAN_QUALITY_CRITICAL, and WAN_PENALTY_RECOVERING.
+     */
+    for (i = 0; i < dw_event_definitions_count; i++) {
+        const struct dw_event_definition *d = &dw_event_definitions[i];
+        if (!d->recovery_event || !d->recovery_event[0])
+            continue;
+        if (strcmp(d->recovery_event, def->id) != 0)
+            continue;
+        st = logd_prepare(
+            "UPDATE log_events SET state='cleared',last_seen=?1 "
+            "WHERE dedupe_key=?2 AND state!='cleared' AND id!=?3 AND event=?4");
+        if (!st)
+            continue;
+        sqlite3_bind_int64(st, 1, logd_now_s());
+        sqlite3_bind_text(st, 2, dedupe_key, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, current_id ? current_id : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, d->id, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE)
+            changed += sqlite3_changes(g_logd_db);
+        sqlite3_finalize(st);
+    }
     return changed;
 }
 
@@ -665,6 +743,8 @@ struct json_object *logd_add_event(struct json_object *body)
     char actor_eff[128];
     char raw_category_eff[64];
     char raw_event_eff[128];
+    char severity_eff[32];
+    char dedupe_key_eff[256];
     char id[96];
     char detail_json[LOGD_MAX_DETAIL_JSON];
     struct json_object *detail_obj = NULL;
@@ -678,47 +758,6 @@ struct json_object *logd_add_event(struct json_object *body)
     int rc;
     struct json_object *resp = json_object_new_object();
     enum jmx_storage_write_priority write_priority;
-
-    write_priority = (!strcmp(severity, "critical") || !strcmp(severity, "error")) ?
-                     JMX_STORAGE_WRITE_EMERGENCY :
-                     (!strcmp(severity, "warning") ? JMX_STORAGE_WRITE_IMPORTANT :
-                      JMX_STORAGE_WRITE_BULK);
-    /* Per-group log level filter.
-     *
-     * The group is derived from the event's real category, and the level decides
-     * the minimum severity that is retained. error and critical are always kept:
-     * a verbosity preference must not be able to hide failures.
-     *
-     * A filtered event is reported honestly as not persisted with an explicit
-     * reason, instead of returning ok/persisted for a row that was never written.
-     */
-    if (logd_event_severity_rank(severity) < logd_event_severity_rank("error")) {
-        const char *group = logd_log_level_group(category);
-        char level[16];
-
-        if (logd_log_level_for_group(group, level, sizeof(level)) == 0 &&
-            logd_event_severity_rank(severity) < logd_log_level_min_rank(level)) {
-            json_object_object_add(resp, "ok", json_object_new_boolean(1));
-            json_object_object_add(resp, "persisted", json_object_new_boolean(0));
-            json_object_object_add(resp, "filtered", json_object_new_boolean(1));
-            json_object_object_add(resp, "filtered_reason",
-                                   json_object_new_string("below_group_log_level"));
-            json_object_object_add(resp, "log_level_group", json_object_new_string(group));
-            json_object_object_add(resp, "log_level", json_object_new_string(level));
-            json_object_object_add(resp, "severity", json_object_new_string(severity));
-            return resp;
-        }
-    }
-    if (!jmx_storage_guard_allow("/", write_priority, NULL)) {
-        g_logd_storage_suppressed++;
-        g_logd_storage_last_suppressed_at = logd_now_s();
-        json_object_object_add(resp, "ok", json_object_new_boolean(0));
-        json_object_object_add(resp, "error", json_object_new_string("storage_pressure_write_suppressed"));
-        json_object_object_add(resp, "persisted", json_object_new_boolean(0));
-        json_object_object_add(resp, "storage_pressure", json_object_new_string(
-            write_priority == JMX_STORAGE_WRITE_BULK ? "warning_or_critical" : "critical"));
-        return resp;
-    }
 
     snprintf(iface_eff, sizeof(iface_eff), "%s", iface ? iface : "");
     snprintf(wan_id_eff, sizeof(wan_id_eff), "%s", wan_id ? wan_id : "");
@@ -748,11 +787,14 @@ struct json_object *logd_add_event(struct json_object *body)
     }
     notify_contract = logd_notify_contract_find(raw_category, raw_event, event_code);
     if (notify_contract) {
-        category = notify_contract->notify_category;
+        const struct dw_event_definition *def = dw_event_definition_find(notify_contract->event_code);
+        if (def)
+            category = def->category;
         event = notify_contract->event_code;
-        if (logd_event_severity_rank(severity) <
-            logd_event_severity_rank(notify_contract->default_severity))
-            severity = notify_contract->default_severity;
+        if (def && logd_event_severity_rank(severity) <
+            logd_event_severity_rank(def->default_severity))
+            severity = def->default_severity;
+        severity = dw_event_effective_severity(event, detail_obj, severity);
         logd_notify_dedupe_from_contract(notify_contract, detail_obj, iface_eff,
                                         wan_id_eff, ip_eff, mac_eff,
                                         notify_dedupe_key, sizeof(notify_dedupe_key));
@@ -770,6 +812,52 @@ struct json_object *logd_add_event(struct json_object *body)
                 snprintf(detail_json, sizeof(detail_json), "%s", detail_s);
         }
     }
+
+    severity = dw_event_effective_severity(event, detail_obj, severity);
+
+    /* Persist important logs above the warning watermark, but do not spend
+     * the critical filesystem reserve on a stream of error events. */
+    write_priority = (!strcmp(severity, "critical") || !strcmp(severity, "error")) ?
+                     JMX_STORAGE_WRITE_IMPORTANT :
+                     (!strcmp(severity, "warning") ? JMX_STORAGE_WRITE_IMPORTANT :
+                      JMX_STORAGE_WRITE_BULK);
+    /* Per-group log level filter.
+     *
+     * The group is derived from the event's real category, and the level decides
+     * the minimum severity that is retained. error and critical are always kept:
+     * a verbosity preference must not be able to hide failures.
+     *
+     * A filtered event is reported honestly as not persisted with an explicit
+     * reason, instead of returning ok/persisted for a row that was never written.
+     */
+    if (logd_event_severity_rank(severity) < logd_event_severity_rank("error")) {
+        const char *group = logd_log_level_group(category);
+        char level[16];
+
+        if (logd_log_level_for_group(group, level, sizeof(level)) == 0 &&
+            logd_event_severity_rank(severity) < logd_log_level_min_rank(level)) {
+            json_object_object_add(resp, "ok", json_object_new_boolean(1));
+            json_object_object_add(resp, "persisted", json_object_new_boolean(0));
+            json_object_object_add(resp, "filtered", json_object_new_boolean(1));
+            json_object_object_add(resp, "filtered_reason",
+                                   json_object_new_string("below_group_log_level"));
+            json_object_object_add(resp, "log_level_group", json_object_new_string(group));
+            json_object_object_add(resp, "log_level", json_object_new_string(level));
+            json_object_object_add(resp, "severity", json_object_new_string(severity));
+            return resp;
+        }
+    }
+    if (!logd_ap_mode() && !jmx_storage_guard_allow(g_logd_db_path, write_priority, NULL)) {
+        g_logd_storage_suppressed++;
+        g_logd_storage_last_suppressed_at = logd_now_s();
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "error", json_object_new_string("storage_pressure_write_suppressed"));
+        json_object_object_add(resp, "persisted", json_object_new_boolean(0));
+        json_object_object_add(resp, "storage_pressure", json_object_new_string(
+            write_priority == JMX_STORAGE_WRITE_BULK ? "warning_or_critical" : "critical"));
+        return resp;
+    }
+
     if (detail_obj)
         json_object_put(detail_obj);
 
@@ -843,6 +931,7 @@ struct json_object *logd_add_event(struct json_object *body)
     }
 
     if (!deduped) {
+        logd_memory_prepare_write();
         seq = logd_event_next_seq();
         st = logd_prepare(
             "INSERT INTO log_events(id,seq,ts,severity,category,event,source,iface,wan_id,ip,mac,username,actor,title,detail_json,dedupe_key,state,first_seen,last_seen,count,created_at) "
@@ -870,9 +959,11 @@ struct json_object *logd_add_event(struct json_object *body)
         sqlite3_bind_text(st, 16, dedupe_key, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 17, state, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(st) != SQLITE_DONE) {
+            int insert_error = sqlite3_errcode(g_logd_db);
+            logd_memory_write_failed(insert_error);
             sqlite3_finalize(st);
             json_object_object_add(resp, "ok", json_object_new_boolean(0));
-            json_object_object_add(resp, "error", json_object_new_string("insert_failed"));
+            json_object_object_add(resp, "error", json_object_new_string(insert_error == SQLITE_FULL ? "detail_storage_limit" : "insert_failed"));
             return resp;
         }
         sqlite3_finalize(st);
@@ -882,22 +973,41 @@ struct json_object *logd_add_event(struct json_object *body)
     json_object_object_add(body, "id", json_object_new_string(id));
     json_object_object_add(body, "ts", json_object_new_int64(ts));
     json_object_object_add(body, "deduplicated", json_object_new_boolean(deduped));
+    /*
+     * severity and dedupe_key still alias body's "severity"/"dedupe_key" json
+     * members (logd_severity() returns its input pointer; logd_json_str() points
+     * into body). The block below calls logd_json_replace_string(body,
+     * "severity"/"dedupe_key", ...) which json_object_object_del()s those members,
+     * so the aliasing locals would dangle before logd_event_should_notify() and
+     * logd_notify_body_for_enqueue() read them (a freed slot is reused by the next
+     * new_string -- severity was observed read back as the category value). Snapshot
+     * to stack buffers now: the same _eff pattern already applied to
+     * iface/wan_id/ip/mac/raw_* above, which this call site was missing for these two.
+     */
+    snprintf(severity_eff, sizeof(severity_eff), "%s", severity ? severity : "info");
+    snprintf(dedupe_key_eff, sizeof(dedupe_key_eff), "%s", dedupe_key ? dedupe_key : "");
+    severity = severity_eff;
+    dedupe_key = dedupe_key_eff;
     if (notify_contract) {
-        logd_json_replace_string(body, "category", notify_contract->notify_category);
+        const struct dw_event_definition *def = dw_event_definition_find(notify_contract->event_code);
+        if (def)
+            logd_json_replace_string(body, "category", def->category);
         logd_json_replace_string(body, "event", notify_contract->event_code);
         logd_json_replace_string(body, "event_code", notify_contract->event_code);
-        logd_json_replace_string(body, "producer", notify_contract->producer);
+        if (def)
+            logd_json_replace_string(body, "producer", def->producer);
         logd_json_replace_string(body, "severity", severity);
         logd_json_replace_string(body, "dedupe_key", dedupe_key);
         logd_json_replace_string(body, "source_category", raw_category);
         logd_json_replace_string(body, "source_event", raw_event);
-        if (notify_contract->recovery_event && notify_contract->recovery_event[0])
-            logd_json_replace_string(body, "recovery_event", notify_contract->recovery_event);
-        if (notify_contract->recovers_event && notify_contract->recovers_event[0])
-            logd_json_replace_string(body, "recovers_event", notify_contract->recovers_event);
+        if (def && def->recovery_event && def->recovery_event[0])
+            logd_json_replace_string(body, "recovery_event", def->recovery_event);
+        if (def && def->recovers_event && def->recovers_event[0])
+            logd_json_replace_string(body, "recovers_event", def->recovers_event);
     }
-    if (logd_json_bool(body, "notify", 1) &&
-        (!deduped || severity_escalated || recovered_count > 0) &&
+    if (!logd_ap_mode() && logd_json_bool(body, "notify", 1) &&
+        (!deduped || severity_escalated || recovered_count > 0 ||
+         dw_wifi_failure_event(event)) &&
         logd_event_should_notify(severity, title, dedupe_key, detail_json)) {
         struct json_object *notify_body = logd_notify_body_for_enqueue(
             body, notify_contract, raw_category, raw_event, source, iface_eff,
@@ -907,7 +1017,16 @@ struct json_object *logd_add_event(struct json_object *body)
         if (notify_body)
             json_object_put(notify_body);
     }
-    if (!deduped || severity_escalated || recovered_count > 0)
+    if (logd_ap_mode()) {
+        int queued = logd_ap_enqueue(body, detail_json);
+        json_object_object_add(resp, "buffered", json_object_new_boolean(queued == 0));
+        json_object_object_add(resp, "persisted", json_object_new_boolean(0));
+        if (queued != 0) {
+            json_object_object_add(resp, "ok", json_object_new_boolean(0));
+            json_object_object_add(resp, "error", json_object_new_string("ap_log_queue_failed"));
+            return resp;
+        }
+    } else if (!deduped || severity_escalated || recovered_count > 0)
         logd_syslog_enqueue_event(body);
     json_object_object_add(resp, "ok", json_object_new_boolean(1));
     json_object_object_add(resp, "id", json_object_new_string(id));
@@ -918,7 +1037,11 @@ struct json_object *logd_add_event(struct json_object *body)
     json_object_object_add(resp, "recovered_count", json_object_new_int(recovered_count));
     if (notify_contract) {
         json_object_object_add(resp, "event_code", json_object_new_string(notify_contract->event_code));
-        json_object_object_add(resp, "producer", json_object_new_string(notify_contract->producer));
+        {
+            const struct dw_event_definition *def = dw_event_definition_find(notify_contract->event_code);
+            if (def)
+                json_object_object_add(resp, "producer", json_object_new_string(def->producer));
+        }
     }
     json_object_object_add(resp, "notified", json_object_new_boolean(notified));
     json_object_object_add(resp, "ts", json_object_new_int64(ts));
@@ -1000,7 +1123,8 @@ struct json_object *logd_list_events(struct json_object *body)
     sqlite3_bind_int(st, b++, limit);
     sqlite3_bind_int(st, b++, offset);
     while ((rc = sqlite3_step(st)) == SQLITE_ROW)
-        logd_event_row_json(arr, st);
+        logd_event_row_json(arr, st,
+                           logd_json_str(body, "locale", "zh-CN"));
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
@@ -1166,10 +1290,7 @@ static const char *logd_unifi_category(const char *category, const char *event)
         category = "";
     if (!event)
         event = "";
-    if (!strcmp(category, "SYSTEM") || !strcmp(category, "INTERNET_AND_WAN") ||
-        !strcmp(category, "CLIENT_DEVICES") || !strcmp(category, "DEVICES") ||
-        !strcmp(category, "ADMIN") || !strcmp(category, "SECURITY") ||
-        !strcmp(category, "VPN"))
+    if (dw_event_domain_find(category))
         return category;
     if (!strcmp(category, "dhcp") || !strcmp(category, "client") ||
         !strncmp(event, "lease_", 6))
@@ -1184,6 +1305,8 @@ static const char *logd_unifi_category(const char *category, const char *event)
         return "SECURITY";
     if (!strcmp(category, "vpn"))
         return "VPN";
+    if (!strcmp(category, "proxy"))
+        return "PROXY";
     return "SYSTEM";
 }
 
@@ -1213,10 +1336,14 @@ static const char *logd_unifi_event_key(const char *category, const char *event)
 {
     if (!event || !event[0])
         return "SYSTEM_LOG";
+    /* Reuse the ingest aliases for historic rows as well. */
+    const struct logd_notify_event_contract *contract =
+        logd_notify_contract_find(category, event, event);
+    if (contract) return contract->event_code;
     if (!strcmp(event, "lease_assigned"))
-        return "CLIENT_CONNECTED_WIRED";
+        return "DHCP_LEASE_ASSIGNED";
     if (!strcmp(event, "lease_released"))
-        return "CLIENT_DISCONNECTED";
+        return "DHCP_LEASE_RELEASED";
     if (!strcmp(event, "link_up"))
         return "PORT_LINK_UP";
     if (!strcmp(event, "link_down"))
@@ -1246,6 +1373,53 @@ static const char *logd_unifi_event_key(const char *category, const char *event)
     if (!strcmp(event, "log_line"))
         return "SYSTEM_LOG";
     return event;
+}
+
+/* Query expressions call the same catalog/mapping as row presentation. */
+#define LOGD_CATEGORY_SQL "dw_log_category(category,event)"
+#define LOGD_EVENT_SQL "dw_log_event(category,event)"
+#define LOGD_DOMAIN_SQL "dw_log_domain(category,event,detail_json)"
+#define LOGD_BUSINESS_SQL "dw_log_business(category,event)"
+#define LOGD_LEVEL_SQL "dw_log_level(category,event,detail_json,severity)"
+
+static void logd_query_catalog(sqlite3_context *ctx, int argc, sqlite3_value **argv)
+{
+    const char *category = (const char *)sqlite3_value_text(argv[0]);
+    const char *event = (const char *)sqlite3_value_text(argv[1]);
+    const char *key = logd_unifi_event_key(category, event);
+    const char *kind = sqlite3_user_data(ctx);
+    struct json_object *detail = NULL;
+    const char *text;
+    if (argc > 2) {
+        text = (const char *)sqlite3_value_text(argv[2]);
+        if (text) detail = json_tokener_parse(text);
+    }
+    if (!strcmp(kind, "business"))
+        sqlite3_result_int(ctx, dw_event_is_business(key));
+    else {
+        if (!strcmp(kind, "category")) text = logd_unifi_category(category, event);
+        else if (!strcmp(kind, "domain")) text = dw_event_domain(logd_unifi_category(category, event), key, detail);
+        else if (!strcmp(kind, "level")) text = dw_event_effective_severity(key, detail, (const char *)sqlite3_value_text(argv[3]));
+        else text = key;
+        sqlite3_result_text(ctx, text, -1, SQLITE_TRANSIENT);
+    }
+    if (detail) json_object_put(detail);
+}
+
+static int logd_register_query_catalog(void)
+{
+    static const struct { const char *name; int argc; const char *kind; } funcs[] = {
+        { "dw_log_category", 2, "category" }, { "dw_log_event", 2, "event" },
+        { "dw_log_domain", 3, "domain" }, { "dw_log_business", 2, "business" },
+        { "dw_log_level", 4, "level" }
+    };
+    size_t i;
+    if (!g_logd_db) return -1;
+    for (i = 0; i < sizeof(funcs) / sizeof(funcs[0]); i++)
+        if (sqlite3_create_function_v2(g_logd_db, funcs[i].name, funcs[i].argc,
+            SQLITE_UTF8 | SQLITE_DETERMINISTIC, (void *)funcs[i].kind,
+            logd_query_catalog, NULL, NULL, NULL) != SQLITE_OK) return -1;
+    return 0;
 }
 
 static const char *logd_unifi_severity(const char *severity)
@@ -1646,6 +1820,33 @@ static void logd_unifi_bind_array(sqlite3_stmt *st, int *b, struct json_object *
 #define LOGD_IS_AUDIT_SQL \
     "COALESCE(json_extract(detail_json,'$.web_audit'),0)=1"
 
+/*
+ * B-LOG-03: raw syslog vs structured application events.
+ *
+ * Only logd_publish_log_line() (the system_log / kernel_log collectors that
+ * scrape logread/dmesg) stamps detail_json.collector. Every structured emitter
+ * -- logd_publish_event() for resource/port/dhcp/roaming, and every daemon's
+ * ubus event_add (webd audit, AC DEVICES events, ...) -- leaves it unset. So the
+ * collector marker is an EXACT discriminant for raw syslog across all history,
+ * and it is what lets the log center default view show our own structured events
+ * while folding the logread firehose into a separate "系统原始日志" facet.
+ */
+#define LOGD_IS_RAW_SYSLOG_SQL \
+    "COALESCE(json_extract(detail_json,'$.collector'),'') IN ('system_log','kernel_log')"
+
+/*
+ * Canonical collector id as SQL. Raw syslog rows carry the real collector name
+ * (system_log / kernel_log); everything else folds to 'app' (application-pushed
+ * structured events). Kept in lockstep with logd_collector_id_valid() so the
+ * `collectors` filter returns exactly the rows whose bucket matches. Structured
+ * collectors (resource/port/dhcp_lease/roaming) do not stamp collector today, so
+ * they read as 'app' here -- the structured side is filtered by category/source
+ * instead; the collector dimension exists to split the raw syslog tab.
+ */
+#define LOGD_COLLECTOR_ID_SQL \
+    "(CASE WHEN COALESCE(json_extract(detail_json,'$.collector'),'')<>'' " \
+    "THEN json_extract(detail_json,'$.collector') ELSE 'app' END)"
+
 static int logd_unifi_is_web_audit(struct json_object *detail,
                                    const char *source, const char *category)
 {
@@ -1734,6 +1935,68 @@ static void logd_unifi_append_device_filter_clause(char *sql, size_t sql_len,
     strncat(sql, ")", sql_len - strlen(sql) - 1);
 }
 
+/*
+ * Exact whitelist for the `collectors` filter. Matching by whole-string equality
+ * against this fixed set is itself the injection guard: only these literals ever
+ * reach the emitted IN clause, so the values can be inlined safely. Mirrors the
+ * g_collectors[] runtime table plus the synthetic 'app' bucket for structured
+ * application events.
+ */
+static int logd_collector_id_valid(const char *v)
+{
+    static const char *known[] = {
+        "system_log", "kernel_log", "resource", "port",
+        "dhcp_lease", "roaming", "app",
+    };
+    size_t i;
+
+    if (!v || !v[0])
+        return 0;
+    for (i = 0; i < sizeof(known) / sizeof(known[0]); i++) {
+        if (!strcmp(v, known[i]))
+            return 1;
+    }
+    return 0;
+}
+
+/*
+ * Append the `collectors` IN clause using only whitelisted literals.
+ * Two passes: validate every element first, then emit -- so a rejected token
+ * never leaves a half-built clause behind. Returns 0 on success, -1 on any
+ * invalid token (caller maps to invalid_collectors).
+ */
+static int logd_unifi_append_collectors_clause(char *sql, size_t sql_len,
+                                               struct json_object *arr)
+{
+    int i, n, emitted = 0;
+
+    if (!arr || !json_object_is_type(arr, json_type_array))
+        return -1;
+    n = json_object_array_length(arr);
+    if (n <= 0 || n > 32)
+        return -1;
+    for (i = 0; i < n; i++) {
+        struct json_object *v = json_object_array_get_idx(arr, i);
+        const char *s = v && json_object_is_type(v, json_type_string)
+                        ? json_object_get_string(v) : NULL;
+
+        if (!logd_collector_id_valid(s))
+            return -1;
+    }
+    strncat(sql, " AND " LOGD_COLLECTOR_ID_SQL " IN (", sql_len - strlen(sql) - 1);
+    for (i = 0; i < n; i++) {
+        struct json_object *v = json_object_array_get_idx(arr, i);
+        const char *s = json_object_get_string(v);
+
+        strncat(sql, emitted ? ",'" : "'", sql_len - strlen(sql) - 1);
+        strncat(sql, s, sql_len - strlen(sql) - 1);
+        strncat(sql, "'", sql_len - strlen(sql) - 1);
+        emitted = 1;
+    }
+    strncat(sql, ")", sql_len - strlen(sql) - 1);
+    return 0;
+}
+
 static int logd_unifi_build_where(struct json_object *body, char *sql, size_t sql_len,
                                   struct json_object **sev_arr, struct json_object **cat_arr,
                                   struct json_object **evt_arr, struct json_object **mac_arr,
@@ -1746,7 +2009,7 @@ static int logd_unifi_build_where(struct json_object *body, char *sql, size_t sq
     int source_state;
     int n;
 
-    if (!sql || sql_len == 0)
+    if (!sql || sql_len == 0 || logd_register_query_catalog() != 0)
         return -1;
     snprintf(sql, sql_len, " FROM log_events WHERE 1=1");
     if (body && logd_unifi_arr_nonempty(body, "severities")) {
@@ -1758,7 +2021,7 @@ static int logd_unifi_build_where(struct json_object *body, char *sql, size_t sq
         low_selected = logd_unifi_array_has(*sev_arr, "LOW");
         strncat(sql, " AND (", sql_len - strlen(sql) - 1);
         if (sev_bind_count > 0) {
-            strncat(sql, "severity IN (", sql_len - strlen(sql) - 1);
+            strncat(sql, LOGD_LEVEL_SQL " IN (", sql_len - strlen(sql) - 1);
             for (int i = 0; i < sev_bind_count; i++)
                 strncat(sql, i ? ",?" : "?", sql_len - strlen(sql) - 1);
             strncat(sql, ")", sql_len - strlen(sql) - 1);
@@ -1766,7 +2029,7 @@ static int logd_unifi_build_where(struct json_object *body, char *sql, size_t sq
         if (low_selected) {
             if (sev_bind_count > 0)
                 strncat(sql, " OR ", sql_len - strlen(sql) - 1);
-            strncat(sql, "severity IN ('info','notice')", sql_len - strlen(sql) - 1);
+            strncat(sql, LOGD_LEVEL_SQL " IN ('info','notice')", sql_len - strlen(sql) - 1);
         }
         if (sev_bind_count <= 0 && !low_selected)
             strncat(sql, "1=1", sql_len - strlen(sql) - 1);
@@ -1774,38 +2037,13 @@ static int logd_unifi_build_where(struct json_object *body, char *sql, size_t sq
     }
     if (body && logd_unifi_arr_nonempty(body, "categories")) {
         json_object_object_get_ex(body, "categories", cat_arr);
-        logd_unifi_append_in_clause(sql, sql_len,
-            "(CASE "
-            "WHEN category IN ('SYSTEM','INTERNET_AND_WAN','CLIENT_DEVICES','DEVICES','ADMIN','SECURITY','VPN') THEN category "
-            "WHEN category IN ('dhcp','client') THEN 'CLIENT_DEVICES' "
-            "WHEN category IN ('wan','pppoe','port') THEN 'INTERNET_AND_WAN' "
-            "WHEN category IN ('audit','auth') THEN 'ADMIN' "
-            "WHEN category='security' THEN 'SECURITY' "
-            "WHEN category='vpn' THEN 'VPN' "
-            "ELSE 'SYSTEM' END)",
-            json_object_array_length(*cat_arr));
+        logd_unifi_append_in_clause(sql, sql_len, LOGD_CATEGORY_SQL,
+                                    json_object_array_length(*cat_arr));
     }
     if (body && logd_unifi_arr_nonempty(body, "events")) {
         json_object_object_get_ex(body, "events", evt_arr);
-        logd_unifi_append_in_clause(sql, sql_len,
-            "(CASE "
-            "WHEN event='lease_assigned' THEN 'CLIENT_CONNECTED_WIRED' "
-            "WHEN event='lease_released' THEN 'CLIENT_DISCONNECTED' "
-            "WHEN event='link_up' THEN 'PORT_LINK_UP' "
-            "WHEN event='link_down' THEN 'PORT_LINK_DOWN' "
-            "WHEN event='port_log' THEN 'PORT_EVENT' "
-            "WHEN event='wan_log' THEN 'WAN_EVENT' "
-            "WHEN event='pppoe_log' THEN 'PPPOE_EVENT' "
-            "WHEN event='auth_log' THEN 'ADMIN_AUTH_EVENT' "
-            "WHEN event='packet_capture_started' THEN 'PACKET_CAPTURE_STARTED' "
-            "WHEN event='packet_capture_stopped' THEN 'PACKET_CAPTURE_STOPPED' "
-            "WHEN event='packet_capture_finished' THEN 'PACKET_CAPTURE_FINISHED' "
-            "WHEN event='packet_capture_deleted' THEN 'PACKET_CAPTURE_DELETED' "
-            "WHEN event='threshold_exceeded' THEN 'SYSTEM_RESOURCE_THRESHOLD' "
-            "WHEN event='dhcp_log' THEN 'DHCP_EVENT' "
-            "WHEN event='log_line' THEN 'SYSTEM_LOG' "
-            "ELSE event END)",
-            json_object_array_length(*evt_arr));
+        logd_unifi_append_in_clause(sql, sql_len, LOGD_EVENT_SQL,
+                                    json_object_array_length(*evt_arr));
     }
     if (body && logd_unifi_arr_nonempty(body, "clientDeviceMacs")) {
         json_object_object_get_ex(body, "clientDeviceMacs", mac_arr);
@@ -1872,6 +2110,75 @@ static int logd_unifi_build_where(struct json_object *body, char *sql, size_t sq
             strncat(sql, " AND NOT (" LOGD_IS_AUDIT_SQL ")", sql_len - strlen(sql) - 1);
         else
             return -2;
+    }
+    /* B-LOG-03: origin is the coarse raw-syslog vs structured lever the log
+     * center default view needs. STRUCTURED (our own application events) is the
+     * intended main view; RAW is the "系统原始日志" tab. No parameter binding --
+     * the clause is fully determined by the literal. Absent/ALL adds nothing, so
+     * existing callers are unaffected. */
+    {
+        struct json_object *origin_obj = NULL;
+
+        if (body && json_object_object_get_ex(body, "origin", &origin_obj)) {
+            const char *origin;
+
+            if (!origin_obj || !json_object_is_type(origin_obj, json_type_string))
+                return -4;
+            origin = json_object_get_string(origin_obj);
+            if (!origin)
+                return -4;
+            if (!strcasecmp(origin, "RAW") || !strcasecmp(origin, "SYSLOG"))
+                strncat(sql, " AND (" LOGD_IS_RAW_SYSLOG_SQL ")", sql_len - strlen(sql) - 1);
+            else if (!strcasecmp(origin, "STRUCTURED") || !strcasecmp(origin, "APP"))
+                strncat(sql, " AND NOT (" LOGD_IS_RAW_SYSLOG_SQL ")", sql_len - strlen(sql) - 1);
+            else if (strcasecmp(origin, "ALL"))
+                return -4;
+        }
+    }
+    /* Fine-grained collector filter (whitelisted literals). Lets the raw tab
+     * split system_log vs kernel_log; structured rows fold to 'app'. */
+    if (body && logd_unifi_arr_nonempty(body, "collectors")) {
+        struct json_object *coll_arr = NULL;
+
+        json_object_object_get_ex(body, "collectors", &coll_arr);
+        if (logd_unifi_append_collectors_clause(sql, sql_len, coll_arr) != 0)
+            return -5;
+    }
+    {
+        struct json_object *value = NULL;
+        const char *v;
+        if (body && json_object_object_get_ex(body, "domain", &value)) {
+            if (!value || !json_object_is_type(value, json_type_string) ||
+                !dw_event_domain_find(v = json_object_get_string(value))) return -6;
+            strncat(sql, " AND " LOGD_DOMAIN_SQL "='", sql_len - strlen(sql) - 1);
+            strncat(sql, v, sql_len - strlen(sql) - 1);
+            strncat(sql, "'", sql_len - strlen(sql) - 1);
+        }
+        if (body && json_object_object_get_ex(body, "semantic", &value)) {
+            if (!value || !json_object_is_type(value, json_type_string)) return -7;
+            v = json_object_get_string(value);
+            if (!strcmp(v, "BUSINESS"))
+                strncat(sql, " AND " LOGD_BUSINESS_SQL "=1", sql_len - strlen(sql) - 1);
+            else if (!strcmp(v, "UNCLASSIFIED"))
+                strncat(sql, " AND " LOGD_BUSINESS_SQL "=0", sql_len - strlen(sql) - 1);
+            else if (strcmp(v, "ALL")) return -7;
+        }
+        if (*cat_arr) {
+            size_t i;
+            for (i = 0; i < json_object_array_length(*cat_arr); i++) {
+                value = json_object_array_get_idx(*cat_arr, i);
+                if (!value || !json_object_is_type(value, json_type_string) ||
+                    !dw_event_domain_find(json_object_get_string(value))) return -8;
+            }
+        }
+        if (*sev_arr) {
+            size_t i;
+            for (i = 0; i < json_object_array_length(*sev_arr); i++) {
+                value = json_object_array_get_idx(*sev_arr, i);
+                v = value && json_object_is_type(value, json_type_string) ? json_object_get_string(value) : "";
+                if (strcmp(v,"LOW") && strcmp(v,"MEDIUM") && strcmp(v,"HIGH") && strcmp(v,"VERY_HIGH")) return -9;
+            }
+        }
     }
     return 0;
 }
@@ -1995,7 +2302,7 @@ static void logd_unifi_actor_state(const char *actor,
 }
 
 static void logd_unifi_item_from_stmt_for_actor(struct json_object *arr, sqlite3_stmt *st,
-                                                const char *viewer)
+                                                const char *viewer, const char *locale)
 {
     sqlite3_int64 rowid = sqlite3_column_int64(st, 0);
     sqlite3_int64 seq = sqlite3_column_int64(st, 1);
@@ -2020,7 +2327,14 @@ static void logd_unifi_item_from_stmt_for_actor(struct json_object *arr, sqlite3
     const char *key = logd_unifi_event_key(category, event);
     const char *uni_category = logd_unifi_category(category, event);
     char fallback_title[160];
-    char cef[1024];
+    /*
+     * A full CEF record is 151 bytes of literal text plus the twelve escaped
+     * fields logd_unifi_build_cef formats into it, which total 1824 bytes at
+     * their maxima. At 1024 a verbose event lost its trailing fields, and since
+     * msg= is last, the human-readable message was the first thing a SIEM
+     * stopped receiving.
+     */
+    char cef[2048];
     struct json_object *o = json_object_new_object();
     struct json_object *params = json_object_new_object();
     struct json_object *device = json_object_new_object();
@@ -2047,6 +2361,12 @@ static void logd_unifi_item_from_stmt_for_actor(struct json_object *arr, sqlite3
     const char *client_id = logd_json_obj_str(detail, "client_id");
     const char *device_name = logd_json_obj_str(detail, "device_name");
     int64_t original_ts_ms = logd_json_obj_i64(detail, "original_timestamp_ms", 0);
+    const char *business_severity = dw_event_effective_severity(key, detail, severity);
+    const char *collector = logd_json_obj_str(detail, "collector");
+    const char *detail_result = logd_json_obj_str(detail, "result");
+    if (!username[0]) username = logd_json_obj_str(detail, "username");
+    if (!iface[0]) iface = logd_json_obj_str(detail, "iface");
+    if (!ip[0]) ip = logd_json_obj_str(detail, "source_ip");
 
     logd_unifi_title_case(key, fallback_title, sizeof(fallback_title));
     logd_program_id_normalize(program[0] ? program : (parsed_module[0] ? parsed_module : source),
@@ -2068,6 +2388,26 @@ static void logd_unifi_item_from_stmt_for_actor(struct json_object *arr, sqlite3
     json_object_object_add(o, "external_id", json_object_new_string(id));
     json_object_object_add(o, "category", json_object_new_string(uni_category));
     json_object_object_add(o, "raw_category", json_object_new_string(category));
+    json_object_object_add(o, "domain", json_object_new_string(dw_event_domain(uni_category, key, detail)));
+    const struct dw_event_domain_definition *domain_def =
+        dw_event_domain_find(dw_event_domain(uni_category, key, detail));
+    if (domain_def)
+        json_object_object_add(o, "domain_label", json_object_new_string(
+            !strcmp(dw_event_locale_normalize(locale), "en") ? domain_def->label_en : domain_def->label_zh));
+    json_object_object_add(o, "origin", json_object_new_string(
+        !strcmp(collector, "system_log") || !strcmp(collector, "kernel_log") ? "RAW" : "STRUCTURED"));
+    json_object_object_add(o, "semantic", json_object_new_string(dw_event_is_business(key) ? "BUSINESS" : "UNCLASSIFIED"));
+    json_object_object_add(o, "username", json_object_new_string(username));
+    json_object_object_add(o, "actor", json_object_new_string(actor));
+    json_object_object_add(o, "ip", json_object_new_string(ip));
+    json_object_object_add(o, "iface", json_object_new_string(iface));
+    json_object_object_add(o, "source_ip", json_object_new_string(ip));
+    json_object_object_add(o, "protocol", json_object_new_string(logd_json_obj_str(detail, "service")));
+    json_object_object_add(o, "auth_method", json_object_new_string(logd_json_obj_str(detail, "auth_method")));
+    json_object_object_add(o, "result", json_object_new_string(detail_result[0] ? detail_result : logd_json_obj_str(detail, "auth_result")));
+    json_object_object_add(o, "first_seen", json_object_new_int64(sqlite3_column_int64(st, 18)));
+    json_object_object_add(o, "last_seen", json_object_new_int64(sqlite3_column_int64(st, 19)));
+
     json_object_object_add(o, "subcategory", json_object_new_string(logd_unifi_subcategory(category, event)));
     json_object_object_add(o, "event", json_object_new_string(key));
     json_object_object_add(o, "raw_event", json_object_new_string(event));
@@ -2096,8 +2436,9 @@ static void logd_unifi_item_from_stmt_for_actor(struct json_object *arr, sqlite3
         json_object_object_add(o, "facility_level", json_object_new_string(facility_level));
     if (parsed_module[0])
         json_object_object_add(o, "module", json_object_new_string(parsed_module));
-    json_object_object_add(o, "severity", json_object_new_string(logd_unifi_severity(severity)));
+    json_object_object_add(o, "severity", json_object_new_string(logd_unifi_severity(business_severity)));
     json_object_object_add(o, "raw_severity", json_object_new_string(severity));
+    json_object_object_add(o, "event_level", json_object_new_string(business_severity));
     json_object_object_add(o, "status", json_object_new_string(!strcmp(state, "cleared") ? "ARCHIVED" : (acked_at > 0 ? "ACKED" : (read_at > 0 ? "READ" : "NEW"))));
     json_object_object_add(o, "read", json_object_new_boolean(read_at > 0));
     json_object_object_add(o, "read_at", json_object_new_int64(read_at));
@@ -2190,67 +2531,38 @@ static void logd_unifi_item_from_stmt_for_actor(struct json_object *arr, sqlite3
     json_object_object_add(params, "RAW", raw);
     json_object_object_add(o, "parameters", params);
 
-    logd_unifi_build_cef(cef, sizeof(cef), key, title, severity, uni_category,
+    logd_unifi_build_cef(cef, sizeof(cef), key, title, business_severity, uni_category,
                          ip, mac, username[0] ? username : actor, source,
                          iface, parsed_message, parsed_module, parsed_facility);
     json_object_object_add(o, "cef", json_object_new_string(cef));
+    /* Attach semantic presentation (locale-aware title, description, actions) */
+    dw_event_payload_present(o, locale);
     json_object_array_add(arr, o);
 }
 
-static void logd_unifi_item_from_stmt(struct json_object *arr, sqlite3_stmt *st)
+static void logd_unifi_item_from_stmt(struct json_object *arr, sqlite3_stmt *st,
+                                      const char *locale)
 {
-    logd_unifi_item_from_stmt_for_actor(arr, st, NULL);
+    logd_unifi_item_from_stmt_for_actor(arr, st, NULL, locale);
 }
 
-static int64_t logd_unifi_count_state(const char *where, const struct logd_unifi_query *q,
-                                      struct json_object *sev_arr,
-                                      struct json_object *cat_arr,
-                                      struct json_object *evt_arr,
-                                      struct json_object *mac_arr,
-                                      struct json_object *device_arr,
-                                      struct json_object *admin_arr,
-                                      struct json_object *program_arr,
-                                      struct json_object *source_arr,
-                                      const char *kind)
-{
-    sqlite3_stmt *st;
-    char sql[4096];
-    int b = 1;
-    int64_t total = 0;
+/* Aggregate the actor state alongside the total so semantic/JSON predicates
+ * are evaluated once per row, not once for each counter. */
+#define LOGD_UNREAD_SQL \
+    "NOT EXISTS (SELECT 1 FROM log_read_cursors c WHERE c.actor=? " \
+    "AND (c.cursor_seq>=log_events.seq OR c.cursor_rowid>=log_events.rowid)) " \
+    "AND NOT EXISTS (SELECT 1 FROM log_read_events r WHERE r.actor=? AND r.event_id=log_events.id) " \
+    "AND NOT EXISTS (SELECT 1 FROM log_event_ack a WHERE a.actor=? AND a.event_id=log_events.id)"
+#define LOGD_ACKED_SQL \
+    "EXISTS (SELECT 1 FROM log_event_ack a WHERE a.actor=? AND a.event_id=log_events.id)"
+#define LOGD_STATE_COUNTS_SQL \
+    "COALESCE(SUM(" LOGD_UNREAD_SQL "),0),COALESCE(SUM(" LOGD_ACKED_SQL "),0)"
 
-    if (!where || !q || !kind)
-        return 0;
-    if (!strcmp(kind, "unread")) {
-        snprintf(sql, sizeof(sql),
-                 "SELECT COUNT(*)%s AND NOT EXISTS ("
-                 " SELECT 1 FROM log_read_cursors c WHERE c.actor=? AND (c.cursor_seq>=log_events.seq OR c.cursor_rowid>=log_events.rowid))"
-                 " AND NOT EXISTS ("
-                 " SELECT 1 FROM log_read_events r WHERE r.actor=? AND r.event_id=log_events.id)"
-                 " AND NOT EXISTS ("
-                 " SELECT 1 FROM log_event_ack a WHERE a.actor=? AND a.event_id=log_events.id)",
-                 where);
-    } else if (!strcmp(kind, "acked")) {
-        snprintf(sql, sizeof(sql),
-                 "SELECT COUNT(*)%s AND EXISTS ("
-                 " SELECT 1 FROM log_event_ack a WHERE a.actor=? AND a.event_id=log_events.id)",
-                 where);
-    } else {
-        return 0;
-    }
-    st = logd_prepare(sql);
-    if (!st)
-        return 0;
-    logd_unifi_bind_common(st, &b, q, sev_arr, cat_arr, evt_arr, mac_arr,
-                           device_arr, admin_arr, program_arr, source_arr);
-    sqlite3_bind_text(st, b++, q->actor ? q->actor : "default", -1, SQLITE_TRANSIENT);
-    if (!strcmp(kind, "unread"))
-        sqlite3_bind_text(st, b++, q->actor ? q->actor : "default", -1, SQLITE_TRANSIENT);
-    if (!strcmp(kind, "unread"))
-        sqlite3_bind_text(st, b++, q->actor ? q->actor : "default", -1, SQLITE_TRANSIENT);
-    if (sqlite3_step(st) == SQLITE_ROW)
-        total = sqlite3_column_int64(st, 0);
-    sqlite3_finalize(st);
-    return total;
+static void logd_unifi_bind_state_actor(sqlite3_stmt *st, int *b, const char *actor)
+{
+    int i;
+    for (i = 0; i < 4; i++)
+        sqlite3_bind_text(st, (*b)++, actor ? actor : "default", -1, SQLITE_TRANSIENT);
 }
 
 struct json_object *logd_unifi_capabilities_json(void)
@@ -2268,6 +2580,13 @@ struct json_object *logd_unifi_capabilities_json(void)
     json_object_object_add(cap, "audit", json_object_new_boolean(1));
     json_object_object_add(cap, "log_type_filter", json_object_new_boolean(1));
     json_object_object_add(cap, "log_source_filter", json_object_new_boolean(1));
+    /* B-LOG-03: raw-syslog vs structured origin split + per-collector facet. */
+    json_object_object_add(cap, "origin_filter", json_object_new_boolean(1));
+    json_object_object_add(cap, "semantic_filter", json_object_new_boolean(1));
+    json_object_object_add(cap, "domain_filter", json_object_new_boolean(1));
+    json_object_object_add(cap, "scoped_facets", json_object_new_boolean(1));
+    json_object_object_add(cap, "collector_filter", json_object_new_boolean(1));
+    json_object_object_add(cap, "raw_syslog_facet", json_object_new_boolean(1));
     json_object_object_add(cap, "web_audit_stream", json_object_new_boolean(1));
     json_object_object_add(cap, "filter_data", json_object_new_boolean(1));
     json_object_object_add(cap, "pagination", json_object_new_boolean(1));
@@ -2356,7 +2675,7 @@ struct json_object *logd_unifi_search(struct json_object *body)
     char sql[4096];
     int b = 1;
     int rc;
-    int64_t total = 0;
+    int64_t total = 0, unread = 0, acked = 0;
     int64_t max_rowid = 0;
     int64_t max_seq = 0;
     int returned = 0;
@@ -2370,13 +2689,17 @@ struct json_object *logd_unifi_search(struct json_object *body)
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string(
             rc == -2 ? "invalid_log_type" :
-            rc == -3 ? "invalid_log_sources" : "query_build_failed"));
+            rc == -3 ? "invalid_log_sources" :
+            rc == -4 ? "invalid_origin" :
+            rc == -5 ? "invalid_collectors" :
+            rc == -6 ? "invalid_domain" : rc == -7 ? "invalid_semantic" :
+            rc == -8 ? "invalid_categories" : rc == -9 ? "invalid_severities" : "query_build_failed"));
         json_object_put(arr);
         return resp;
     }
     logd_unifi_add_time_search_where(where, sizeof(where), &q);
 
-    snprintf(sql, sizeof(sql), "SELECT COUNT(*)%s", where);
+    snprintf(sql, sizeof(sql), "SELECT COUNT(*)," LOGD_STATE_COUNTS_SQL "%s", where);
     st = logd_prepare(sql);
     if (!st) {
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
@@ -2384,10 +2707,14 @@ struct json_object *logd_unifi_search(struct json_object *body)
         json_object_put(arr);
         return resp;
     }
+    logd_unifi_bind_state_actor(st, &b, q.actor);
     logd_unifi_bind_common(st, &b, &q, sev_arr, cat_arr, evt_arr, mac_arr,
                            device_arr, admin_arr, program_arr, source_arr);
-    if (sqlite3_step(st) == SQLITE_ROW)
+    if (sqlite3_step(st) == SQLITE_ROW) {
         total = sqlite3_column_int64(st, 0);
+        unread = sqlite3_column_int64(st, 1);
+        acked = sqlite3_column_int64(st, 2);
+    }
     sqlite3_finalize(st);
 
     snprintf(sql, sizeof(sql),
@@ -2415,7 +2742,8 @@ struct json_object *logd_unifi_search(struct json_object *body)
             max_rowid = rowid;
         if (seq > max_seq)
             max_seq = seq;
-        logd_unifi_item_from_stmt_for_actor(arr, st, q.actor);
+        logd_unifi_item_from_stmt_for_actor(arr, st, q.actor,
+                                           logd_json_str(body, "locale", "zh-CN"));
         returned++;
     }
     sqlite3_finalize(st);
@@ -2450,8 +2778,8 @@ struct json_object *logd_unifi_search(struct json_object *body)
     json_object_object_add(resp, "ack_supported", json_object_new_boolean(1));
     json_object_object_add(resp, "mark_read_supported", json_object_new_boolean(1));
     json_object_object_add(resp, "read_actor", json_object_new_string(q.actor ? q.actor : "default"));
-    json_object_object_add(resp, "unread_total", json_object_new_int64(logd_unifi_count_state(where, &q, sev_arr, cat_arr, evt_arr, mac_arr, device_arr, admin_arr, program_arr, source_arr, "unread")));
-    json_object_object_add(resp, "acked_total", json_object_new_int64(logd_unifi_count_state(where, &q, sev_arr, cat_arr, evt_arr, mac_arr, device_arr, admin_arr, program_arr, source_arr, "acked")));
+    json_object_object_add(resp, "unread_total", json_object_new_int64(unread));
+    json_object_object_add(resp, "acked_total", json_object_new_int64(acked));
     json_object_object_add(resp, "has_more", json_object_new_boolean(total > returned && q.incremental));
     json_object_object_add(resp, "total_element_count", json_object_new_int64(total));
     json_object_object_add(resp, "total_page_count",
@@ -2503,7 +2831,8 @@ struct json_object *logd_unifi_get_by_ids(struct json_object *body)
     }
     logd_unifi_bind_event_ids(st, &b, ids);
     while ((rc = sqlite3_step(st)) == SQLITE_ROW)
-        logd_unifi_item_from_stmt_for_actor(items, st, actor);
+        logd_unifi_item_from_stmt_for_actor(items, st, actor,
+                                               logd_json_str(body, "locale", "zh-CN"));
     sqlite3_finalize(st);
     if (rc != SQLITE_DONE) {
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
@@ -2563,7 +2892,11 @@ struct json_object *logd_unifi_export(struct json_object *body)
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string(
             rc == -2 ? "invalid_log_type" :
-            rc == -3 ? "invalid_log_sources" : "query_build_failed"));
+            rc == -3 ? "invalid_log_sources" :
+            rc == -4 ? "invalid_origin" :
+            rc == -5 ? "invalid_collectors" :
+            rc == -6 ? "invalid_domain" : rc == -7 ? "invalid_semantic" :
+            rc == -8 ? "invalid_categories" : rc == -9 ? "invalid_severities" : "query_build_failed"));
         return resp;
     }
     logd_unifi_add_time_search_where(where, sizeof(where), &q);
@@ -2603,34 +2936,35 @@ struct json_object *logd_unifi_export(struct json_object *body)
         struct json_object *arr = json_object_new_array();
 
         while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-            logd_unifi_item_from_stmt(arr, st);
+            logd_unifi_item_from_stmt(arr, st,
+                                          logd_json_str(body, "locale", "zh-CN"));
             count++;
         }
         if (fprintf(fp, "%s\n", json_object_to_json_string_ext(arr, JSON_C_TO_STRING_PRETTY)) < 0)
             write_failed = 1;
         json_object_put(arr);
     } else if (!strcmp(format, "csv")) {
-        if (fprintf(fp, "id,seq,timestamp,severity,category,event,title,source,iface,wan_id,ip,mac,username,actor,count,detail_json\n") < 0)
+        static const char *fields[] = { "id", "seq", "ts", "event_level", "category", "event", "title",
+            "source", "iface", "wan_id", "ip", "mac", "username", "actor", "count", "detail_json",
+            "domain", "origin", "semantic", "description", "raw_severity", "raw_category", "raw_event" };
+        if (fprintf(fp, "id,seq,timestamp,severity,category,event,title,source,iface,wan_id,ip,mac,username,actor,count,detail_json,domain,origin,semantic,description,raw_severity,raw_category,raw_event\n") < 0)
             write_failed = 1;
         while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
-            if (logd_csv_escape(fp, logd_sqlite_text(st, 2, "")) != 0 ||
-                fprintf(fp, ",%lld,%lld,", (long long)sqlite3_column_int64(st, 1),
-                        (long long)sqlite3_column_int64(st, 3)) < 0 ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 4, "")) != 0 || fputc(',', fp) == EOF ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 5, "")) != 0 || fputc(',', fp) == EOF ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 6, "")) != 0 || fputc(',', fp) == EOF ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 14, "")) != 0 || fputc(',', fp) == EOF ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 7, "")) != 0 || fputc(',', fp) == EOF ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 8, "")) != 0 || fputc(',', fp) == EOF ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 9, "")) != 0 || fputc(',', fp) == EOF ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 10, "")) != 0 || fputc(',', fp) == EOF ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 11, "")) != 0 || fputc(',', fp) == EOF ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 12, "")) != 0 || fputc(',', fp) == EOF ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 13, "")) != 0 ||
-                fprintf(fp, ",%d,", sqlite3_column_int(st, 20)) < 0 ||
-                logd_csv_escape(fp, logd_sqlite_text(st, 15, "{}")) != 0 ||
-                fputc('\n', fp) == EOF)
-                write_failed = 1;
+            struct json_object *arr = json_object_new_array();
+            logd_unifi_item_from_stmt(arr, st, logd_json_str(body, "locale", "zh-CN"));
+            struct json_object *item = json_object_array_get_idx(arr, 0);
+            struct json_object *params = json_object_object_get(item, "parameters");
+            struct json_object *raw = params ? json_object_object_get(params, "RAW") : NULL;
+            struct json_object *presentation = json_object_object_get(item, "presentation");
+            for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+                struct json_object *value = !strcmp(fields[i], "description") ?
+                    json_object_object_get(presentation, "description") : json_object_object_get(item, fields[i]);
+                if (!value && raw) value = json_object_object_get(raw, fields[i]);
+                if ((i && fputc(',', fp) == EOF) || logd_csv_escape(fp, value ? json_object_get_string(value) : "") != 0)
+                    write_failed = 1;
+            }
+            if (fputc('\n', fp) == EOF) write_failed = 1;
+            json_object_put(arr);
             count++;
         }
     } else {
@@ -2639,7 +2973,8 @@ struct json_object *logd_unifi_export(struct json_object *body)
             struct json_object *item;
             struct json_object *cef = NULL;
 
-            logd_unifi_item_from_stmt(arr, st);
+            logd_unifi_item_from_stmt(arr, st,
+                                          logd_json_str(body, "locale", "zh-CN"));
             item = json_object_array_get_idx(arr, 0);
             if (item && json_object_object_get_ex(item, "cef", &cef) && cef)
                 if (fprintf(fp, "%s\n", json_object_get_string(cef)) < 0)
@@ -2849,7 +3184,7 @@ struct json_object *logd_unifi_count(struct json_object *body)
     char where[2048];
     char sql[4096];
     int b = 1;
-    int64_t total = 0;
+    int64_t total = 0, unread = 0, acked = 0;
 
     logd_unifi_parse_query(body, &q);
     {
@@ -2861,13 +3196,17 @@ struct json_object *logd_unifi_count(struct json_object *body)
             json_object_object_add(resp, "ok", json_object_new_boolean(0));
             json_object_object_add(resp, "error", json_object_new_string(
                 where_rc == -2 ? "invalid_log_type" :
-                where_rc == -3 ? "invalid_log_sources" : "query_build_failed"));
+                where_rc == -3 ? "invalid_log_sources" :
+                where_rc == -4 ? "invalid_origin" :
+                where_rc == -5 ? "invalid_collectors" :
+            where_rc == -6 ? "invalid_domain" : where_rc == -7 ? "invalid_semantic" :
+            where_rc == -8 ? "invalid_categories" : where_rc == -9 ? "invalid_severities" : "query_build_failed"));
             json_object_put(by);
             return resp;
         }
     }
     logd_unifi_add_time_search_where(where, sizeof(where), &q);
-    snprintf(sql, sizeof(sql), "SELECT severity,COUNT(*)%s GROUP BY severity", where);
+    snprintf(sql, sizeof(sql), "SELECT " LOGD_LEVEL_SQL ",COUNT(*)," LOGD_STATE_COUNTS_SQL "%s GROUP BY 1", where);
     st = logd_prepare(sql);
     if (!st) {
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
@@ -2875,6 +3214,7 @@ struct json_object *logd_unifi_count(struct json_object *body)
         json_object_put(by);
         return resp;
     }
+    logd_unifi_bind_state_actor(st, &b, q.actor);
     logd_unifi_bind_common(st, &b, &q, sev_arr, cat_arr, evt_arr, mac_arr,
                            device_arr, admin_arr, program_arr, source_arr);
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -2888,6 +3228,8 @@ struct json_object *logd_unifi_count(struct json_object *body)
             prev = json_object_get_int64(old);
         json_object_object_add(by, uni, json_object_new_int64(prev + cnt));
         total += cnt;
+        unread += sqlite3_column_int64(st, 2);
+        acked += sqlite3_column_int64(st, 3);
     }
     sqlite3_finalize(st);
     {
@@ -2907,8 +3249,8 @@ struct json_object *logd_unifi_count(struct json_object *body)
     json_object_object_add(resp, "ok", json_object_new_boolean(1));
     json_object_object_add(resp, "total", json_object_new_int64(total));
     json_object_object_add(resp, "actor", json_object_new_string(q.actor ? q.actor : "default"));
-    json_object_object_add(resp, "unread_total", json_object_new_int64(logd_unifi_count_state(where, &q, sev_arr, cat_arr, evt_arr, mac_arr, device_arr, admin_arr, program_arr, source_arr, "unread")));
-    json_object_object_add(resp, "acked_total", json_object_new_int64(logd_unifi_count_state(where, &q, sev_arr, cat_arr, evt_arr, mac_arr, device_arr, admin_arr, program_arr, source_arr, "acked")));
+    json_object_object_add(resp, "unread_total", json_object_new_int64(unread));
+    json_object_object_add(resp, "acked_total", json_object_new_int64(acked));
     json_object_object_add(resp, "bySeverity", by);
     json_object_object_add(resp, "capabilities", logd_unifi_capabilities_json());
     return resp;
@@ -3035,203 +3377,123 @@ static void logd_unifi_client_filter_row(struct json_object *arr, const char *ma
     json_object_array_add(arr, o);
 }
 
-static void logd_unifi_filter_distinct(struct json_object *arr, const char *sql,
-                                       int map_category)
-{
-    sqlite3_stmt *st = logd_prepare(sql);
-
-    if (!st)
-        return;
-    while (sqlite3_step(st) == SQLITE_ROW) {
-        const char *raw = logd_sqlite_text(st, 0, "");
-        int64_t cnt = sqlite3_column_int64(st, 1);
-        char label[128];
-        const char *id = raw;
-
-        if (!raw[0])
-            continue;
-        if (map_category) {
-            id = logd_unifi_category(raw, "");
-            logd_unifi_title_case(id, label, sizeof(label));
-        } else {
-            id = logd_unifi_event_key("", raw);
-            logd_unifi_title_case(id, label, sizeof(label));
-        }
-        logd_unifi_filter_row(arr, id, label, cnt);
-    }
-    sqlite3_finalize(st);
-}
-
+/* Every facet uses the exact WHERE and bound values used by search/count/export. */
 struct json_object *logd_unifi_filter_data(struct json_object *body)
 {
+    static const struct { const char *name, *expr, *label; int limit; } fields[] = {
+        { "categories", LOGD_CATEGORY_SQL, LOGD_CATEGORY_SQL, 64 },
+        { "domains", LOGD_DOMAIN_SQL, LOGD_DOMAIN_SQL, 64 },
+        { "events", LOGD_EVENT_SQL, LOGD_EVENT_SQL, 256 },
+        { "deviceFilters", "COALESCE(NULLIF('iface:'||NULLIF(iface,''),''),NULLIF('wan:'||NULLIF(wan_id,''),''),'source:'||source)", "COALESCE(NULLIF(iface,''),NULLIF(wan_id,''),source)", 128 },
+        { "clientFilters", "mac", "COALESCE(NULLIF(json_extract(detail_json,'$.hostname'),''),NULLIF(ip,''),mac)", 128 },
+        { "adminFilters", "COALESCE(NULLIF(username,''),actor)", "COALESCE(NULLIF(username,''),actor)", 128 },
+        { "programs", "lower(rtrim(COALESCE(NULLIF(json_extract(detail_json,'$.program'),''),NULLIF(json_extract(detail_json,'$.module'),''),source),'[0123456789]()'))", "COALESCE(NULLIF(json_extract(detail_json,'$.program_label'),''),NULLIF(json_extract(detail_json,'$.program'),''),source)", 256 },
+        { "sources", LOGD_SOURCE_ID_SQL, LOGD_SOURCE_ID_SQL, 64 },
+        { "collectors", LOGD_COLLECTOR_ID_SQL, LOGD_COLLECTOR_ID_SQL, 32 },
+        { "origins", "CASE WHEN " LOGD_IS_RAW_SYSLOG_SQL " THEN 'RAW' ELSE 'STRUCTURED' END", "''", 2 },
+        { "semantics", "CASE WHEN " LOGD_BUSINESS_SQL " THEN 'BUSINESS' ELSE 'UNCLASSIFIED' END", "''", 2 },
+    };
+    struct logd_unifi_query q;
+    struct json_object *sev = NULL, *cat = NULL, *evt = NULL, *mac = NULL;
+    struct json_object *device = NULL, *admin = NULL, *program = NULL, *source = NULL;
     struct json_object *resp = json_object_new_object();
-    struct json_object *categories = json_object_new_array();
-    struct json_object *events = json_object_new_array();
-    struct json_object *devices = json_object_new_array();
-    struct json_object *clients = json_object_new_array();
-    struct json_object *admins = json_object_new_array();
-    struct json_object *programs = json_object_new_array();
+    struct json_object *catalog = json_object_new_array();
     sqlite3_stmt *st = NULL;
-
-    (void)body;
-    logd_unifi_filter_row(categories, "SYSTEM", "System", 0);
-    logd_unifi_filter_row(categories, "INTERNET_AND_WAN", "Internet and WAN", 0);
-    logd_unifi_filter_row(categories, "CLIENT_DEVICES", "Client Devices", 0);
-    logd_unifi_filter_row(categories, "ADMIN", "Admin", 0);
-    logd_unifi_filter_row(categories, "SECURITY", "Security", 0);
-    logd_unifi_filter_row(categories, "VPN", "VPN", 0);
-    logd_unifi_filter_distinct(categories, "SELECT category,COUNT(*) FROM log_events GROUP BY category ORDER BY COUNT(*) DESC LIMIT 64", 1);
-    logd_unifi_filter_row(events, "SYSTEM_LOG", "System Log", 0);
-    logd_unifi_filter_row(events, "SYSTEM_RESOURCE_THRESHOLD", "System Resource Threshold", 0);
-    logd_unifi_filter_row(events, "CLIENT_CONNECTED_WIRED", "Wired Client Connected", 0);
-    logd_unifi_filter_row(events, "CLIENT_DISCONNECTED", "Client Disconnected", 0);
-    logd_unifi_filter_row(events, "PORT_LINK_UP", "Port Link Up", 0);
-    logd_unifi_filter_row(events, "PORT_LINK_DOWN", "Port Link Down", 0);
-    logd_unifi_filter_row(events, "PORT_EVENT", "Port Event", 0);
-    logd_unifi_filter_row(events, "WAN_EVENT", "WAN Event", 0);
-    logd_unifi_filter_row(events, "PPPOE_EVENT", "PPPoE Event", 0);
-    logd_unifi_filter_row(events, "ADMIN_AUTH_EVENT", "Admin Auth Event", 0);
-    logd_unifi_filter_row(events, "PACKET_CAPTURE_STARTED", "Packet Capture Started", 0);
-    logd_unifi_filter_row(events, "PACKET_CAPTURE_STOPPED", "Packet Capture Stopped", 0);
-    logd_unifi_filter_row(events, "PACKET_CAPTURE_FINISHED", "Packet Capture Finished", 0);
-    logd_unifi_filter_row(events, "PACKET_CAPTURE_DELETED", "Packet Capture Deleted", 0);
-    logd_unifi_filter_row(events, "DHCP_EVENT", "DHCP Event", 0);
-    logd_unifi_filter_distinct(events, "SELECT event,COUNT(*) FROM log_events GROUP BY event ORDER BY COUNT(*) DESC LIMIT 128", 0);
-
-    st = logd_prepare("SELECT iface,COUNT(*) FROM log_events WHERE iface!='' GROUP BY iface ORDER BY COUNT(*) DESC LIMIT 64");
-    if (st) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            const char *iface = logd_sqlite_text(st, 0, "");
-            char id[96];
-            char name[128];
-
-            snprintf(id, sizeof(id), "iface:%s", iface);
-            snprintf(name, sizeof(name), "Interface %s", iface);
-            logd_unifi_device_filter_row(devices, id, name, "iface", iface,
-                                         sqlite3_column_int64(st, 1));
-        }
-        sqlite3_finalize(st);
+    char where[2048];
+    sqlite3_str *builder;
+    char *sql;
+    size_t i;
+    int rc;
+    logd_unifi_parse_query(body, &q);
+    rc = logd_unifi_build_where(body, where, sizeof(where), &sev, &cat, &evt,
+                                &mac, &device, &admin, &program, &source);
+    if (rc) {
+        json_object_object_add(resp, "error", json_object_new_string(
+            rc == -2 ? "invalid_log_type" : rc == -3 ? "invalid_log_sources" :
+            rc == -4 ? "invalid_origin" : rc == -5 ? "invalid_collectors" :
+            rc == -6 ? "invalid_domain" : rc == -7 ? "invalid_semantic" :
+            rc == -8 ? "invalid_categories" : rc == -9 ? "invalid_severities" : "query_build_failed"));
+        goto failed;
     }
-
-    st = logd_prepare("SELECT wan_id,COUNT(*) FROM log_events WHERE wan_id!='' GROUP BY wan_id ORDER BY COUNT(*) DESC LIMIT 64");
-    if (st) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            const char *wan = logd_sqlite_text(st, 0, "");
-            char id[96];
-            char name[128];
-
-            snprintf(id, sizeof(id), "wan:%s", wan);
-            snprintf(name, sizeof(name), "WAN %s", wan);
-            logd_unifi_device_filter_row(devices, id, name, "wan", wan,
-                                         sqlite3_column_int64(st, 1));
-        }
-        sqlite3_finalize(st);
+    logd_unifi_add_time_search_where(where, sizeof(where), &q);
+    /* Materialize the matching rows once. Repeating the WHERE (including JSON
+     * classification) for each facet blocks the single ubus loop on real logs. */
+    builder = sqlite3_str_new(g_logd_db);
+    sqlite3_str_appendall(builder, "WITH matched AS MATERIALIZED (SELECT ");
+    for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        json_object_object_add(resp, fields[i].name, json_object_new_array());
+        sqlite3_str_appendf(builder, "%s%s AS v%d", i ? "," : "", fields[i].expr, (int)i);
+        if (strcmp(fields[i].expr, fields[i].label))
+            sqlite3_str_appendf(builder, ",%s AS l%d", fields[i].label, (int)i);
     }
-
-    st = logd_prepare("SELECT source,COUNT(*) FROM log_events WHERE source!='' GROUP BY source ORDER BY COUNT(*) DESC LIMIT 64");
-    if (st) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            const char *source = logd_sqlite_text(st, 0, "");
-            char id[128];
-            char name[160];
-
-            snprintf(id, sizeof(id), "source:%s", source);
-            snprintf(name, sizeof(name), "Source %s", source);
-            logd_unifi_device_filter_row(devices, id, name, "source", source,
-                                         sqlite3_column_int64(st, 1));
-        }
-        sqlite3_finalize(st);
+    sqlite3_str_appendf(builder, "%s) ", where);
+    for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++) {
+        sqlite3_str_appendf(builder,
+            "%sSELECT %d,id,label,n FROM (SELECT v%d AS id,MAX(%c%d) AS label,COUNT(*) AS n "
+            "FROM matched WHERE v%d<>'' GROUP BY v%d ORDER BY n DESC,id LIMIT %d)",
+            i ? " UNION ALL " : "", (int)i, (int)i,
+            strcmp(fields[i].expr, fields[i].label) ? 'l' : 'v', (int)i,
+            (int)i, (int)i, fields[i].limit);
     }
-
-    st = logd_prepare(
-        "SELECT mac,MAX(ip),MAX(json_extract(detail_json,'$.hostname')),MAX(json_extract(detail_json,'$.client_id')),COUNT(*) "
-        "FROM log_events WHERE mac!='' GROUP BY mac ORDER BY COUNT(*) DESC LIMIT 128");
-    if (st) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            const char *mac = logd_sqlite_text(st, 0, "");
-            const char *ip = logd_sqlite_text(st, 1, "");
-            const char *hostname = logd_sqlite_text(st, 2, "");
-            const char *client_id = logd_sqlite_text(st, 3, "");
-
-            logd_unifi_client_filter_row(clients, mac, ip, hostname, client_id,
-                                         sqlite3_column_int64(st, 4));
-        }
-        sqlite3_finalize(st);
+    sql = sqlite3_str_finish(builder);
+    if (!sql) goto unavailable;
+    st = logd_prepare(sql);
+    sqlite3_free(sql);
+    if (!st) goto unavailable;
+    {
+        int bind = 1;
+        logd_unifi_bind_common(st, &bind, &q, sev, cat, evt, mac, device, admin, program, source);
     }
-
-    st = logd_prepare(
-        "SELECT json_extract(detail_json,'$.mac'),MAX(json_extract(detail_json,'$.ip')),MAX(json_extract(detail_json,'$.hostname')),MAX(json_extract(detail_json,'$.client_id')),COUNT(*) "
-        "FROM log_events WHERE mac='' AND json_extract(detail_json,'$.mac') IS NOT NULL AND json_extract(detail_json,'$.mac')!='' "
-        "GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 128");
-    if (st) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            const char *mac = logd_sqlite_text(st, 0, "");
-            const char *ip = logd_sqlite_text(st, 1, "");
-            const char *hostname = logd_sqlite_text(st, 2, "");
-            const char *client_id = logd_sqlite_text(st, 3, "");
-
-            logd_unifi_client_filter_row(clients, mac, ip, hostname, client_id,
-                                         sqlite3_column_int64(st, 4));
-        }
-        sqlite3_finalize(st);
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        i = (size_t)sqlite3_column_int(st, 0);
+        const char *id = logd_sqlite_text(st, 1, "");
+        const char *label = logd_sqlite_text(st, 2, "");
+        const struct dw_event_domain_definition *domain = dw_event_domain_find(id);
+        const struct dw_event_definition *def = dw_event_definition_find(id);
+        struct json_object *row = json_object_new_object();
+        struct json_object *arr = json_object_object_get(resp, fields[i].name);
+        int en = !strcmp(dw_event_locale_normalize(logd_json_str(body, "locale", "zh-CN")), "en");
+        if ((!strcmp(fields[i].name,"categories") || !strcmp(fields[i].name,"domains")) && domain)
+            label = en ? domain->label_en : domain->label_zh;
+        else if (!strcmp(fields[i].name,"events") && def)
+            label = en ? def->label_en : def->label_zh;
+        json_object_object_add(row, "id", json_object_new_string(id));
+        json_object_object_add(row, "name", json_object_new_string(label[0] ? label : id));
+        json_object_object_add(row, "label", json_object_new_string(label[0] ? label : id));
+        json_object_object_add(row, "count", json_object_new_int64(sqlite3_column_int64(st, 3)));
+        if (!strcmp(fields[i].name,"clientFilters"))
+            json_object_object_add(row, "mac", json_object_new_string(id));
+        json_object_array_add(arr, row);
     }
-
-    st = logd_prepare(
-        "SELECT COALESCE(NULLIF(username,''),NULLIF(actor,''),NULLIF(json_extract(detail_json,'$.username'),''),NULLIF(json_extract(detail_json,'$.user'),''),NULLIF(json_extract(detail_json,'$.actor'),'')),COUNT(*) "
-        "FROM log_events WHERE username!='' OR actor!='' OR json_extract(detail_json,'$.username')!='' OR json_extract(detail_json,'$.user')!='' OR json_extract(detail_json,'$.actor')!='' "
-        "GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 64");
-    if (st) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            struct json_object *o = json_object_new_object();
-            const char *id = logd_sqlite_text(st, 0, "");
-            json_object_object_add(o, "id", json_object_new_string(id));
-            json_object_object_add(o, "name", json_object_new_string(id));
-            json_object_object_add(o, "count", json_object_new_int64(sqlite3_column_int64(st, 1)));
-            json_object_array_add(admins, o);
+    sqlite3_finalize(st); st = NULL;
+    if (rc != SQLITE_DONE) goto unavailable;
+    for (i = 0; i < dw_event_domains_count; i++) {
+        struct json_object *entry = json_object_new_object();
+        size_t j;
+        int producers = 0;
+        for (j = 0; j < dw_event_definitions_count; j++) {
+            const struct dw_event_definition *def = &dw_event_definitions[j];
+            if (!strcmp(dw_event_domain(def->category, def->id, NULL), dw_event_domains[i].id) &&
+                def->available && def->producer[0]) producers++;
         }
-        sqlite3_finalize(st);
+        json_object_object_add(entry,"id",json_object_new_string(dw_event_domains[i].id));
+        json_object_object_add(entry,"label",json_object_new_string(dw_event_domains[i].label_zh));
+        json_object_object_add(entry,"integration_status",json_object_new_string(producers ? "declared" : "not_integrated"));
+        json_object_object_add(entry,"producer_count",json_object_new_int(producers));
+        json_object_object_add(entry,"device_support",json_object_new_string("unknown"));
+        json_object_object_add(entry,"verified",json_object_new_boolean(0));
+        json_object_array_add(catalog,entry);
     }
-
-    st = logd_prepare(
-        "SELECT CASE lower(rtrim(COALESCE(NULLIF(json_extract(detail_json,'$.program'),''),"
-        "NULLIF(json_extract(detail_json,'$.module'),''),source),'[0123456789]()')) "
-        "WHEN 'kernel_log' THEN 'kernel' WHEN 'system_log' THEN 'system' "
-        "ELSE lower(rtrim(COALESCE(NULLIF(json_extract(detail_json,'$.program'),''),"
-        "NULLIF(json_extract(detail_json,'$.module'),''),source),'[0123456789]()')) END," 
-        "MAX(json_extract(detail_json,'$.program_label'))," 
-        "MAX(json_extract(detail_json,'$.package')),COUNT(*) "
-        "FROM log_events WHERE COALESCE(NULLIF(json_extract(detail_json,'$.program'),''),"
-        "NULLIF(json_extract(detail_json,'$.module'),''),source)!='' "
-        "GROUP BY 1 ORDER BY COUNT(*) DESC LIMIT 256");
-    if (st) {
-        while (sqlite3_step(st) == SQLITE_ROW) {
-            struct json_object *o = json_object_new_object();
-            const char *id = logd_sqlite_text(st, 0, "");
-            const char *label = logd_sqlite_text(st, 1, "");
-            const char *package = logd_sqlite_text(st, 2, "");
-
-            if (!id[0]) {
-                json_object_put(o);
-                continue;
-            }
-            json_object_object_add(o, "id", json_object_new_string(id));
-            json_object_object_add(o, "name", json_object_new_string(label[0] ? label : id));
-            json_object_object_add(o, "label", json_object_new_string(label[0] ? label : id));
-            json_object_object_add(o, "package", json_object_new_string(package));
-            json_object_object_add(o, "count", json_object_new_int64(sqlite3_column_int64(st, 3)));
-            json_object_array_add(programs, o);
-        }
-        sqlite3_finalize(st);
-    }
-
-    json_object_object_add(resp, "ok", json_object_new_boolean(1));
-    json_object_object_add(resp, "categories", categories);
-    json_object_object_add(resp, "events", events);
-    json_object_object_add(resp, "deviceFilters", devices);
-    json_object_object_add(resp, "clientFilters", clients);
-    json_object_object_add(resp, "adminFilters", admins);
-    json_object_object_add(resp, "programs", programs);
-    json_object_object_add(resp, "capabilities", logd_unifi_capabilities_json());
+    json_object_object_add(resp,"domain_catalog",catalog);
+    json_object_object_add(resp,"ok",json_object_new_boolean(1));
+    json_object_object_add(resp,"capabilities",logd_unifi_capabilities_json());
+    return resp;
+unavailable:
+    if (st) sqlite3_finalize(st);
+    json_object_object_add(resp,"error",json_object_new_string("filter_data_unavailable"));
+failed:
+    json_object_put(catalog);
+    json_object_object_add(resp,"ok",json_object_new_boolean(0));
     return resp;
 }
 

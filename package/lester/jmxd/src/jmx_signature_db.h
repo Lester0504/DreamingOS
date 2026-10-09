@@ -32,6 +32,19 @@ int jmx_signature_db_open_path(const char *path, sqlite3 **db);
 int jmx_signature_db_close_path(sqlite3 *db);
 const char *jmx_signature_db_last_error(void);
 
+/* Serialized control-plane reader lease. Retains one verified, locked
+ * corpus between requests; revalidates the source and both keys on acquire.
+ * Finalize all statements and release on the same thread after a successful
+ * acquire. Plaintext paths are opened/closed normally. Never nest leases. */
+int jmx_signature_db_acquire_path(const char *path, sqlite3 **db);
+void jmx_signature_db_release_path(sqlite3 *db);
+void jmx_signature_db_cache_clear(void);
+
+#ifdef JMX_SIGNATURE_DB_TEST_HOOKS
+/* Test-only failure injection; production builds do not expose this symbol. */
+void jmx_signature_db_test_fail_open(int enabled);
+#endif
+
 /* Offline/build-time compatibility for tools that inspect a source SQLite DB.
  * Never use this entry point for a runtime signature authority. */
 int jmx_signature_db_open_plaintext_path(const char *path, sqlite3 **db);

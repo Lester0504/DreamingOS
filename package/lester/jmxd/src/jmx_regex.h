@@ -7,6 +7,8 @@
 #define __JMX_REGEX_H__
 
 #include "jmx_rule.h"
+#include <json-c/json.h>
+struct json_object *jmx_regex_memory_json(void);
 
 /*
  * Initialize the regex engine from a rule set.

@@ -9,6 +9,8 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <ifaddrs.h>
+#include <net/if.h>
 #include <limits.h>
 #include <poll.h>
 #include <pwd.h>
@@ -58,9 +60,23 @@
 #define JMX_NFSD_THREADS_PATH "/proc/fs/nfsd/threads"
 #endif
 
+#ifndef JMX_NFSD_INIT_PATH
+#define JMX_NFSD_INIT_PATH "/etc/init.d/nfsd"
+#endif
+#ifndef JMX_RPC_BIND_INIT_PATH
+#define JMX_RPC_BIND_INIT_PATH "/etc/init.d/rpcbind"
+#endif
+#ifndef JMX_SAMBA_PDBEDIT_PATH
+#define JMX_SAMBA_PDBEDIT_PATH "/usr/bin/pdbedit"
+#endif
+
+#ifndef JMX_WEBDAV_CONFIG_DIR
+#define JMX_WEBDAV_CONFIG_DIR "/etc/config"
+#endif
+
 #define FS_API_OK 2000
 #define FS_API_ERROR 4000
-#define FS_SCHEMA_VERSION 1
+#define FS_SCHEMA_VERSION 3
 #define FS_DB_BUSY_TIMEOUT_MS 5000
 #define FS_SERVICE_TIMEOUT_MS 15000
 #define FS_SERVICE_OUTPUT_MAX (16U * 1024U)
@@ -118,6 +134,43 @@ struct fs_nfs_export {
     int64_t updated_at;
 };
 
+static int fs_nfsd_threads_positive(struct fs_exec_result *result);
+static int fs_accounts_schema(sqlite3 *db);
+static int fs_dav_schema(sqlite3 *db);
+static int fs_dav_any_running(sqlite3 *db);
+static int fs_dav_wants_running(sqlite3 *db);
+static struct json_object *fs_dav_action(struct json_object *req);
+static struct json_object *fs_dav_get(sqlite3 *db);
+static int fs_dav_account_refs(sqlite3 *db,const char *login,struct json_object *refs);
+static int fs_dav_apply(sqlite3 *db,struct fs_snapshot *old,int *replaced,int start,const char **reason);
+static int fs_dav_restore(const struct fs_snapshot *old,int replaced,int running);
+static int fs_ftp_schema(sqlite3 *db);
+static int fs_ftp_installed(void);
+static int fs_ftp_running(void);
+static int fs_ftp_wants_running(sqlite3 *db);
+static struct json_object *fs_ftp_get(sqlite3 *db);
+static struct json_object *fs_ftp_action(struct json_object *req);
+static int fs_ftp_account_refs(sqlite3 *db,const char *login,struct json_object *refs);
+static int fs_ftp_apply(sqlite3 *db,struct fs_snapshot *old,int *replaced,int start,const char **reason);
+static int fs_ftp_restore(const struct fs_snapshot *old,int replaced,int running);
+static void fs_ftp_reconcile(sqlite3 *db);
+static int fs_bindings_schema(sqlite3 *db);
+static int fs_bindings_seed(sqlite3 *db);
+static int fs_binding_update(sqlite3 *db,const char *service,const char *id,const char *path,int enabled,struct json_object *payload);
+static int fs_binding_available(sqlite3 *db,const char *service,const char *id,const char *path);
+static int fs_binding_target(const char *id,char *path,size_t size);
+static struct json_object *fs_binding_identity(const char *path);
+static int fs_binding_equal(struct json_object *a,struct json_object *b);
+static int fs_binding_pin(const char *id,const char *path,struct json_object *identity,char *target,size_t size);
+static int fs_binding_mounted(const char *path);
+static void fs_binding_unpin(const char *id);
+static int fs_binding_prepare(sqlite3 *db,const char *service,const char *id,const char *path,char *target,size_t size);
+static void fs_binding_sweep(sqlite3 *db,const char *service);
+static void fs_binding_status(sqlite3 *db,struct json_object *item,const char *service,const char *id,const char *path);
+
+static int fs_operations_schema(sqlite3 *db);
+static int fs_operation_receipt(sqlite3 *db, const char *id, int64_t revision, int deleted);
+static struct json_object *fs_accounts_data(sqlite3 *db);
 static int fs_write_all(int fd, const void *data, size_t len);
 static void fs_probe_error(struct fs_exec_result *result, int exit_code);
 
@@ -239,6 +292,8 @@ static int fs_table_has_rows(sqlite3 *db, const char *table)
     return exists;
 }
 
+static void fs_nfs_defaults_read(sqlite3 *db, struct json_object *data);
+
 static int fs_schema_create(sqlite3 *db)
 {
     static const char schema[] =
@@ -262,6 +317,10 @@ static int fs_schema_create(sqlite3 *db)
         "guest_access INTEGER NOT NULL DEFAULT 0 CHECK(guest_access IN(0,1)),"
         "revision INTEGER NOT NULL DEFAULT 1,"
         "updated_at INTEGER NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS samba_service_policy(id INTEGER PRIMARY KEY CHECK(id=1));"
+        "CREATE TABLE IF NOT EXISTS nfs_service_defaults(id INTEGER PRIMARY KEY CHECK(id=1),"
+        "clients TEXT NOT NULL,options TEXT NOT NULL,revision INTEGER NOT NULL);"
+        "INSERT OR IGNORE INTO nfs_service_defaults VALUES(1,'','ro,sync,root_squash,no_subtree_check',1);"
         "CREATE TABLE IF NOT EXISTS samba_share("
         "id TEXT PRIMARY KEY,"
         "name TEXT NOT NULL COLLATE NOCASE UNIQUE,"
@@ -276,6 +335,9 @@ static int fs_schema_create(sqlite3 *db)
         "revision INTEGER NOT NULL DEFAULT 1,"
         "created_at INTEGER NOT NULL,"
         "updated_at INTEGER NOT NULL);"
+        "CREATE TABLE IF NOT EXISTS samba_share_acl("
+        "share_id TEXT PRIMARY KEY REFERENCES samba_share(id) ON DELETE CASCADE,"
+        "read_only_users_json TEXT NOT NULL DEFAULT '[]');"
         "CREATE TABLE IF NOT EXISTS nfs_export("
         "id TEXT PRIMARY KEY,"
         "enabled INTEGER NOT NULL DEFAULT 1 CHECK(enabled IN(0,1)),"
@@ -297,7 +359,8 @@ static int fs_schema_create(sqlite3 *db)
             "(id,schema_version,authority,uci_migrated,migration_state,revision,last_error,updated_at)"
             " VALUES(1,?1,'config_db',0,'pending',0,'',?2)") != 0)
         return -1;
-    sqlite3_bind_int(st, 1, FS_SCHEMA_VERSION);
+    /* Mark initialization complete only after every protocol schema and seed. */
+    sqlite3_bind_int(st, 1, 0);
     sqlite3_bind_int64(st, 2, now);
     if (fs_step_done(st) != 0) {
         sqlite3_finalize(st);
@@ -400,7 +463,7 @@ static int fs_path_forbidden(const char *path)
 {
     static const char *const denied[] = {
         "/proc", "/sys", "/dev", "/run", "/boot", "/etc", "/usr",
-        "/bin", "/sbin", "/lib", "/lib64"
+        "/bin", "/sbin", "/lib", "/lib64", "/remote-share"
     };
     size_t i;
 
@@ -410,7 +473,7 @@ static int fs_path_forbidden(const char *path)
     return 0;
 }
 
-static int fs_share_path_ok(const char *path, char *canonical, size_t canonical_len)
+static int fs_migration_path_ok(const char *path, char *canonical, size_t canonical_len)
 {
     char resolved[PATH_MAX];
     char parent[PATH_MAX];
@@ -448,6 +511,47 @@ static int fs_share_path_ok(const char *path, char *canonical, size_t canonical_
     return 0;
 }
 
+static int fs_share_path_ok(const char *path, char *canonical, size_t canonical_len)
+{
+    char resolved[PATH_MAX];
+
+    if (!path || path[0] != '/' || !strcmp(path, "/") || strlen(path) > FS_MAX_PATH ||
+        !fs_text_ok(path, FS_MAX_PATH, 1) || fs_path_has_dotdot(path) ||
+        fs_path_forbidden(path))
+        return 0;
+    if (realpath(path, resolved)) {
+        struct stat st;
+        if (!strcmp(resolved, "/") || fs_path_forbidden(resolved) || stat(resolved, &st) != 0 ||
+            !S_ISDIR(st.st_mode) || strlen(resolved) >= canonical_len)
+            return 0;
+        if (fs_path_prefix(resolved, "/mnt") || fs_path_prefix(resolved, "/media")) {
+            struct stat root;
+            if (stat("/", &root) != 0 || root.st_dev == st.st_dev) return 0;
+        }
+        snprintf(canonical, canonical_len, "%s", resolved);
+        return 1;
+    }
+
+    return 0;
+}
+
+/* Revoking an existing publication must still work after its disk disappears. */
+static int fs_share_path_update_ok(const char *path, const char *previous,
+                                   struct json_object *payload,
+                                   char *canonical, size_t canonical_len)
+{
+    struct json_object *enabled = NULL;
+    if (fs_share_path_ok(path, canonical, canonical_len)) return 1;
+    if (path && previous && previous[0] && !strcmp(path, previous) &&
+        json_object_object_get_ex(payload, "enabled", &enabled) &&
+        json_object_is_type(enabled, json_type_boolean) &&
+        !json_object_get_boolean(enabled) && strlen(previous) < canonical_len) {
+        snprintf(canonical, canonical_len, "%s", previous);
+        return 1;
+    }
+    return 0;
+}
+
 static struct json_object *fs_payload(struct json_object *req)
 {
     struct json_object *data = NULL;
@@ -481,7 +585,7 @@ static int fs_json_string(struct json_object *req, const char *key,
     if (!item || !json_object_is_type(item, json_type_string))
         return -1;
     *value = json_object_get_string(item);
-    return *value ? 0 : -1;
+    return *value && strlen(*value) == (size_t)json_object_get_string_len(item) ? 0 : -1;
 }
 
 static int fs_json_bool(struct json_object *req, const char *key,
@@ -1118,7 +1222,7 @@ static int fs_migration_insert_samba_share(sqlite3 *db, int ordinal,
     int rc = -1;
 
     if (!array || !fs_samba_name_ok(name) ||
-        !fs_share_path_ok(path, canonical, sizeof(canonical)))
+        !fs_migration_path_ok(path, canonical, sizeof(canonical)))
         goto out;
     if (users && users[0]) {
         snprintf(user_copy, sizeof(user_copy), "%s", users);
@@ -1365,7 +1469,7 @@ static int fs_migration_insert_nfs(sqlite3 *db, int ordinal, int enabled,
     sqlite3_stmt *st = NULL;
     int rc = -1;
 
-    if (!fs_share_path_ok(path, canonical, sizeof(canonical)) ||
+    if (!fs_migration_path_ok(path, canonical, sizeof(canonical)) ||
         !fs_nfs_clients_ok(clients) || !fs_nfs_options_ok(options))
         return -1;
     snprintf(id, sizeof(id), "nfs-migrated-%d", ordinal);
@@ -1480,8 +1584,9 @@ rollback:
 static int fs_db_open(sqlite3 **db_out)
 {
     sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
     int flags = SQLITE_OPEN_READWRITE | SQLITE_OPEN_CREATE | SQLITE_OPEN_FULLMUTEX;
-    int samba_preexisting, nfs_preexisting;
+    int samba_preexisting, nfs_preexisting, ready = 0;
 
     *db_out = NULL;
     if (sqlite3_open_v2(JMX_FILE_SERVICES_DB_PATH, &db, flags, NULL) != SQLITE_OK) {
@@ -1490,17 +1595,42 @@ static int fs_db_open(sqlite3 **db_out)
         return -1;
     }
     sqlite3_busy_timeout(db, FS_DB_BUSY_TIMEOUT_MS);
+    if (fs_sql_exec(db, "PRAGMA foreign_keys=ON") != 0)
+        goto fail;
+    /* A status read must not request a write lock while the binding watcher
+     * applies protocol configuration. FS_SCHEMA_VERSION covers all schemas below. */
+    if (fs_prepare(db, &st,
+            "SELECT schema_version,uci_migrated FROM file_service_meta WHERE id=1") == 0) {
+        ready = sqlite3_step(st) == SQLITE_ROW &&
+                sqlite3_column_int(st, 0) >= FS_SCHEMA_VERSION &&
+                sqlite3_column_int(st, 1);
+        sqlite3_finalize(st);
+    }
+    if (ready) {
+        if (fs_bindings_seed(db) != 0)
+            goto fail;
+        *db_out = db;
+        return 0;
+    }
     samba_preexisting = fs_table_has_rows(db, "samba_service") ||
                         fs_table_has_rows(db, "samba_share");
     nfs_preexisting = fs_table_has_rows(db, "nfs_export");
-    if (fs_sql_exec(db, "PRAGMA foreign_keys=ON") != 0 ||
-        fs_schema_create(db) != 0 ||
-        fs_migrate_once(db, samba_preexisting, nfs_preexisting) != 0) {
-        sqlite3_close(db);
-        return -1;
+    if (fs_schema_create(db) != 0 || fs_accounts_schema(db) != 0 || fs_operations_schema(db) != 0 || fs_dav_schema(db) != 0 || fs_ftp_schema(db) != 0 || fs_bindings_schema(db) != 0 ||
+        fs_migrate_once(db, samba_preexisting, nfs_preexisting) != 0 || fs_bindings_seed(db) != 0) {
+        goto fail;
     }
+    if (fs_prepare(db, &st, "UPDATE file_service_meta SET schema_version=?1 WHERE id=1") != 0)
+        goto fail;
+    sqlite3_bind_int(st, 1, FS_SCHEMA_VERSION);
+    int rc = fs_step_done(st);
+    sqlite3_finalize(st);
+    if (rc != 0)
+        goto fail;
     *db_out = db;
     return 0;
+fail:
+    sqlite3_close(db);
+    return -1;
 }
 
 static int fs_random_id(sqlite3 *db, const char *prefix, const char *table,
@@ -1603,17 +1733,18 @@ static struct json_object *fs_capabilities_all(void)
     json_object_object_add(samba, "expected_revision_required", json_object_new_boolean(1));
     json_object_object_add(samba, "config_preflight", json_object_new_boolean(1));
     json_object_object_add(samba, "runtime_probe", json_object_new_boolean(1));
-    json_object_object_add(samba, "settings", json_object_new_boolean(0));
+    json_object_object_add(samba, "settings", json_object_new_boolean(1));
     json_object_object_add(nfs, "exports", json_object_new_boolean(1));
     json_object_object_add(nfs, "conditional_write", json_object_new_boolean(1));
     json_object_object_add(nfs, "expected_revision_required", json_object_new_boolean(1));
     json_object_object_add(nfs, "config_preflight", json_object_new_boolean(1));
     json_object_object_add(nfs, "runtime_probe", json_object_new_boolean(1));
+    json_object_object_add(nfs, "settings", json_object_new_boolean(1));
     json_object_object_add(nfs, "mounts", json_object_new_boolean(0));
     json_object_object_add(webdav, "settings", json_object_new_boolean(0));
     json_object_object_add(webdav, "download_registry", json_object_new_boolean(0));
-    json_object_object_add(ftp, "settings", json_object_new_boolean(0));
-    json_object_object_add(ftp, "users", json_object_new_boolean(0));
+    const char *ftp_keys[]={"settings","shares","users","actions","autostart","tls"};
+    for(size_t i=0;i<sizeof ftp_keys/sizeof ftp_keys[0];i++)json_object_object_add(ftp,ftp_keys[i],json_object_new_boolean(fs_ftp_installed()));
     json_object_object_add(all, "samba", samba);
     json_object_object_add(all, "nfs", nfs);
     json_object_object_add(all, "webdav", webdav);
@@ -1629,18 +1760,16 @@ static struct json_object *fs_capability_reasons_all(void)
     struct json_object *webdav = json_object_new_object();
     struct json_object *ftp = json_object_new_object();
 
-    json_object_object_add(samba, "settings",
-                           json_object_new_string("service_settings_apply_pending"));
     json_object_object_add(nfs, "mounts",
                            json_object_new_string("nfs_mount_manager_pending"));
     json_object_object_add(webdav, "settings",
-                           json_object_new_string("secret_encryption_apply_pending"));
+                           json_object_new_string("shared_nginx_transaction_and_acl_pending"));
     json_object_object_add(webdav, "download_registry",
-                           json_object_new_string("secret_encryption_apply_pending"));
-    json_object_object_add(ftp, "settings",
-                           json_object_new_string("runtime_not_installed"));
-    json_object_object_add(ftp, "users",
-                           json_object_new_string("runtime_not_installed"));
+                           json_object_new_string("shared_nginx_transaction_and_acl_pending"));
+    if(!fs_ftp_installed()){
+        const char *keys[]={"settings","shares","users","actions","autostart","tls"};
+        for(size_t i=0;i<sizeof keys/sizeof keys[0];i++)json_object_object_add(ftp,keys[i],json_object_new_string("managed_ftp_runtime_missing"));
+    }
     json_object_object_add(all, "samba", samba);
     json_object_object_add(all, "nfs", nfs);
     json_object_object_add(all, "webdav", webdav);
@@ -1688,13 +1817,14 @@ static struct json_object *fs_json_array_text(const char *text)
     return value;
 }
 
-static struct json_object *fs_samba_share_row(sqlite3_stmt *st)
+static struct json_object *fs_samba_share_row(sqlite3 *db,sqlite3_stmt *st)
 {
     struct json_object *item = json_object_new_object();
 
     json_object_object_add(item, "id", json_object_new_string(fs_sql_text(st, 0, "")));
     json_object_object_add(item, "name", json_object_new_string(fs_sql_text(st, 1, "")));
     json_object_object_add(item, "path", json_object_new_string(fs_sql_text(st, 2, "")));
+    fs_binding_status(db,item,"samba",fs_sql_text(st,0,""),fs_sql_text(st,2,""));
     json_object_object_add(item, "enabled", json_object_new_boolean(sqlite3_column_int(st, 3)));
     json_object_object_add(item, "read_only", json_object_new_boolean(sqlite3_column_int(st, 4)));
     json_object_object_add(item, "browseable", json_object_new_boolean(sqlite3_column_int(st, 5)));
@@ -1703,6 +1833,7 @@ static struct json_object *fs_samba_share_row(sqlite3_stmt *st)
     json_object_object_add(item, "guest_access", json_object_new_boolean(sqlite3_column_int(st, 7)));
     json_object_object_add(item, "allowed_users",
                            fs_json_array_text(fs_sql_text(st, 8, "[]")));
+    json_object_object_add(item, "read_only_users", fs_json_array_text(fs_sql_text(st, 13, "[]")));
     json_object_object_add(item, "note", json_object_new_string(fs_sql_text(st, 9, "")));
     json_object_object_add(item, "revision", json_object_new_int64(sqlite3_column_int64(st, 10)));
     json_object_object_add(item, "created_at",
@@ -1712,13 +1843,14 @@ static struct json_object *fs_samba_share_row(sqlite3_stmt *st)
     return item;
 }
 
-static struct json_object *fs_nfs_export_row(sqlite3_stmt *st)
+static struct json_object *fs_nfs_export_row(sqlite3 *db,sqlite3_stmt *st)
 {
     struct json_object *item = json_object_new_object();
 
     json_object_object_add(item, "id", json_object_new_string(fs_sql_text(st, 0, "")));
     json_object_object_add(item, "enabled", json_object_new_boolean(sqlite3_column_int(st, 1)));
     json_object_object_add(item, "path", json_object_new_string(fs_sql_text(st, 2, "")));
+    fs_binding_status(db,item,"nfs",fs_sql_text(st,0,""),fs_sql_text(st,2,""));
     json_object_object_add(item, "clients", json_object_new_string(fs_sql_text(st, 3, "")));
     json_object_object_add(item, "options", json_object_new_string(fs_sql_text(st, 4, "")));
     json_object_object_add(item, "note", json_object_new_string(fs_sql_text(st, 5, "")));
@@ -1728,6 +1860,159 @@ static struct json_object *fs_nfs_export_row(sqlite3_stmt *st)
     json_object_object_add(item, "updated_at",
                            json_object_new_int64(sqlite3_column_int64(st, 8)));
     return item;
+}
+
+/* Runtime control belongs to the protocol daemon, not to SSH or global nginx. */
+static const char *fs_control_script(const char *service)
+{
+    if (!strcmp(service, "samba")) return JMX_SAMBA_INIT_PATH;
+    if (!strcmp(service, "nfs")) return JMX_NFSD_INIT_PATH;
+    return NULL;
+}
+
+static int fs_control_running(const char *service)
+{
+    static const char *const smb[] = {"smbd", "samba", NULL};
+    struct fs_exec_result result = {0};
+    if (!strcmp(service, "samba"))
+        return fs_service_running(JMX_SAMBA_INIT_PATH) || fs_process_running(smb);
+    return fs_nfsd_threads_positive(&result);
+}
+
+static void fs_listeners_read(struct json_object *data, unsigned expected)
+{
+    /* Observed TCP listeners; absence is unknown when proc is unreadable. */
+    struct json_object *listeners = json_object_new_array();
+    const char *tables[] = {"/proc/net/tcp", "/proc/net/tcp6"};
+    int read_tables = 0;
+    for (size_t i = 0; i < 2; i++) {
+        FILE *fp = fopen(tables[i], "r");
+        char line[1024], address[65], remote[65];
+        unsigned port, remote_port, state;
+        if (!fp) continue;
+        read_tables++;
+        while (fgets(line, sizeof(line), fp)) {
+            if (sscanf(line, " %*u: %64[0-9A-Fa-f]:%x %64[0-9A-Fa-f]:%x %x", address, &port, remote, &remote_port, &state) != 5 || port != expected || state != 10) continue;
+            struct json_object *listener = json_object_new_object();
+            char ip[INET6_ADDRSTRLEN];
+            unsigned words[4] = {0};
+            if (i == 0) sscanf(address, "%8x", &words[0]);
+            else if (sscanf(address, "%8x%8x%8x%8x", &words[0], &words[1], &words[2], &words[3]) != 4) continue;
+            if (!inet_ntop(i ? AF_INET6 : AF_INET, words, ip, sizeof(ip))) continue;
+            json_object_object_add(listener, "address", json_object_new_string(ip));
+            json_object_object_add(listener, "port", json_object_new_int(port));
+            json_object_object_add(listener, "transport", json_object_new_string("tcp"));
+            json_object_array_add(listeners, listener);
+            /* A wildcard socket covers the host interface addresses, not a public reachability claim. */
+            if (!strcmp(ip, "0.0.0.0") || !strcmp(ip, "::")) {
+                struct ifaddrs *addresses = NULL;
+                if (getifaddrs(&addresses) == 0) {
+                    for (struct ifaddrs *ifa = addresses; ifa; ifa = ifa->ifa_next) {
+                        if (!ifa->ifa_addr || (ifa->ifa_flags & IFF_LOOPBACK) || !(ifa->ifa_flags & IFF_UP) ||
+                            ifa->ifa_addr->sa_family != (i ? AF_INET6 : AF_INET)) continue;
+                        const void *addr = i ? (void *)&((struct sockaddr_in6 *)ifa->ifa_addr)->sin6_addr :
+                                              (void *)&((struct sockaddr_in *)ifa->ifa_addr)->sin_addr;
+                        if (i && IN6_IS_ADDR_LINKLOCAL((const struct in6_addr *)addr)) continue;
+                        char target[INET6_ADDRSTRLEN];
+                        if (!inet_ntop(i ? AF_INET6 : AF_INET, addr, target, sizeof(target))) continue;
+                        struct json_object *candidate = json_object_new_object();
+                        json_object_object_add(candidate, "address", json_object_new_string(target));
+                        json_object_object_add(candidate, "port", json_object_new_int(port));
+                        json_object_object_add(candidate, "transport", json_object_new_string("tcp"));
+                        json_object_object_add(candidate, "source", json_object_new_string("wildcard_listener_interface"));
+                        json_object_array_add(listeners, candidate);
+                    }
+                    freeifaddrs(addresses);
+                }
+            }
+
+        }
+        fclose(fp);
+    }
+    json_object_object_add(data, "listeners", listeners);
+    json_object_object_add(data, "listeners_known", json_object_new_boolean(read_tables == 2));
+}
+
+static int fs_samba_extended_settings(void)
+{
+    char line[512]; FILE *fp = fopen(JMX_SAMBA_INIT_PATH, "r");
+    if (!fp) return 0;
+    int found = 0;
+    while (fgets(line, sizeof(line), fp)) if (strstr(line, "dreamingwrt-samba-policy-v1")) { found = 1; break; }
+    fclose(fp); return found;
+}
+
+static int fs_smb_protocol_rank(const char *name)
+{
+    const char *names[] = {"SMB2", "SMB2_02", "SMB2_10", "SMB3", "SMB3_00", "SMB3_02", "SMB3_11"};
+    const int ranks[] = {0,0,1,2,2,3,4};
+    for (int i=0; i<7; i++) if (!strcmp(name,names[i])) return ranks[i];
+    return -1;
+}
+
+static void fs_control_read(sqlite3 *db, const char *service, struct json_object *data)
+{
+    const char *script = fs_control_script(service);
+    struct fs_exec_result result = {0};
+    sqlite3_stmt *st = NULL;
+    struct json_object *available = NULL, *caps = NULL;
+    int enabled_rc = script ? fs_service_action(script, "enabled", &result) : -1;
+    json_object_object_get_ex(data, "available", &available);
+    json_object_object_add(data, "installed", json_object_new_boolean(json_object_get_boolean(available)));
+    json_object_object_add(data, "config_source", json_object_new_string("config_db"));
+    json_object_object_add(data, "enabled", enabled_rc == 0 ? json_object_new_boolean(1) :
+        result.exit_code == 1 ? json_object_new_boolean(0) : NULL);
+    json_object_object_add(data, "enabled_source", json_object_new_string("init_symlink"));
+    json_object_object_add(data, "running", json_object_new_boolean(fs_control_running(service)));
+    json_object_object_get_ex(data, "capabilities", &caps);
+    json_object_object_add(caps, "actions", json_object_new_boolean(json_object_get_boolean(available) && script && access(script, X_OK) == 0));
+    json_object_object_add(caps, "autostart", json_object_new_boolean(json_object_get_boolean(available) && script && access(script, X_OK) == 0));
+    if (!strcmp(service, "samba")) {
+        struct json_object *fields = json_object_new_array();
+        const char *names[] = {"workgroup", "server_description", "interfaces", "min_protocol", "max_protocol", "guest_access"};
+        for (size_t i = 0; i < (fs_samba_extended_settings()?6:3); i++) json_object_array_add(fields, json_object_new_string(names[i]));
+        json_object_object_add(data, "settings_fields", fields);
+    }
+    if (fs_prepare(db, &st, "SELECT revision,last_error FROM file_service_meta WHERE id=1") == 0 &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        json_object_object_add(data, "control_revision", json_object_new_int64(sqlite3_column_int64(st, 0)));
+        json_object_object_add(data, "last_error", json_object_new_string(fs_sql_text(st, 1, "")));
+    }
+    if (st) sqlite3_finalize(st);
+    st=NULL;
+    if(fs_prepare(db,&st,"SELECT error FROM file_share_binding_error WHERE service=?1")==0){
+        sqlite3_bind_text(st,1,service,-1,SQLITE_STATIC);
+        if(sqlite3_step(st)==SQLITE_ROW && fs_sql_text(st,0,"")[0])
+            json_object_object_add(data,"last_error",json_object_new_string(fs_sql_text(st,0,"")));
+    }
+    if(st)sqlite3_finalize(st);
+    fs_listeners_read(data, !strcmp(service, "samba") ? 445 : 2049);
+}
+
+static void fs_subjects_read(struct json_object *data)
+{
+    struct json_object *subjects = json_object_new_array();
+    struct fs_exec_result result = {0};
+    char output[FS_SERVICE_OUTPUT_MAX], *line, *save = NULL;
+    char *argv[] = {(char *)JMX_SAMBA_PDBEDIT_PATH, (char *)"-L", NULL};
+    int ok = access(argv[0], X_OK) == 0 && fs_exec_argv(argv, 3000, output, sizeof(output), &result) == 0 && !result.output_truncated;
+    if (ok) for (line = strtok_r(output, "\n", &save); line; line = strtok_r(NULL, "\n", &save)) {
+        char *colon = strchr(line, ':');
+        if (!colon) continue;
+        *colon = '\0';
+        struct passwd *pw = getpwnam(line);
+        if (!pw || !fs_username_ok(line)) continue;
+        struct json_object *item = json_object_new_object();
+        json_object_object_add(item, "username", json_object_new_string(line));
+        json_object_object_add(item, "system_uid", json_object_new_int64(pw->pw_uid));
+        /* pdbedit -L proves membership, not password validity or account enabled state. */
+        json_object_object_add(item, "credential_state", json_object_new_string("samba_account_present"));
+        json_object_object_add(item, "has_password", NULL);
+        json_object_array_add(subjects, item);
+    }
+    json_object_object_add(data, "subjects", subjects);
+    json_object_object_add(data, "subjects_known", json_object_new_boolean(ok));
+    json_object_object_add(data, "subjects_source", json_object_new_string("system_passwd+samba_passdb"));
 }
 
 static struct json_object *fs_samba_get_data(sqlite3 *db)
@@ -1751,7 +2036,7 @@ static struct json_object *fs_samba_get_data(sqlite3 *db)
     json_object_object_add(data, "running", json_object_new_boolean(running));
     if (fs_prepare(db, &st,
             "SELECT enabled,workgroup,server_description,interfaces_json,min_protocol,"
-            "max_protocol,guest_access,revision,updated_at FROM samba_service WHERE id=1") == 0 &&
+            "max_protocol,CASE WHEN EXISTS(SELECT 1 FROM samba_service_policy) THEN guest_access ELSE 1 END,revision,updated_at FROM samba_service WHERE id=1") == 0 &&
         sqlite3_step(st) == SQLITE_ROW) {
         json_object_object_add(data, "enabled", json_object_new_boolean(sqlite3_column_int(st, 0)));
         json_object_object_add(data, "workgroup",
@@ -1784,14 +2069,21 @@ static struct json_object *fs_samba_get_data(sqlite3 *db)
     st = NULL;
     if (fs_prepare(db, &st,
             "SELECT id,name,path,enabled,read_only,browseable,network_discovery,guest_access,"
-            "allowed_users_json,note,revision,created_at,updated_at FROM samba_share "
+            "allowed_users_json,note,revision,created_at,updated_at,"
+            "COALESCE((SELECT read_only_users_json FROM samba_share_acl WHERE share_id=samba_share.id),'[]') FROM samba_share "
             "ORDER BY name COLLATE NOCASE,id") == 0)
         while (sqlite3_step(st) == SQLITE_ROW)
-            json_object_array_add(shares, fs_samba_share_row(st));
+            json_object_array_add(shares, fs_samba_share_row(db,st));
     if (st)
         sqlite3_finalize(st);
     json_object_object_add(data, "shares", shares);
     json_object_object_add(data, "source", json_object_new_string("config_db"));
+    fs_control_read(db, "samba", data);
+    struct json_object *caps = NULL;
+    json_object_object_get_ex(data, "capabilities", &caps);
+    json_object_object_add(caps, "settings", json_object_new_boolean(available));
+    json_object_object_add(data, "affected_shares", json_object_new_int(json_object_array_length(shares)));
+    fs_subjects_read(data);
     return data;
 }
 
@@ -1817,30 +2109,65 @@ static struct json_object *fs_nfs_get_data(sqlite3 *db)
             "SELECT id,enabled,path,clients,options,note,revision,created_at,updated_at "
             "FROM nfs_export ORDER BY path,clients,id") == 0)
         while (sqlite3_step(st) == SQLITE_ROW)
-            json_object_array_add(exports, fs_nfs_export_row(st));
+            json_object_array_add(exports, fs_nfs_export_row(db,st));
     if (st)
         sqlite3_finalize(st);
     json_object_object_add(data, "exports", exports);
     json_object_object_add(data, "mounts", json_object_new_array());
     json_object_object_add(data, "source", json_object_new_string("config_db"));
+    fs_control_read(db, "nfs", data);
+    fs_nfs_defaults_read(db, data);
     return data;
+}
+
+/* Inspect the installed legacy configuration; never import its secret or claim it is managed. */
+static void fs_webdav_config_read(struct json_object *data)
+{
+    struct uci_context *ctx = uci_alloc_context();
+    struct uci_package *package = NULL;
+    struct uci_element *element;
+    if (!ctx) return;
+    uci_set_confdir(ctx, JMX_WEBDAV_CONFIG_DIR);
+    if (uci_load(ctx, "webdav", &package) != UCI_OK) { uci_free_context(ctx); return; }
+    uci_foreach_element(&package->sections, element) {
+        struct uci_section *section = uci_to_section(element);
+        if (strcmp(section->e.name, "config")) continue;
+        const char *strings[][2] = {{"username","username"},{"root_dir","root_dir"},{"cert_cer","cert_file"},{"cert_key","key_file"}};
+        const char *booleans[][2] = {{"enable","configured_enabled"},{"read_only","read_only"},{"firewall_accept","open_firewall"},{"ssl","ssl"}};
+        for (size_t i=0;i<sizeof(strings)/sizeof(strings[0]);i++) {
+            const char *value=uci_lookup_option_string(ctx,section,strings[i][0]);
+            if (value) json_object_object_add(data,strings[i][1],json_object_new_string(value));
+        }
+        for (size_t i=0;i<sizeof(booleans)/sizeof(booleans[0]);i++) {
+            const char *value=uci_lookup_option_string(ctx,section,booleans[i][0]);
+            json_object_object_add(data,booleans[i][1],json_object_new_boolean(fs_bool_text(value,0)));
+        }
+        const char *password=uci_lookup_option_string(ctx,section,"password");
+        json_object_object_add(data,"has_password",json_object_new_boolean(password && *password));
+        const char *port=uci_lookup_option_string(ctx,section,"listen_port");
+        if (port && fs_uint_value(port,65535) && atoi(port)>0)
+            json_object_object_add(data,"listen_port",json_object_new_int(atoi(port)));
+        json_object_object_add(data,"source",json_object_new_string("legacy_uci_readonly"));
+        json_object_object_add(data,"config_source",json_object_new_string("legacy_uci_readonly"));
+        json_object_object_add(data,"managed",json_object_new_boolean(0));
+        break;
+    }
+    uci_unload(ctx,package); uci_free_context(ctx);
 }
 
 static struct json_object *fs_webdav_get_data(void)
 {
-    static const char *const processes[] = { "nginx", NULL };
     struct json_object *data = json_object_new_object();
     int available = access("/etc/init.d/webdav", X_OK) == 0;
-    int running = available && access("/etc/nginx/conf.d/webdav.conf", R_OK) == 0 &&
-                  fs_process_running(processes);
 
     fs_add_contract(data);
     json_object_object_add(data, "service", json_object_new_string("webdav"));
     json_object_object_add(data, "capabilities", fs_single_capabilities("webdav"));
     json_object_object_add(data, "capability_reasons", fs_single_reasons("webdav"));
     json_object_object_add(data, "available", json_object_new_boolean(available));
-    json_object_object_add(data, "running", json_object_new_boolean(running));
-    json_object_object_add(data, "enabled", json_object_new_boolean(0));
+    json_object_object_add(data, "running", NULL);
+    json_object_object_add(data, "runtime_reason", json_object_new_string("unmanaged_listener_not_probed"));
+    json_object_object_add(data, "enabled", NULL);
     json_object_object_add(data, "listen_port", json_object_new_int(5005));
     json_object_object_add(data, "username", json_object_new_string(""));
     json_object_object_add(data, "has_password", json_object_new_boolean(0));
@@ -1852,34 +2179,14 @@ static struct json_object *fs_webdav_get_data(void)
     json_object_object_add(data, "key_file", json_object_new_string(""));
     json_object_object_add(data, "registry_download_available", json_object_new_boolean(0));
     json_object_object_add(data, "source", json_object_new_string("safe_defaults"));
+    json_object_object_add(data, "installed", json_object_new_boolean(available));
+    fs_webdav_config_read(data);
+    struct json_object *port = NULL;
+    json_object_object_get_ex(data, "listen_port", &port);
+    fs_listeners_read(data, json_object_get_int(port));
     return data;
 }
 
-static struct json_object *fs_ftp_get_data(void)
-{
-    static const char *const processes[] = { "vsftpd", NULL };
-    struct json_object *data = json_object_new_object();
-    int available = access("/etc/init.d/vsftpd", X_OK) == 0 &&
-                    access("/usr/sbin/vsftpd", X_OK) == 0;
-    int running = available &&
-        (fs_service_running("/etc/init.d/vsftpd") || fs_process_running(processes));
-
-    fs_add_contract(data);
-    json_object_object_add(data, "service", json_object_new_string("ftp"));
-    json_object_object_add(data, "capabilities", fs_single_capabilities("ftp"));
-    json_object_object_add(data, "capability_reasons", fs_single_reasons("ftp"));
-    json_object_object_add(data, "available", json_object_new_boolean(available));
-    json_object_object_add(data, "running", json_object_new_boolean(running));
-    json_object_object_add(data, "enabled", json_object_new_boolean(0));
-    json_object_object_add(data, "listen_port", json_object_new_int(21));
-    json_object_object_add(data, "root_dir", json_object_new_string("/mnt"));
-    json_object_object_add(data, "anonymous_access", json_object_new_boolean(0));
-    json_object_object_add(data, "write_enabled", json_object_new_boolean(0));
-    json_object_object_add(data, "tls", json_object_new_boolean(0));
-    json_object_object_add(data, "users", json_object_new_array());
-    json_object_object_add(data, "source", json_object_new_string("safe_defaults"));
-    return data;
-}
 
 static int fs_meta_add(sqlite3 *db, struct json_object *data)
 {
@@ -1911,11 +2218,48 @@ static int fs_meta_add(sqlite3 *db, struct json_object *data)
     return rc;
 }
 
+/* Dependency inventory is separate from managed share capability. In
+ * particular a working SSH daemon does not imply an isolated SFTP share. */
+static struct json_object *fs_optional_service_data(const char *service)
+{
+    const char *const sftp_bins[] = {"/usr/lib/sftp-server", "/usr/libexec/sftp-server", NULL};
+    const char *const dlna_bins[] = {"/usr/sbin/minidlnad", "/usr/bin/minidlna", "/usr/sbin/minidlna", NULL};
+    const char *const afp_bins[] = {"/usr/sbin/afpd", "/usr/sbin/netatalk", NULL};
+    const char *const sftp_processes[] = {"dropbear", "sshd", NULL};
+    const char *const dlna_processes[] = {"minidlnad", "minidlna", NULL};
+    const char *const afp_processes[] = {"afpd", "netatalk", NULL};
+    int sftp = !strcmp(service, "sftp"), dlna = !strcmp(service, "dlna");
+    int installed = fs_binary_present(sftp ? sftp_bins : dlna ? dlna_bins : afp_bins);
+    int process = fs_process_running(sftp ? sftp_processes : dlna ? dlna_processes : afp_processes);
+    struct json_object *data = json_object_new_object(), *caps = json_object_new_object();
+    struct json_object *reasons = json_object_new_object();
+    const char *reason = !installed ? "runtime_not_installed" : sftp ? "restricted_sftp_shares_pending" :
+        dlna ? "media_directory_and_scan_manager_pending" : "afp_directory_and_acl_manager_pending";
+    json_object_object_add(data, "service", json_object_new_string(service));
+    json_object_object_add(data, "installed", json_object_new_boolean(installed));
+    json_object_object_add(data, "available", json_object_new_boolean(installed));
+    json_object_object_add(data, "dependency_running", json_object_new_boolean(process));
+    json_object_object_add(data, "running", NULL);
+    json_object_object_add(data, "enabled", NULL);
+    json_object_object_add(data, "source", json_object_new_string("runtime_probe"));
+    const char *names[] = {"settings", "shares", "actions", "autostart", "shared_access"};
+    for (size_t i = 0; i < sizeof(names)/sizeof(names[0]); i++) {
+        json_object_object_add(caps, names[i], json_object_new_boolean(0));
+        json_object_object_add(reasons, names[i], json_object_new_string(reason));
+    }
+    json_object_object_add(data, "capabilities", caps);
+    json_object_object_add(data, "capability_reasons", reasons);
+    fs_add_contract(data);
+    return data;
+}
+
 struct json_object *jmx_file_service_get(const char *service)
 {
     sqlite3 *db = NULL;
     struct json_object *data;
 
+    if (service && (!strcmp(service, "sftp") || !strcmp(service, "dlna") || !strcmp(service, "afp")))
+        return fs_success(fs_optional_service_data(service));
     if (!service || (strcmp(service, "samba") && strcmp(service, "nfs") &&
         strcmp(service, "webdav") && strcmp(service, "ftp")))
         return fs_error("invalid_service", "supported_services_are_samba_nfs_webdav_ftp");
@@ -1926,9 +2270,9 @@ struct json_object *jmx_file_service_get(const char *service)
     else if (!strcmp(service, "nfs"))
         data = fs_nfs_get_data(db);
     else if (!strcmp(service, "webdav"))
-        data = fs_webdav_get_data();
+        data = fs_dav_get(db);
     else
-        data = fs_ftp_get_data();
+        data = fs_ftp_get(db);
     sqlite3_close(db);
     return fs_success(data);
 }
@@ -1946,8 +2290,17 @@ struct json_object *jmx_file_services_get(void)
     json_object_object_add(data, "capability_reasons", fs_capability_reasons_all());
     json_object_object_add(data, "samba", fs_samba_get_data(db));
     json_object_object_add(data, "nfs", fs_nfs_get_data(db));
-    json_object_object_add(data, "webdav", fs_webdav_get_data());
-    json_object_object_add(data, "ftp", fs_ftp_get_data());
+    json_object_object_add(data, "webdav", fs_dav_get(db));
+    json_object_object_add(data, "ftp", fs_ftp_get(db));
+    json_object_object_add(data, "accounts", fs_accounts_data(db));
+    struct json_object *operations=json_object_new_object();
+    json_object_object_add(operations,"manage",json_object_new_boolean(1));
+    struct json_object *operation_info=json_object_new_object();
+    json_object_object_add(operation_info,"capabilities",operations);
+    json_object_object_add(data,"operations",operation_info);
+    json_object_object_add(data, "sftp", fs_optional_service_data("sftp"));
+    json_object_object_add(data, "dlna", fs_optional_service_data("dlna"));
+    json_object_object_add(data, "afp", fs_optional_service_data("afp"));
     json_object_object_add(data, "generated_at", json_object_new_int64(fs_now_s()));
     (void)fs_meta_add(db, data);
     sqlite3_close(db);
@@ -1988,7 +2341,8 @@ static int fs_render_samba(sqlite3 *db, struct fs_buffer *buffer)
             "config samba\n") != 0)
         return -1;
     if (fs_prepare(db, &st,
-            "SELECT workgroup,server_description,interfaces_json,min_protocol,max_protocol "
+            "SELECT workgroup,server_description,interfaces_json,min_protocol,max_protocol,"
+            "CASE WHEN EXISTS(SELECT 1 FROM samba_service_policy) THEN guest_access ELSE 1 END "
             "FROM samba_service WHERE id=1") != 0 || sqlite3_step(st) != SQLITE_ROW)
         goto out;
     workgroup = fs_sql_text(st, 0, "WORKGROUP");
@@ -2024,11 +2378,15 @@ static int fs_render_samba(sqlite3 *db, struct fs_buffer *buffer)
     if (fs_buffer_append(buffer,
             "\n\toption allow_legacy_protocols '0'\n\toption disable_netbios '1'\n") != 0)
         goto out;
+    if (fs_samba_extended_settings() && fs_buffer_printf(buffer,
+            "\toption dwrt_min_protocol '%s'\n\toption dwrt_max_protocol '%s'\n\toption dwrt_guest_access '%d'\n",
+            fs_sql_text(st,3,"SMB2"),fs_sql_text(st,4,"SMB3_11"),sqlite3_column_int(st,5)) != 0) goto out;
     sqlite3_finalize(st);
     st = NULL;
     if (fs_prepare(db, &st,
             "SELECT name,path,read_only,browseable,network_discovery,guest_access,"
-            "allowed_users_json FROM samba_share WHERE enabled=1 ORDER BY name COLLATE NOCASE,id") != 0)
+            "allowed_users_json,COALESCE((SELECT read_only_users_json FROM samba_share_acl WHERE share_id=samba_share.id),'[]'),id "
+            "FROM samba_share WHERE enabled=1 ORDER BY name COLLATE NOCASE,id") != 0)
         goto out;
     while (sqlite3_step(st) == SQLITE_ROW) {
         const char *name = fs_sql_text(st, 0, "");
@@ -2040,9 +2398,10 @@ static int fs_render_samba(sqlite3 *db, struct fs_buffer *buffer)
         int guest = sqlite3_column_int(st, 5);
         struct fs_buffer user_value = {0};
         char canonical[FS_MAX_PATH + 1];
-
+        int bound=fs_binding_prepare(db,"samba",fs_sql_text(st,8,""),path,canonical,sizeof canonical);
+        if(bound<0)goto out;
+        if(!bound)continue;
         if (!fs_samba_name_ok(name) ||
-            !fs_share_path_ok(path, canonical, sizeof(canonical)) ||
             fs_samba_users_value(&user_value, users) != 0 ||
             fs_buffer_append(buffer, "\nconfig sambashare\n\toption name ") != 0 ||
             fs_buffer_uci_value(buffer, name) != 0 ||
@@ -2064,6 +2423,15 @@ static int fs_render_samba(sqlite3 *db, struct fs_buffer *buffer)
             goto out;
         }
         fs_buffer_free(&user_value);
+        /* read list restricts users; never emit write list, which can override
+         * the share-level read-only constraint. */
+        struct fs_buffer readers = {0};
+        if (fs_samba_users_value(&readers, fs_sql_text(st, 7, "[]")) != 0 ||
+            (readers.len && (fs_buffer_append(buffer, "\toption read_list ") != 0 ||
+             fs_buffer_uci_value(buffer, readers.data) != 0 || fs_buffer_append(buffer, "\n") != 0))) {
+            fs_buffer_free(&readers); goto out;
+        }
+        fs_buffer_free(&readers);
     }
     rc = 0;
 out:
@@ -2084,7 +2452,7 @@ static int fs_render_nfs(sqlite3 *db, struct fs_buffer *buffer)
             "# Manual edits are replaced on the next successful apply.\n") != 0)
         return -1;
     if (fs_prepare(db, &st,
-            "SELECT path,clients,options FROM nfs_export WHERE enabled=1 "
+            "SELECT path,clients,options,id FROM nfs_export WHERE enabled=1 "
             "ORDER BY path,clients,id") != 0)
         return -1;
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -2093,15 +2461,17 @@ static int fs_render_nfs(sqlite3 *db, struct fs_buffer *buffer)
         const char *options = fs_sql_text(st, 2, "");
         char canonical[FS_MAX_PATH + 1];
 
-        if (!fs_share_path_ok(path, canonical, sizeof(canonical)) ||
-            !fs_nfs_clients_ok(clients) || !fs_nfs_options_ok(options) ||
+        int bound=fs_binding_prepare(db,"nfs",fs_sql_text(st,3,""),path,canonical,sizeof canonical);
+        if(bound<0)goto out;
+        if(!bound)continue;
+        if (!fs_nfs_clients_ok(clients) || !fs_nfs_options_ok(options) ||
             fs_buffer_append(buffer, "\nconfig share\n\toption enabled '1'\n\toption path ") != 0 ||
             fs_buffer_uci_value(buffer, canonical) != 0 ||
             fs_buffer_append(buffer, "\n\toption clients ") != 0 ||
             fs_buffer_uci_value(buffer, clients) != 0 ||
-            fs_buffer_append(buffer, "\n\toption options ") != 0 ||
-            fs_buffer_uci_value(buffer, options) != 0 ||
-            fs_buffer_append(buffer, "\n") != 0)
+            fs_buffer_append(buffer, "\n\toption options '") != 0 ||
+            fs_buffer_append(buffer, options) != 0 ||
+            fs_buffer_append(buffer, ",mountpoint'\n") != 0)
             goto out;
     }
     rc = 0;
@@ -2118,7 +2488,7 @@ static int fs_render_nfs_exports(sqlite3 *db, struct fs_buffer *buffer)
     int rc = -1;
 
     if (fs_prepare(db, &st,
-            "SELECT path,clients,options FROM nfs_export WHERE enabled=1 "
+            "SELECT path,clients,options,id FROM nfs_export WHERE enabled=1 "
             "ORDER BY path,clients,id") != 0)
         goto out;
     while (sqlite3_step(st) == SQLITE_ROW) {
@@ -2128,9 +2498,11 @@ static int fs_render_nfs_exports(sqlite3 *db, struct fs_buffer *buffer)
         char client_copy[513], *save = NULL, *client;
         char canonical[FS_MAX_PATH + 1];
 
+        int bound=fs_binding_prepare(db,"nfs",fs_sql_text(st,3,""),path,canonical,sizeof canonical);
+        if(bound<0)goto out;
+        if(!bound)continue;
         if ((!count && fs_buffer_append(buffer,
                 "# Generated by DreamingWrt from /etc/dreamingwrt/config.db.\n") != 0) ||
-            !fs_share_path_ok(path, canonical, sizeof(canonical)) ||
             !fs_nfs_clients_ok(clients) || !fs_nfs_options_ok(options) ||
             fs_buffer_append(buffer, canonical) != 0)
             goto out;
@@ -2138,7 +2510,7 @@ static int fs_render_nfs_exports(sqlite3 *db, struct fs_buffer *buffer)
         snprintf(client_copy, sizeof(client_copy), "%s", clients);
         for (client = strtok_r(client_copy, " ,\t", &save); client;
              client = strtok_r(NULL, " ,\t", &save))
-            if (fs_buffer_printf(buffer, "\t%s(%s)", client, options) != 0)
+            if (fs_buffer_printf(buffer, "\t%s(%s,mountpoint)", client, options) != 0)
                 goto out;
         if (fs_buffer_append(buffer, "\n") != 0)
             goto out;
@@ -2208,7 +2580,7 @@ static int fs_samba_runtime_probe(sqlite3 *db, struct fs_exec_result *result)
                      sizeof(output), result) != 0 || result->output_truncated)
         return -1;
     if (fs_prepare(db, &st,
-            "SELECT name,path FROM samba_share WHERE enabled=1 "
+            "SELECT name,path,id FROM samba_share WHERE enabled=1 "
             "ORDER BY name COLLATE NOCASE,id") != 0) {
         fs_probe_error(result, 65);
         return -1;
@@ -2216,6 +2588,10 @@ static int fs_samba_runtime_probe(sqlite3 *db, struct fs_exec_result *result)
     while (sqlite3_step(st) == SQLITE_ROW) {
         const char *name = fs_sql_text(st, 0, "");
         const char *path = fs_sql_text(st, 1, "");
+        char published[FS_MAX_PATH+1];
+        if(!fs_binding_available(db,"samba",fs_sql_text(st,2,""),path))continue;
+        if(fs_binding_prepare(db,"samba",fs_sql_text(st,2,""),path,published,sizeof published)!=1)goto out;
+        path=published;
         char section_arg[FS_MAX_NAME + 32];
         char expected_path[FS_MAX_PATH + 16];
         char *section_argv[] = {
@@ -2372,7 +2748,7 @@ static int fs_nfs_runtime_probe(sqlite3 *db, struct fs_exec_result *result)
         return -1;
     (void)fs_export_output_scan(output, NULL, NULL, NULL, &actual_entries);
     if (fs_prepare(db, &st,
-            "SELECT path,clients,options FROM nfs_export WHERE enabled=1 "
+            "SELECT path,clients,options,id FROM nfs_export WHERE enabled=1 "
             "ORDER BY path,clients,id") != 0) {
         fs_probe_error(result, 65);
         return -1;
@@ -2383,6 +2759,10 @@ static int fs_nfs_runtime_probe(sqlite3 *db, struct fs_exec_result *result)
         const char *options = fs_sql_text(st, 2, "");
         char copy[513], *save = NULL, *client;
 
+        char published[FS_MAX_PATH+1];
+        if(!fs_binding_available(db,"nfs",fs_sql_text(st,3,""),path))continue;
+        if(fs_binding_prepare(db,"nfs",fs_sql_text(st,3,""),path,published,sizeof published)!=1)goto out;
+        path=published;
         enabled_count++;
         snprintf(copy, sizeof(copy), "%s", clients);
         for (client = strtok_r(copy, " ,\t", &save); client;
@@ -2417,18 +2797,10 @@ static int fs_service_reload_or_restart(const char *script,
                                         struct fs_exec_result *result,
                                         const char **action)
 {
-    /* Legacy OpenWrt NFS init accepts reload with rc=0 but does no work. */
-    if (strcmp(script, JMX_NFS_INIT_PATH) &&
-        fs_service_action(script, "reload", result) == 0) {
-        *action = "reload";
-        return 0;
-    }
-    if (fs_service_action(script, "restart", result) == 0) {
-        *action = "restart";
-        return 0;
-    }
+    /* Revoke existing protocol sessions too: a reload may retain a directory
+     * FD after its publication is removed or rebound. */
     *action = "restart";
-    return -1;
+    return fs_service_action(script,"restart",result);
 }
 
 static int fs_apply_new_config(sqlite3 *db, const char *service,
@@ -2442,6 +2814,7 @@ static int fs_apply_new_config(sqlite3 *db, const char *service,
     int rc;
 
     *config_replaced = 0;
+    fs_binding_sweep(db,service);
     if (!strcmp(service, "samba")) {
         path = JMX_SAMBA_CONFIG_PATH;
         script = JMX_SAMBA_INIT_PATH;
@@ -2515,7 +2888,13 @@ static int fs_reload_old_service(sqlite3 *db, const char *service,
 {
     const char *script = !strcmp(service, "samba") ?
         JMX_SAMBA_INIT_PATH : JMX_NFS_INIT_PATH;
-    int rc = fs_service_reload_or_restart(script, result, restore_action);
+    struct fs_buffer rendered={0};
+    fs_binding_sweep(db,service);
+    int rc=!strcmp(service,"samba")?fs_render_samba(db,&rendered):fs_render_nfs(db,&rendered);
+    const char *config=!strcmp(service,"samba")?JMX_SAMBA_CONFIG_PATH:JMX_NFS_CONFIG_PATH;
+    if(rc==0)rc=fs_atomic_replace(config,rendered.data,rendered.len,0600);
+    fs_buffer_free(&rendered);
+    if(rc==0)rc=fs_service_reload_or_restart(script,result,restore_action);
 
     if (rc == 0 && !strcmp(service, "nfs")) {
         rc = fs_nfs_exports_apply(db, result);
@@ -2524,18 +2903,20 @@ static int fs_reload_old_service(sqlite3 *db, const char *service,
     return rc;
 }
 
-static void fs_meta_bump(sqlite3 *db)
+static int fs_meta_bump(sqlite3 *db)
 {
     sqlite3_stmt *st = NULL;
+    int rc = -1;
 
     if (fs_prepare(db, &st,
             "UPDATE file_service_meta SET revision=revision+1,last_error='',updated_at=?1 "
             "WHERE id=1") == 0) {
         sqlite3_bind_int64(st, 1, fs_now_s());
-        (void)fs_step_done(st);
+        rc = fs_step_done(st);
     }
     if (st)
         sqlite3_finalize(st);
+    return rc;
 }
 
 static struct json_object *fs_write_failure(sqlite3 *db, const char *error,
@@ -2726,6 +3107,48 @@ static int fs_nfs_load(sqlite3 *db, const char *id, struct fs_nfs_export *item)
     return found;
 }
 
+/* Store per-user restrictions in the same transaction as the canonical share. */
+static int fs_samba_acl_update(sqlite3 *db, const char *id,
+                                struct json_object *payload, const char *allowed_json)
+{
+    struct json_object *value = NULL, *readers = NULL, *allowed = fs_json_array_text(allowed_json);
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+    if (json_object_object_get_ex(payload, "read_only_users", &value)) {
+        struct json_object *wrapped = json_object_new_object();
+        char *encoded = NULL; int present = 0;
+        json_object_object_add(wrapped, "allowed_users", json_object_get(value));
+        int valid = fs_allowed_users_json(wrapped, &encoded, &present) == 0 && present;
+        json_object_put(wrapped);
+        if (!valid) { free(encoded); goto out; }
+        readers = fs_json_array_text(encoded); free(encoded);
+    } else {
+        if (fs_prepare(db, &st, "SELECT read_only_users_json FROM samba_share_acl WHERE share_id=?1") != 0) goto out;
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        int step = sqlite3_step(st);
+        if (step != SQLITE_ROW && step != SQLITE_DONE) goto out;
+        readers = fs_json_array_text(step == SQLITE_ROW ? fs_sql_text(st, 0, "[]") : "[]");
+        sqlite3_finalize(st); st = NULL;
+    }
+    for (size_t i = 0; i < json_object_array_length(readers); i++) {
+        const char *name = json_object_get_string(json_object_array_get_idx(readers, i));
+        int found = 0;
+        for (size_t j = 0; j < json_object_array_length(allowed); j++)
+            if (!strcmp(name, json_object_get_string(json_object_array_get_idx(allowed, j)))) found = 1;
+        if (!found) goto out;
+    }
+    if (fs_prepare(db, &st, "INSERT INTO samba_share_acl(share_id,read_only_users_json) VALUES(?1,?2) "
+        "ON CONFLICT(share_id) DO UPDATE SET read_only_users_json=excluded.read_only_users_json") != 0) goto out;
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, json_object_to_json_string_ext(readers, JSON_C_TO_STRING_PLAIN), -1, SQLITE_TRANSIENT);
+    rc = fs_step_done(st);
+out:
+    if (st) sqlite3_finalize(st);
+    if (readers) json_object_put(readers);
+    json_object_put(allowed);
+    return rc;
+}
+
 struct json_object *jmx_samba_share_upsert(const char *id,
                                             struct json_object *req)
 {
@@ -2792,7 +3215,7 @@ struct json_object *jmx_samba_share_upsert(const char *id,
         snprintf(share.name, sizeof(share.name), "%s", name);
     if (fs_json_string(payload, "path", &path, &present) != 0 ||
         (create && !present) ||
-        (present && !fs_share_path_ok(path, canonical, sizeof(canonical)))) {
+        (present && !fs_share_path_update_ok(path, share.path, payload, canonical, sizeof(canonical)))) {
         response = fs_error("invalid_path", "share_path_must_be_safe_absolute_directory");
         goto out;
     }
@@ -2839,6 +3262,28 @@ struct json_object *jmx_samba_share_upsert(const char *id,
         response = fs_error("storage_busy", "file_service_transaction_could_not_start");
         goto out;
     }
+    /* Serialize ACL validation with dedicated-account creation/deletion. */
+    if (users_present) {
+        char *checked = NULL; int has_users = 0;
+        if (fs_allowed_users_json(payload, &checked, &has_users) != 0) {
+            response = fs_error("invalid_allowed_users", "allowed_users_changed_during_write");
+            (void)fs_sql_exec(db, "ROLLBACK");
+            goto out;
+        }
+        free(checked);
+    }
+    /* Disabled legacy shares must still be revocable when their disk is lost. */
+    if (share.enabled && !share.guest_access) {
+        struct json_object *acl = fs_json_array_text(share.allowed_users_json);
+        int count = 0;
+        int broad = json_object_array_length(acl) == 0;
+        json_object_put(acl);
+        if (broad && (create || fs_table_count(db, "file_share_account", &count) != 0 || count > 0)) {
+            response = fs_error("explicit_acl_required", "private_share_requires_explicit_users");
+            (void)fs_sql_exec(db, "ROLLBACK");
+            goto out;
+        }
+    }
     if (fs_prepare(db, &st, create ?
             "INSERT INTO samba_share"
             "(id,name,path,enabled,read_only,browseable,network_discovery,guest_access,"
@@ -2884,6 +3329,14 @@ struct json_object *jmx_samba_share_upsert(const char *id,
                                  expected_revision, current_revision);
         goto out;
     }
+    if (fs_samba_acl_update(db, share.id, payload, share.allowed_users_json) != 0) {
+        response = fs_write_failure(db, "invalid_read_only_users",
+                                   "read_only_users_must_be_unique_members_of_allowed_users", 0, NULL);
+        goto out;
+    }
+    if(fs_binding_update(db,"samba",share.id,share.path,share.enabled,payload)!=0){
+        response=fs_write_failure(db,"directory_binding_changed","reselect_directory_or_disable_share",0,NULL);goto out;
+    }
     new_revision = create ? 1 : expected_revision + 1;
     fs_meta_bump(db);
     if (fs_meta_revision_lookup(db, &meta_revision) != 1) {
@@ -2897,7 +3350,8 @@ struct json_object *jmx_samba_share_upsert(const char *id,
             config_replaced, "service_apply_failed", reason, &apply_result);
         goto out;
     }
-    if (fs_sql_exec(db, "COMMIT") != 0) {
+    if (fs_operation_receipt(db, share.id, new_revision, 0) != 0 ||
+        fs_sql_exec(db, "COMMIT") != 0) {
         response = fs_apply_failure_rollback(db, "samba", &old_config,
             config_replaced, "storage_error", "commit_failed_after_apply", &apply_result);
         goto out;
@@ -2990,7 +3444,8 @@ struct json_object *jmx_samba_share_delete(const char *id,
             config_replaced, "service_apply_failed", reason, &apply_result);
         goto out;
     }
-    if (fs_sql_exec(db, "COMMIT") != 0) {
+    if (fs_operation_receipt(db, id, expected_revision, 1) != 0 ||
+        fs_sql_exec(db, "COMMIT") != 0) {
         response = fs_apply_failure_rollback(db, "samba", &old_config,
             config_replaced, "storage_error", "commit_failed_after_apply", &apply_result);
         goto out;
@@ -3064,7 +3519,7 @@ struct json_object *jmx_nfs_export_upsert(const char *id,
     snprintf(item.id, sizeof(item.id), "%s", id);
     if (fs_json_string(payload, "path", &path, &present) != 0 ||
         (create && !present) ||
-        (present && !fs_share_path_ok(path, canonical, sizeof(canonical)))) {
+        (present && !fs_share_path_update_ok(path, item.path, payload, canonical, sizeof(canonical)))) {
         response = fs_error("invalid_path", "export_path_must_be_safe_absolute_directory");
         goto out;
     }
@@ -3133,6 +3588,9 @@ struct json_object *jmx_nfs_export_upsert(const char *id,
                                  expected_revision, current_revision);
         goto out;
     }
+    if(fs_binding_update(db,"nfs",item.id,item.path,item.enabled,payload)!=0){
+        response=fs_write_failure(db,"directory_binding_changed","reselect_directory_or_disable_share",0,NULL);goto out;
+    }
     new_revision = create ? 1 : expected_revision + 1;
     fs_meta_bump(db);
     if (fs_meta_revision_lookup(db, &meta_revision) != 1) {
@@ -3146,7 +3604,8 @@ struct json_object *jmx_nfs_export_upsert(const char *id,
             config_replaced, "service_apply_failed", reason, &apply_result);
         goto out;
     }
-    if (fs_sql_exec(db, "COMMIT") != 0) {
+    if (fs_operation_receipt(db, item.id, new_revision, 0) != 0 ||
+        fs_sql_exec(db, "COMMIT") != 0) {
         response = fs_apply_failure_rollback(db, "nfs", &old_config,
             config_replaced, "storage_error", "commit_failed_after_apply", &apply_result);
         goto out;
@@ -3233,7 +3692,8 @@ struct json_object *jmx_nfs_export_delete(const char *id,
             config_replaced, "service_apply_failed", reason, &apply_result);
         goto out;
     }
-    if (fs_sql_exec(db, "COMMIT") != 0) {
+    if (fs_operation_receipt(db, id, expected_revision, 1) != 0 ||
+        fs_sql_exec(db, "COMMIT") != 0) {
         response = fs_apply_failure_rollback(db, "nfs", &old_config,
             config_replaced, "storage_error", "commit_failed_after_apply", &apply_result);
         goto out;
@@ -3253,3 +3713,234 @@ out:
     if (db) sqlite3_close(db);
     return response ? response : fs_error("internal_error", "nfs_export_delete_failed");
 }
+
+/* Explicit protocol commands. The database write lock also serializes share applies. */
+struct json_object *jmx_file_service_action(const char *service, struct json_object *req)
+{
+    struct json_object *payload = fs_payload(req), *response = NULL, *data;
+    struct fs_exec_result result = {0}, restore = {0};
+    struct fs_buffer rendered = {0};
+    struct fs_snapshot snapshot = {0};
+    sqlite3 *db = NULL;
+    const char *script, *action = NULL;
+    int present = 0, in_tx = 0, before_running, before_enabled, rc = -1;
+    int replaced = 0;
+    const char *config_path = NULL;
+    int64_t expected = 0, revision = 0;
+    if(service && !strcmp(service,"webdav"))return fs_dav_action(req);
+    if(service && !strcmp(service,"ftp"))return fs_ftp_action(req);
+    if (!service || !(script = fs_control_script(service)))
+        return fs_error("capability_disabled", "protocol_control_not_available");
+    config_path = !strcmp(service, "samba") ? JMX_SAMBA_CONFIG_PATH : JMX_NFS_CONFIG_PATH;
+    if (!fs_confirmed(req)) return fs_error("confirmation_required", "confirm_true_required");
+    if (fs_json_string(payload, "action", &action, &present) != 0 || !present ||
+        (strcmp(action, "start") && strcmp(action, "stop") && strcmp(action, "restart") && strcmp(action, "enable") && strcmp(action, "disable")))
+        return fs_error("invalid_action", "start_stop_restart_enable_disable_only");
+    if (fs_json_positive_int64(payload, "expected_revision", &expected, &present) != 0 || !present)
+        return fs_error("missing_expected_revision", "control_revision_required");
+    if (access(script, X_OK) != 0) return fs_error("runtime_not_installed", "protocol_init_missing");
+    if (fs_db_open(&db) != 0) return fs_error("storage_unavailable", "config_db_open_failed");
+    if (fs_sql_exec(db, "BEGIN IMMEDIATE") != 0) { response = fs_error("storage_busy", "protocol_operation_in_progress"); goto out; }
+    in_tx = 1;
+    if (fs_meta_revision_lookup(db, &revision) != 1) goto out;
+    if (revision != expected) { response = fs_revision_conflict("file_service_changed", expected, revision); goto out; }
+    before_running = fs_control_running(service);
+    rc = fs_service_action(script, "enabled", &result);
+    if (rc != 0 && result.exit_code != 1) { response = fs_error("runtime_probe_failed", "autostart_state_unknown"); goto out; }
+    before_enabled = rc == 0;
+    int autostart = !strcmp(action, "enable") || !strcmp(action, "disable");
+    if (!autostart && strcmp(action, "stop")) {
+        if ((!strcmp(service, "samba") ? fs_render_samba(db, &rendered) : fs_render_nfs(db, &rendered)) != 0 ||
+            fs_config_preflight(!strcmp(service, "samba") ? "samba4" : "nfs", rendered.data, rendered.len) != 0) {
+            response = fs_error("config_preflight_failed", "shared_directories_or_config_unavailable"); goto out;
+        }
+        if (!strcmp(service, "nfs") && !fs_service_running(JMX_RPC_BIND_INIT_PATH)) {
+            response = fs_error("dependency_unavailable", "rpcbind_must_be_running"); goto out;
+        }
+        if (fs_snapshot_read(config_path, &snapshot) != 0 ||
+            fs_atomic_replace(config_path, rendered.data, rendered.len,
+                              snapshot.existed ? snapshot.mode : 0600) != 0) {
+            response = fs_error("config_replace_failed", "protocol_projection_failed"); goto out;
+        }
+        replaced = 1;
+    }
+    rc = fs_service_action(script, action, &result);
+    if (rc == 0 && !autostart && strcmp(action, "stop")) {
+        if (!strcmp(service, "nfs")) rc = fs_nfs_exports_apply(db, &result);
+        if (rc == 0) rc = fs_runtime_probe(db, service, &result);
+    }
+    if (rc == 0 && autostart) {
+        int actual = fs_service_action(script, "enabled", &result);
+        rc = ((actual == 0) == !strcmp(action, "enable") &&
+              (actual == 0 || result.exit_code == 1)) ? 0 : -1;
+    }
+    if (rc == 0 && !strcmp(action, "stop") && fs_control_running(service)) rc = -1;
+    if (rc == 0) {
+        fs_meta_bump(db);
+        if (fs_sql_exec(db, "COMMIT") == 0) {
+            in_tx = 0;
+            data = json_object_new_object();
+            json_object_object_add(data, "service", json_object_new_string(service));
+            json_object_object_add(data, "service_action", json_object_new_string(action));
+            json_object_object_add(data, "control_revision", json_object_new_int64(revision + 1));
+            json_object_object_add(data, "applied", json_object_new_boolean(1));
+            json_object_object_add(data, "running", json_object_new_boolean(fs_control_running(service)));
+            json_object_object_add(data, "enabled", json_object_new_boolean(autostart ? !strcmp(action, "enable") : before_enabled));
+            response = fs_success(data); goto out;
+        }
+        rc = -1;
+    }
+    if (rc != 0) {
+        int file_ok = !replaced || fs_snapshot_restore(config_path, &snapshot) == 0;
+        int restored = file_ok && fs_service_action(script, autostart ? (before_enabled ? "enable" : "disable") : (before_running ? "restart" : "stop"), &restore) == 0;
+        if (restored && !autostart && before_running && !strcmp(service, "nfs")) restored = fs_nfs_exports_apply(db, &restore) == 0;
+        if (restored && !autostart && before_running) restored = fs_runtime_probe(db, service, &restore) == 0;
+        if (restored && !autostart && !before_running) restored = !fs_control_running(service);
+        if (restored && autostart) {
+            int enabled = fs_service_action(script, "enabled", &restore);
+            restored = (enabled == 0 || restore.exit_code == 1) && ((enabled == 0) == before_enabled);
+        }
+        int rolled_db = fs_sql_exec(db, "ROLLBACK") == 0; in_tx = 0;
+        data = fs_error_detail("service_action_failed", result.timed_out ? "service_timeout" : "command_or_runtime_probe_failed");
+        json_object_object_add(data, "service_action", json_object_new_string(action));
+        json_object_object_add(data, "service_exit_code", json_object_new_int(result.exit_code));
+        json_object_object_add(data, "rolled_back", json_object_new_boolean(restored && rolled_db));
+        json_object_object_add(data, "rollback_failed", json_object_new_boolean(!restored || !rolled_db));
+        json_object_object_add(data, "rollback_service_exit_code", json_object_new_int(restore.exit_code));
+        json_object_object_add(data, "config_restored", json_object_new_boolean(file_ok));
+        json_object_object_add(data, "db_rolled_back", json_object_new_boolean(rolled_db));
+        json_object_object_add(data, "running", json_object_new_boolean(fs_control_running(service)));
+        response = fs_envelope(FS_API_ERROR, data);
+    }
+out:
+    if (in_tx) fs_sql_exec(db, "ROLLBACK");
+    if (db) sqlite3_close(db);
+    fs_buffer_free(&rendered);
+    fs_snapshot_free(&snapshot);
+    return response ? response : fs_error("storage_error", "service_control_failed");
+}
+
+struct json_object *jmx_samba_settings_set(struct json_object *req)
+{
+    struct json_object *payload = fs_payload(req), *response = NULL, *current = NULL, *value;
+    struct fs_snapshot snapshot = {0};
+    struct fs_exec_result result = {0};
+    struct fs_buffer rendered = {0};
+    sqlite3 *db = NULL;
+    sqlite3_stmt *st = NULL;
+    int present = 0, in_tx = 0, replaced = 0, was_running = 0;
+    int64_t expected = 0, revision = 0;
+    const char *reason = "", *action = "none";
+    if (!fs_confirmed(req)) return fs_error("confirmation_required", "confirm_true_required");
+    if (fs_json_positive_int64(payload, "expected_revision", &expected, &present) != 0 || !present)
+        return fs_error("missing_expected_revision", "samba_settings_revision_required");
+    json_object_object_foreach(payload, key, val) {
+        (void)val;
+        if (strcmp(key,"confirm") && strcmp(key,"apply") && strcmp(key,"expected_revision") &&
+            strcmp(key,"workgroup") && strcmp(key,"server_description") && strcmp(key,"interfaces") &&
+            (!fs_samba_extended_settings() || (strcmp(key,"min_protocol") && strcmp(key,"max_protocol") && strcmp(key,"guest_access"))))
+            return fs_error("invalid_field", key);
+    }
+    if (fs_db_open(&db) != 0) return fs_error("storage_unavailable", "config_db_open_failed");
+    if (fs_sql_exec(db,"BEGIN IMMEDIATE") != 0) goto out;
+    in_tx = 1;
+    current = fs_samba_get_data(db);
+    json_object_object_get_ex(current,"revision",&value); revision = json_object_get_int64(value);
+    if (revision != expected) { response = fs_revision_conflict("samba_settings_changed", expected, revision); goto out; }
+    const char *keys[] = {"workgroup","server_description","interfaces"};
+    for (size_t i=0; i<3; i++) if (json_object_object_get_ex(payload,keys[i],&value)) {
+        if (i < 2) {
+            const char *text = json_object_get_string(value);
+            if (!json_object_is_type(value,json_type_string) || !fs_text_ok(text, i ? 128 : 15, 1) || strpbrk(text,"&#|\\'\"<>[]{};%?=")) {
+                response = fs_error("invalid_settings",keys[i]); goto out;
+            }
+        } else {
+            if (!json_object_is_type(value,json_type_array) || json_object_array_length(value)==0 || json_object_array_length(value)>16) {
+                response = fs_error("invalid_interfaces","select_explicit_interfaces"); goto out;
+            }
+            for (size_t j=0;j<json_object_array_length(value);j++) {
+                struct json_object *iface = json_object_array_get_idx(value,j);
+                if (!json_object_is_type(iface,json_type_string) || !fs_id_ok(json_object_get_string(iface))) {
+                    response = fs_error("invalid_interfaces","invalid_interface_name"); goto out;
+                }
+            }
+        }
+        json_object_object_add(current,keys[i],json_object_get(value));
+    }
+    const char *extended[] = {"min_protocol","max_protocol","guest_access"};
+    for (int i=0; i<3; i++) if (json_object_object_get_ex(payload,extended[i],&value)) {
+        if (i==2 ? !json_object_is_type(value,json_type_boolean) :
+            (!json_object_is_type(value,json_type_string) || fs_smb_protocol_rank(json_object_get_string(value))<0)) {
+            response=fs_error("invalid_settings",extended[i]); goto out;
+        }
+        json_object_object_add(current,extended[i],json_object_get(value));
+    }
+    struct json_object *min_version,*max_version;
+    json_object_object_get_ex(current,"min_protocol",&min_version);
+    json_object_object_get_ex(current,"max_protocol",&max_version);
+    if(fs_smb_protocol_rank(json_object_get_string(min_version))>fs_smb_protocol_rank(json_object_get_string(max_version))) {
+        response=fs_error("invalid_settings","min_protocol_exceeds_max_protocol");goto out;
+    }
+    if (json_object_object_get_ex(payload,"guest_access",&value) &&
+        fs_sql_exec(db,"INSERT OR IGNORE INTO samba_service_policy VALUES(1)")!=0) goto out;
+    if (fs_prepare(db,&st,"UPDATE samba_service SET workgroup=?1,server_description=?2,interfaces_json=?3,revision=revision+1,updated_at=?4,min_protocol=?6,max_protocol=?7,guest_access=?8 WHERE id=1 AND revision=?5") != 0) goto out;
+    for(int i=0;i<3;i++) {
+        json_object_object_get_ex(current,keys[i],&value);
+        sqlite3_bind_text(st,i+1,i==2 ? json_object_to_json_string_ext(value,JSON_C_TO_STRING_PLAIN) : json_object_get_string(value),-1,SQLITE_TRANSIENT);
+    }
+    sqlite3_bind_int64(st,4,fs_now_s());sqlite3_bind_int64(st,5,expected);
+    sqlite3_bind_text(st,6,json_object_get_string(min_version),-1,SQLITE_TRANSIENT);
+    sqlite3_bind_text(st,7,json_object_get_string(max_version),-1,SQLITE_TRANSIENT);
+    json_object_object_get_ex(current,"guest_access",&value);sqlite3_bind_int(st,8,json_object_get_boolean(value));
+    if (fs_step_done(st) != 0 || sqlite3_changes(db) != 1) goto out;
+    sqlite3_finalize(st);st=NULL;
+    was_running=fs_control_running("samba");
+    if (was_running) {
+        if (fs_apply_new_config(db,"samba",&snapshot,&result,&action,&reason,&replaced) != 0) goto rollback;
+    } else {
+        if (fs_render_samba(db,&rendered)!=0 || fs_config_preflight("samba4",rendered.data,rendered.len)!=0) { reason="config_preflight_failed"; goto rollback; }
+        if (fs_snapshot_read(JMX_SAMBA_CONFIG_PATH,&snapshot)!=0) { reason="snapshot_failed"; goto rollback; }
+        if (fs_atomic_replace(JMX_SAMBA_CONFIG_PATH,rendered.data,rendered.len,snapshot.existed?snapshot.mode:0600)!=0) { reason="config_replace_failed"; goto rollback; }
+        replaced=1;
+    }
+    fs_meta_bump(db);
+    if (fs_sql_exec(db,"COMMIT")!=0) { reason="db_commit_failed"; goto rollback; }
+    in_tx=0;
+    struct json_object *data=json_object_new_object();
+    json_object_object_add(data,"revision",json_object_new_int64(revision+1));
+    json_object_object_add(data,"persisted",json_object_new_boolean(1));
+    json_object_object_add(data,"applied",json_object_new_boolean(was_running));
+    json_object_object_add(data,"service_action",json_object_new_string(action));
+    json_object_object_add(data,"restart_required",json_object_new_boolean(!was_running));
+    response=fs_success(data);goto out;
+rollback:
+    if (was_running) response=fs_apply_failure_rollback(db,"samba",&snapshot,replaced,"apply_failed",reason,&result);
+    else {
+        int file_ok=!replaced || fs_snapshot_restore(JMX_SAMBA_CONFIG_PATH,&snapshot)==0;
+        int db_ok=fs_sql_exec(db,"ROLLBACK")==0;
+        struct json_object *data=fs_error_detail("apply_failed",reason);
+        json_object_object_add(data,"rolled_back",json_object_new_boolean(file_ok&&db_ok));
+        json_object_object_add(data,"rollback_failed",json_object_new_boolean(!file_ok||!db_ok));
+        response=fs_envelope(FS_API_ERROR,data);
+    }
+    in_tx=0;
+out:
+    if(st) sqlite3_finalize(st);
+    if(in_tx) fs_sql_exec(db,"ROLLBACK");
+    if(db) sqlite3_close(db);
+    if(current) json_object_put(current);
+    fs_snapshot_free(&snapshot);fs_buffer_free(&rendered);
+    return response?response:fs_error("storage_error","samba_settings_failed");
+}
+
+#include "file_service_accounts.inc"
+
+#include "file_service_operations.inc"
+
+#include "file_service_webdav.inc"
+
+#include "file_service_defaults.inc"
+
+#include "file_service_bindings.inc"
+
+#include "file_service_ftp.inc"

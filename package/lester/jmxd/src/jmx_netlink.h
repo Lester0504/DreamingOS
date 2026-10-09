@@ -38,6 +38,12 @@ typedef struct jmx_nl_feature_msg{
 
 int jmx_netlink_init(void);
 int jmx_v2_netlink_init(void);
+/* Forward declaration so the prototype below names the same struct as the rest
+ * of the program. Declared inside the parameter list it would be a distinct,
+ * function-scoped type, and no caller could ever satisfy it. Kept as a bare
+ * declaration rather than including libubox/uloop.h, which this header's
+ * consumers do not otherwise need. */
+struct uloop_fd;
 void jmx_netlink_handler(struct uloop_fd *u, unsigned int ev);
 int jmx_nl_send_msg_to_kernel(int fd, void *msg, int len);
 #endif

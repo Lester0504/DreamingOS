@@ -70,6 +70,41 @@ static int notifyd_handle_settings_set(struct ubus_context *ctx, struct ubus_obj
     return UBUS_STATUS_OK;
 }
 
+/*
+ * Per-user mute preferences. `username` is not taken from the caller's own
+ * wish: webd resolves it from the session and passes it in, so a client cannot
+ * read or edit someone else's setting by naming them here.
+ */
+static int notifyd_handle_preferences_get(struct ubus_context *ctx, struct ubus_object *obj,
+                                          struct ubus_request_data *req, const char *method,
+                                          struct blob_attr *msg)
+{
+    struct json_object *body = notifyd_json_from_blob(msg);
+    struct json_object *resp;
+    (void)obj; (void)method;
+
+    resp = notifyd_preferences_get(notifyd_payload_or_self(body));
+    notifyd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
+static int notifyd_handle_preferences_set(struct ubus_context *ctx, struct ubus_object *obj,
+                                          struct ubus_request_data *req, const char *method,
+                                          struct blob_attr *msg)
+{
+    struct json_object *body = notifyd_json_from_blob(msg);
+    struct json_object *resp;
+    (void)obj; (void)method;
+
+    resp = notifyd_preferences_update(notifyd_payload_or_self(body));
+    notifyd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
 static int notifyd_handle_channels_get(struct ubus_context *ctx, struct ubus_object *obj,
                                        struct ubus_request_data *req, const char *method,
                                        struct blob_attr *msg)
@@ -150,6 +185,21 @@ static int notifyd_handle_routes_delete(struct ubus_context *ctx, struct ubus_ob
     (void)obj; (void)method;
 
     resp = notifyd_routes_delete(notifyd_payload_or_self(body));
+    notifyd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
+static int notifyd_handle_triggers_get(struct ubus_context *ctx, struct ubus_object *obj,
+                                       struct ubus_request_data *req, const char *method,
+                                       struct blob_attr *msg)
+{
+    struct json_object *body = notifyd_json_from_blob(msg);
+    struct json_object *resp;
+    (void)obj; (void)method;
+
+    resp = notifyd_triggers_json(notifyd_payload_or_self(body));
     notifyd_send_json(ctx, req, resp);
     json_object_put(resp);
     json_object_put(body);
@@ -275,12 +325,15 @@ static const struct ubus_method notifyd_methods[] = {
     UBUS_METHOD("event_catalog", notifyd_handle_event_catalog, notifyd_any_policy),
     UBUS_METHOD("settings_get", notifyd_handle_settings_get, notifyd_any_policy),
     UBUS_METHOD("settings_set", notifyd_handle_settings_set, notifyd_any_policy),
+    UBUS_METHOD("preferences_get", notifyd_handle_preferences_get, notifyd_any_policy),
+    UBUS_METHOD("preferences_set", notifyd_handle_preferences_set, notifyd_any_policy),
     UBUS_METHOD("channels_get", notifyd_handle_channels_get, notifyd_any_policy),
     UBUS_METHOD("channels_set", notifyd_handle_channels_set, notifyd_any_policy),
     UBUS_METHOD("channels_delete", notifyd_handle_channels_delete, notifyd_any_policy),
     UBUS_METHOD("routes_get", notifyd_handle_routes_get, notifyd_any_policy),
     UBUS_METHOD("routes_set", notifyd_handle_routes_set, notifyd_any_policy),
     UBUS_METHOD("routes_delete", notifyd_handle_routes_delete, notifyd_any_policy),
+    UBUS_METHOD("triggers_get", notifyd_handle_triggers_get, notifyd_any_policy),
     UBUS_METHOD("enqueue", notifyd_handle_enqueue, notifyd_any_policy),
     UBUS_METHOD("test_send", notifyd_handle_test_send, notifyd_any_policy),
     UBUS_METHOD("outbox_list", notifyd_handle_outbox_list, notifyd_any_policy),

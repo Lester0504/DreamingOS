@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "otad_internal.h"
+#include "otad_task_projection.h"
 
 static int otad_send_json(struct ubus_context *ctx, struct ubus_request_data *req,
                           struct json_object *obj)
@@ -166,6 +167,21 @@ static int otad_handle_confirm_boot(struct ubus_context *ctx, struct ubus_object
     return UBUS_STATUS_OK;
 }
 
+static int otad_handle_task_projection(struct ubus_context *ctx,
+                                       struct ubus_object *obj,
+                                       struct ubus_request_data *req,
+                                       const char *method,
+                                       struct blob_attr *msg)
+{
+    struct json_object *resp;
+    (void)obj; (void)method; (void)msg;
+
+    resp = otad_task_projection_get();
+    otad_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
 static const struct blobmsg_policy otad_any_policy[] = {
     { .name = "payload", .type = BLOBMSG_TYPE_UNSPEC },
 };
@@ -181,6 +197,7 @@ static const struct ubus_method otad_methods[] = {
     UBUS_METHOD("confirm_boot", otad_handle_confirm_boot, otad_any_policy),
     UBUS_METHOD("inventory_scan", otad_handle_inventory_scan, otad_any_policy),
     UBUS_METHOD("unknowns", otad_handle_unknowns, otad_any_policy),
+    UBUS_METHOD_NOARG("task_projection", otad_handle_task_projection),
 };
 
 static struct ubus_object_type otad_object_type =

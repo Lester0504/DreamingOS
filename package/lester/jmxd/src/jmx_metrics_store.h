@@ -3,10 +3,11 @@
 #define __JMX_METRICS_STORE_H__
 
 #include <json-c/json.h>
+#include "jmx_dataset_path.h"
 #include <stdint.h>
 #include <sqlite3.h>
 
-#define JMX_METRICS_DB_PATH_DEFAULT "/etc/dreamingwrt/metrics.db"
+#define JMX_METRICS_DB_PATH_DEFAULT jmx_dataset_path("metrics")
 
 struct jmx_metrics_usage {
     int64_t up_bytes;

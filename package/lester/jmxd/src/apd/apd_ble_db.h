@@ -10,6 +10,7 @@ struct apd_ble_db_status {
     char state[24];
     char bootstrap_id[65];
     char request_id[65];
+    char session_id[APD_BLE_SESSION_ID_LEN * 2 + 1];
     int64_t expires_at;
     int physical_confirmed;
     uint64_t last_sequence;

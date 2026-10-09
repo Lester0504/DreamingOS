@@ -5,6 +5,8 @@
  * traffic counters and timestamps so idle sampling does not create fake events.
  */
 #include "jmx_topology_history.h"
+#include "jmx_db.h"
+#include "jmx_observability.h"
 
 #define JTH_API_CODE_SUCCESS 2000
 
@@ -24,11 +26,21 @@ extern struct json_object *jmx_log_center_event_add(struct json_object *cfg);
 #include <zlib.h>
 
 #define JTH_DEFAULT_DB "/opt/dreamingwrt/topology/history.db"
+#define JTH_CONFIG_DB "/etc/dreamingwrt/config.db"
 #define JTH_RETENTION_MS (24LL * 60LL * 60LL * 1000LL)
 #define JTH_ANCHOR_MS (5LL * 60LL * 1000LL)
 #define JTH_MAX_SNAPSHOTS 4096
 #define JTH_MAX_EVENTS 32768
 #define JTH_MAX_PAYLOAD_BYTES (32U * 1024U * 1024U)
+/*
+ * Store-wide byte ceiling for the compressed snapshot table.  This is a
+ * safety backstop, not a routinely-binding cap: at 4096 rows the byte cap
+ * only bites if snapshots are pathologically large.  64 MiB is double the
+ * 32 MiB single-snapshot ceiling (JTH_MAX_PAYLOAD_BYTES, uncompressed) and
+ * sits inside the profile's own [16 MiB, 2 GiB] validated range, so an
+ * operator profile can widen or tighten it without a code change.
+ */
+#define JTH_MAX_STORE_BYTES (64LL * 1024LL * 1024LL)
 
 struct jth_buf {
     char *data;
@@ -67,6 +79,19 @@ static const char *jth_db_path(void)
     return override && override[0] ? override : JTH_DEFAULT_DB;
 }
 
+/*
+ * Shared configuration database that carries the observability retention
+ * profile (observability_retention_profile).  Topology history reuses the
+ * same profile so a single operator setting governs both projections; the
+ * override exists for the unit test, which points it at a scratch db.
+ */
+static const char *jth_config_db_path(void)
+{
+    const char *override = getenv("DREAMINGWRT_TOPOLOGY_CONFIG_DB");
+
+    return override && override[0] ? override : JTH_CONFIG_DB;
+}
+
 static int jth_ensure_dir(const char *path)
 {
     struct stat st;
@@ -91,6 +116,54 @@ static int jth_exec(const char *sql)
         return -1;
     }
     return 0;
+}
+
+/* PRAGMA table_info cannot be parameter-bound; table is a fixed literal. */
+static int jth_table_has_column(const char *table, const char *column)
+{
+    sqlite3_stmt *st = NULL;
+    char sql[128];
+    int found = 0;
+
+    if (!table || !column ||
+        snprintf(sql, sizeof(sql), "PRAGMA table_info(%s)", table) >= (int)sizeof(sql))
+        return -1;
+    if (sqlite3_prepare_v2(g_jth_db, sql, -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(st, 1);
+
+        if (name && !strcmp(name, column)) {
+            found = 1;
+            break;
+        }
+    }
+    sqlite3_finalize(st);
+    return found;
+}
+
+/*
+ * Idempotent migration: give a table the retention_class column used to pin
+ * rows against age/row/byte eviction.  SQLite ADD COLUMN is metadata-only and
+ * backward-compatible; existing rows read the NOT NULL default (''), so the
+ * pin guard is a no-op until an operator sets a 'pinned_%' class.  Re-running
+ * after the column exists is a checked no-op.  table is a fixed literal.
+ */
+static int jth_ensure_retention_class(const char *table)
+{
+    char sql[160];
+    int has;
+
+    has = jth_table_has_column(table, "retention_class");
+    if (has < 0)
+        return -1;
+    if (has)
+        return 0;
+    if (snprintf(sql, sizeof(sql),
+                 "ALTER TABLE %s ADD COLUMN retention_class TEXT NOT NULL DEFAULT ''",
+                 table) >= (int)sizeof(sql))
+        return -1;
+    return jth_exec(sql);
 }
 
 static int jth_db_open(void)
@@ -133,7 +206,9 @@ static int jth_db_open(void)
                  "mac TEXT,name TEXT,port_idx INTEGER,link_id TEXT,"
                  "before_json TEXT,after_json TEXT)") != 0 ||
         jth_exec("CREATE INDEX IF NOT EXISTS idx_topology_events_ts "
-                 "ON topology_events(timestamp_ms)") != 0) {
+                 "ON topology_events(timestamp_ms)") != 0 ||
+        jth_ensure_retention_class("topology_snapshots") != 0 ||
+        jth_ensure_retention_class("topology_events") != 0) {
         sqlite3_close(g_jth_db);
         g_jth_db = NULL;
         return -1;
@@ -540,6 +615,43 @@ static int jth_insert_event(int64_t ts_ms, const char *type, const char *entity_
     if (after_s) sqlite3_bind_text(st, 10, after_s, -1, SQLITE_TRANSIENT); else sqlite3_bind_null(st, 10);
     rc = sqlite3_step(st);
     sqlite3_finalize(st);
+    if (rc == SQLITE_DONE && sqlite3_changes(g_jth_db) > 0) {
+        struct json_object *payload = json_object_new_object();
+        struct json_object *evidence = json_object_new_object();
+        char port_id[32] = "";
+        int coalesced = 0;
+
+        if (port_idx >= 0)
+            snprintf(port_id, sizeof(port_id), "%d", port_idx);
+        if (!payload || !evidence) {
+            if (payload) json_object_put(payload);
+            if (evidence) json_object_put(evidence);
+            return sqlite3_changes(g_jth_db);
+        }
+        json_object_object_add(payload, "event_id", json_object_new_string(event_id));
+        json_object_object_add(payload, "event_type", json_object_new_string(type ? type : ""));
+        json_object_object_add(payload, "category", json_object_new_string("TOPOLOGY"));
+        json_object_object_add(payload, "state", json_object_new_string("active"));
+        json_object_object_add(payload, "severity", json_object_new_string("info"));
+        json_object_object_add(payload, "confidence", json_object_new_string("measured"));
+        json_object_object_add(payload, "observed_at", json_object_new_int64(ts_ms));
+        json_object_object_add(payload, "first_seen", json_object_new_int64(ts_ms));
+        json_object_object_add(payload, "last_seen", json_object_new_int64(ts_ms));
+        json_object_object_add(payload, "source", json_object_new_string("topology_history"));
+        json_object_object_add(payload, "device_id", json_object_new_string(entity_id ? entity_id : ""));
+        json_object_object_add(payload, "port_id", json_object_new_string(port_id));
+        json_object_object_add(payload, "retention_class", json_object_new_string("topology_24h"));
+        json_object_object_add(payload, "detector_revision", json_object_new_string("topology-history-v1"));
+        if (before)
+            json_object_object_add(evidence, "before", json_object_get(before));
+        if (after)
+            json_object_object_add(evidence, "after", json_object_get(after));
+        json_object_object_add(evidence, "port_idx", json_object_new_int(port_idx));
+        json_object_object_add(payload, "evidence", evidence);
+        (void)jmx_obs_event_append_json(jmx_db_handle(), payload, &coalesced);
+        json_object_put(payload);
+        return sqlite3_changes(g_jth_db);
+    }
     return rc == SQLITE_DONE ? sqlite3_changes(g_jth_db) : -1;
 }
 
@@ -808,30 +920,168 @@ static struct json_object *jth_snapshot_by_timestamp(int64_t ts_ms)
     return obj;
 }
 
+/*
+ * compressed_bytes is the authoritative per-row on-disk footprint, so the
+ * store total is a plain SUM with no estimator (unlike observability, which
+ * has to estimate row overhead).  Pinned rows are counted: they occupy real
+ * space, and if pins alone exceed the cap the eviction loop simply stops once
+ * no non-pinned row is left to drop.
+ */
+static int64_t jth_snapshot_store_bytes(void)
+{
+    sqlite3_stmt *st = NULL;
+    int64_t bytes = 0;
+
+    if (sqlite3_prepare_v2(g_jth_db,
+        "SELECT COALESCE(SUM(compressed_bytes),0) FROM topology_snapshots",
+        -1, &st, NULL) != SQLITE_OK) {
+        sqlite3_finalize(st);
+        return 0;
+    }
+    if (sqlite3_step(st) == SQLITE_ROW)
+        bytes = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    return bytes;
+}
+
+/*
+ * Resolve the effective retention bounds.  The shared observability profile,
+ * when explicitly configured, governs topology too (same operator setting for
+ * both projections).  When no profile row exists the loader falls back to
+ * observability's loose 90d/256MiB defaults, which would break topology's
+ * bounded-24h contract, so in that case we ignore them and keep topology's own
+ * tighter constants.  Env overrides exist only for the unit test, which cannot
+ * otherwise drive the profile below its validated floors (16 MiB / 1024 rows).
+ */
+static void jth_resolve_retention(int64_t *age_ms, int *snapshot_cap,
+                                  int *event_cap, int64_t *byte_cap)
+{
+    struct jmx_obs_retention_profile profile;
+    const char *env;
+
+    jmx_obs_retention_profile_default(&profile);
+    (void)jmx_obs_retention_profile_load(jth_config_db_path(), &profile);
+
+    /*
+     * Topology history is a bounded-24h Time Machine (see file header): its age
+     * window and row caps are a fixed design contract and must NOT be widened to
+     * the shared observability profile's 90d / 65536-row values.  Parity here
+     * means the NEW byte_cap governance dimension plus pin protection, not
+     * adopting observability's retention window.  So age + row caps stay
+     * topology's own constants unconditionally; only byte_cap follows the
+     * operator-configured profile when one exists, else topology's 64 MiB
+     * backstop applies.
+     */
+    *age_ms = JTH_RETENTION_MS;
+    *snapshot_cap = JTH_MAX_SNAPSHOTS;
+    *event_cap = JTH_MAX_EVENTS;
+    *byte_cap = profile.configured ? profile.byte_cap : JTH_MAX_STORE_BYTES;
+
+    env = getenv("DREAMINGWRT_TOPOLOGY_BYTE_CAP");
+    if (env && env[0]) {
+        long long v = atoll(env);
+        if (v > 0)
+            *byte_cap = (int64_t)v;
+    }
+    env = getenv("DREAMINGWRT_TOPOLOGY_SNAPSHOT_CAP");
+    if (env && env[0]) {
+        int v = atoi(env);
+        if (v > 0)
+            *snapshot_cap = v;
+    }
+}
+
 static int jth_prune(int64_t now_ms)
 {
     sqlite3_stmt *st = NULL;
     int removed = 0;
+    int64_t age_ms = JTH_RETENTION_MS;
+    int snapshot_cap = JTH_MAX_SNAPSHOTS;
+    int event_cap = JTH_MAX_EVENTS;
+    int64_t byte_cap = JTH_MAX_STORE_BYTES;
 
+    jth_resolve_retention(&age_ms, &snapshot_cap, &event_cap, &byte_cap);
+
+    /* Age prune, pinned ('pinned_%') rows exempt in both tables. */
     if (sqlite3_prepare_v2(g_jth_db,
-        "DELETE FROM topology_snapshots WHERE ts_ms < ?", -1, &st, NULL) != SQLITE_OK)
+        "DELETE FROM topology_snapshots WHERE ts_ms < ? "
+        "AND (retention_class NOT LIKE 'pinned_%' OR retention_class='')",
+        -1, &st, NULL) != SQLITE_OK)
         return -1;
-    sqlite3_bind_int64(st, 1, now_ms - JTH_RETENTION_MS);
+    sqlite3_bind_int64(st, 1, now_ms - age_ms);
     if (sqlite3_step(st) != SQLITE_DONE) { sqlite3_finalize(st); return -1; }
     removed += sqlite3_changes(g_jth_db);
     sqlite3_finalize(st);
+    st = NULL;
     if (sqlite3_prepare_v2(g_jth_db,
-        "DELETE FROM topology_events WHERE timestamp_ms < ?", -1, &st, NULL) != SQLITE_OK)
+        "DELETE FROM topology_events WHERE timestamp_ms < ? "
+        "AND (retention_class NOT LIKE 'pinned_%' OR retention_class='')",
+        -1, &st, NULL) != SQLITE_OK)
         return -1;
-    sqlite3_bind_int64(st, 1, now_ms - JTH_RETENTION_MS);
+    sqlite3_bind_int64(st, 1, now_ms - age_ms);
     if (sqlite3_step(st) != SQLITE_DONE) { sqlite3_finalize(st); return -1; }
     removed += sqlite3_changes(g_jth_db);
     sqlite3_finalize(st);
-    if (jth_exec("DELETE FROM topology_snapshots WHERE id NOT IN "
-                 "(SELECT id FROM topology_snapshots ORDER BY ts_ms DESC LIMIT 4096)") != 0 ||
-        jth_exec("DELETE FROM topology_events WHERE event_id NOT IN "
-                 "(SELECT event_id FROM topology_events ORDER BY timestamp_ms DESC LIMIT 32768)") != 0)
+    st = NULL;
+
+    /* Row cap prune: keep newest N non-pinned rows, exempt pinned entirely. */
+    if (sqlite3_prepare_v2(g_jth_db,
+        "DELETE FROM topology_snapshots "
+        "WHERE (retention_class NOT LIKE 'pinned_%' OR retention_class='') "
+        "AND id NOT IN "
+        "(SELECT id FROM topology_snapshots "
+        "WHERE (retention_class NOT LIKE 'pinned_%' OR retention_class='') "
+        "ORDER BY ts_ms DESC LIMIT ?)",
+        -1, &st, NULL) != SQLITE_OK)
         return -1;
+    sqlite3_bind_int(st, 1, snapshot_cap);
+    if (sqlite3_step(st) != SQLITE_DONE) { sqlite3_finalize(st); return -1; }
+    removed += sqlite3_changes(g_jth_db);
+    sqlite3_finalize(st);
+    st = NULL;
+    if (sqlite3_prepare_v2(g_jth_db,
+        "DELETE FROM topology_events "
+        "WHERE (retention_class NOT LIKE 'pinned_%' OR retention_class='') "
+        "AND event_id NOT IN "
+        "(SELECT event_id FROM topology_events "
+        "WHERE (retention_class NOT LIKE 'pinned_%' OR retention_class='') "
+        "ORDER BY timestamp_ms DESC LIMIT ?)",
+        -1, &st, NULL) != SQLITE_OK)
+        return -1;
+    sqlite3_bind_int(st, 1, event_cap);
+    if (sqlite3_step(st) != SQLITE_DONE) { sqlite3_finalize(st); return -1; }
+    removed += sqlite3_changes(g_jth_db);
+    sqlite3_finalize(st);
+    st = NULL;
+
+    /*
+     * Byte cap: drop the oldest non-pinned snapshots in bounded batches until
+     * the store's SUM(compressed_bytes) is under the cap or no non-pinned row
+     * remains.  Mirrors observability's byte loop shape.
+     */
+    if (byte_cap > 0) {
+        int64_t total_bytes = jth_snapshot_store_bytes();
+
+        while (total_bytes > byte_cap) {
+            int batch_removed;
+
+            if (sqlite3_prepare_v2(g_jth_db,
+                "DELETE FROM topology_snapshots WHERE id IN "
+                "(SELECT id FROM topology_snapshots "
+                "WHERE (retention_class NOT LIKE 'pinned_%' OR retention_class='') "
+                "ORDER BY ts_ms ASC LIMIT 100)",
+                -1, &st, NULL) != SQLITE_OK)
+                return -1;
+            if (sqlite3_step(st) != SQLITE_DONE) { sqlite3_finalize(st); return -1; }
+            batch_removed = sqlite3_changes(g_jth_db);
+            sqlite3_finalize(st);
+            st = NULL;
+            if (batch_removed == 0)
+                break; /* only pinned rows left */
+            removed += batch_removed;
+            total_bytes = jth_snapshot_store_bytes();
+        }
+    }
     return removed;
 }
 
@@ -1146,19 +1396,44 @@ struct json_object *jmx_topology_history_status(void)
     snprintf(wal_path, sizeof(wal_path), "%s-wal", jth_db_path());
     if (stat(wal_path, &sb) == 0) wal_bytes = sb.st_size;
     jth_secure_files();
-    root = json_object_new_object();
-    json_object_object_add(root, "available", json_object_new_boolean(1));
-    json_object_object_add(root, "database", json_object_new_string(jth_db_path()));
-    json_object_object_add(root, "retention_ms", json_object_new_int64(JTH_RETENTION_MS));
-    json_object_object_add(root, "anchor_interval_ms", json_object_new_int64(JTH_ANCHOR_MS));
-    json_object_object_add(root, "snapshot_count", json_object_new_int64(snapshots));
-    json_object_object_add(root, "event_count", json_object_new_int64(events));
-    json_object_object_add(root, "oldest_timestamp", json_object_new_int64(oldest));
-    json_object_object_add(root, "newest_timestamp", json_object_new_int64(newest));
-    json_object_object_add(root, "database_bytes", json_object_new_int64(db_bytes));
-    json_object_object_add(root, "wal_bytes", json_object_new_int64(wal_bytes));
-    json_object_object_add(root, "snapshot_row_cap", json_object_new_int(JTH_MAX_SNAPSHOTS));
-    json_object_object_add(root, "event_row_cap", json_object_new_int(JTH_MAX_EVENTS));
+    {
+        int64_t age_ms = JTH_RETENTION_MS;
+        int snapshot_cap = JTH_MAX_SNAPSHOTS;
+        int event_cap = JTH_MAX_EVENTS;
+        int64_t byte_cap = JTH_MAX_STORE_BYTES;
+        int64_t store_bytes;
+        int byte_pressure = 0;
+        const char *pressure_level = "normal";
+
+        jth_resolve_retention(&age_ms, &snapshot_cap, &event_cap, &byte_cap);
+        store_bytes = jth_snapshot_store_bytes();
+        if (byte_cap > 0 && store_bytes >= byte_cap)
+            byte_pressure = 2;
+        else if (byte_cap > 0 && store_bytes >= (byte_cap * 9LL / 10LL))
+            byte_pressure = 1;
+        if (byte_pressure >= 2 || snapshots >= snapshot_cap)
+            pressure_level = "critical";
+        else if (byte_pressure == 1 || snapshots >= (snapshot_cap * 9LL / 10LL))
+            pressure_level = "warning";
+
+        root = json_object_new_object();
+        json_object_object_add(root, "available", json_object_new_boolean(1));
+        json_object_object_add(root, "database", json_object_new_string(jth_db_path()));
+        json_object_object_add(root, "retention_ms", json_object_new_int64(age_ms));
+        json_object_object_add(root, "anchor_interval_ms", json_object_new_int64(JTH_ANCHOR_MS));
+        json_object_object_add(root, "snapshot_count", json_object_new_int64(snapshots));
+        json_object_object_add(root, "event_count", json_object_new_int64(events));
+        json_object_object_add(root, "oldest_timestamp", json_object_new_int64(oldest));
+        json_object_object_add(root, "newest_timestamp", json_object_new_int64(newest));
+        json_object_object_add(root, "database_bytes", json_object_new_int64(db_bytes));
+        json_object_object_add(root, "wal_bytes", json_object_new_int64(wal_bytes));
+        json_object_object_add(root, "snapshot_row_cap", json_object_new_int(snapshot_cap));
+        json_object_object_add(root, "event_row_cap", json_object_new_int(event_cap));
+        json_object_object_add(root, "byte_cap", json_object_new_int64(byte_cap));
+        json_object_object_add(root, "snapshot_store_bytes", json_object_new_int64(store_bytes));
+        json_object_object_add(root, "byte_pressure", json_object_new_int(byte_pressure));
+        json_object_object_add(root, "storage_pressure", json_object_new_string(pressure_level));
+    }
     return root;
 }
 

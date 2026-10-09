@@ -35,6 +35,7 @@
 #include <libubox/uloop.h>
 #include <libubox/utils.h>
 #include <libubus.h>
+#include "otad_boot_contract.h"
 
 #ifndef OTAD_CONFIG_DB_PATH
 #define OTAD_CONFIG_DB_PATH "/etc/dreamingwrt/config.db"
@@ -77,6 +78,8 @@
 #define OTAD_BOOT_CONFIRM_DELAY_MS 30000
 #define OTAD_BOOT_OBSERVATION_WINDOW_SEC 600
 #define OTAD_BOOT_RECHECK_DELAY_MS 30000
+#define OTAD_BOOT_RETRY_DELAY_MS 120000
+#define OTAD_BOOT_LOG_REPEAT_MS 300000
 #define OTAD_BOOT_HARD_FAILURE_CONFIRMATIONS 3
 #define OTAD_BOOT_RESTART_LIMIT 3
 #define OTAD_STATUS_PROBE_FAILURE_TTL_MS 30000
@@ -84,7 +87,11 @@
 #define OTAD_UPLOAD_ID_LEN 36
 #define OTAD_OPERATION_OPTIONS_MAX 1024
 #define OTAD_TRUST_KEY_ID_MAX 128
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+#define OTAD_UPLOAD_STAGING_ROOT "/tmp/dreamingwrt/upload-staging"
+#else
 #define OTAD_UPLOAD_STAGING_ROOT "/data/persist/var/lib/dreamingwrt/upload-staging"
+#endif
 #define OTAD_FIRMWARE_MAX_BYTES (8ULL * 1024ULL * 1024ULL * 1024ULL)
 #define OTAD_SPACE_SAFETY_MIN_BYTES (64ULL * 1024ULL * 1024ULL)
 #define OTAD_SPACE_SAFETY_PERCENT 10U
@@ -315,6 +322,13 @@ int otad_operation_commit_hot_preflight(const char *operation_id,
                                         const struct otad_trust_binding *binding,
                                         struct json_object *result);
 int otad_operation_claim_hot_apply(const char *operation_id);
+int otad_operation_commit_single_slot_preflight(const char *operation_id,
+                                            const char *from_version,
+                                            const char *to_version,
+                                            const char *build_id,
+                                            const struct otad_trust_binding *binding,
+                                            struct json_object *result);
+int otad_operation_claim_single_slot_apply(const char *operation_id);
 int otad_operation_reverify_trust_binding(
     int fd, uint64_t expected_size, const struct otad_operation_work *work,
     char *error, size_t error_len);

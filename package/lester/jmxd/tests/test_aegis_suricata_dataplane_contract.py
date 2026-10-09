@@ -5,12 +5,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text
 SRC = ROOT / "src"
 INTERNAL = (SRC / "aegisxd/aegisxd_internal.h").read_text(encoding="utf-8")
 DB = (SRC / "aegisxd/aegisxd_db.c").read_text(encoding="utf-8")
 DATAPLANE = (SRC / "aegisxd/aegisxd_dataplane.c").read_text(encoding="utf-8")
 STATUS = (SRC / "aegisxd/aegisxd_status.c").read_text(encoding="utf-8")
-WEB = (SRC / "webd/jmx_app_api.c").read_text(encoding="utf-8")
+WEB = webd_dispatch_text()
 
 
 def test_runtime_capture_settings_are_persistent_and_migrated() -> None:

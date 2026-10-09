@@ -10,7 +10,9 @@
 #include <errno.h>
 #include <json-c/json.h>
 #include <limits.h>
+#include <pthread.h>
 #include <sqlite3.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -30,6 +32,8 @@ struct jmx_isp_cache_entry {
 };
 
 static struct jmx_isp_cache_entry g_isp_cache[JMX_ISP_MAX_WANS];
+static pthread_mutex_t g_isp_lock = PTHREAD_MUTEX_INITIALIZER;
+static unsigned int g_isp_refresh_inflight;
 
 static int jmx_isp_ifname_ok(const char *s);
 
@@ -264,7 +268,7 @@ static int jmx_isp_match_carrier(uint32_t public_ip_host_order, jmx_isp_entry_t 
     int ok = -1;
 
     if (jmx_isp_signature_db_path(path, sizeof(path)) != 0 ||
-        sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
+        jmx_signature_db_open_path(path, &db) != SQLITE_OK)
         goto done;
     if (sqlite3_prepare_v2(db,
         "SELECT carrier,carrier_id,carrier_name,network,prefix_len "
@@ -296,7 +300,7 @@ static int jmx_isp_match_carrier(uint32_t public_ip_host_order, jmx_isp_entry_t 
 
 done:
     if (st) sqlite3_finalize(st);
-    if (db) sqlite3_close(db);
+    if (db) jmx_signature_db_close_path(db);
     return ok;
 }
 
@@ -383,45 +387,112 @@ void jmx_isp_exit(void)
 {
 }
 
+static void *jmx_isp_refresh_thread(void *arg)
+{
+    intptr_t idx = (intptr_t)arg;
+    jmx_isp_entry_t detected;
+    char key[32] = "";
+    int rc;
+
+    pthread_mutex_lock(&g_isp_lock);
+    if (idx >= 0 && idx < JMX_ISP_MAX_WANS && g_isp_cache[idx].key[0])
+        snprintf(key, sizeof(key), "%s", g_isp_cache[idx].key);
+    pthread_mutex_unlock(&g_isp_lock);
+    if (!key[0])
+        return NULL;
+
+    rc = jmx_isp_detect_sync(key, key, &detected);
+    pthread_mutex_lock(&g_isp_lock);
+    if (idx >= 0 && idx < JMX_ISP_MAX_WANS &&
+        g_isp_cache[idx].key[0] && !strcmp(g_isp_cache[idx].key, key)) {
+        g_isp_cache[idx].ts = time(NULL);
+        g_isp_cache[idx].status = rc;
+        g_isp_cache[idx].entry = detected;
+        g_isp_cache[idx].entry.pending = 0;
+    }
+    if (idx >= 0 && idx < JMX_ISP_MAX_WANS)
+        g_isp_refresh_inflight &= ~(1U << (unsigned int)idx);
+    pthread_mutex_unlock(&g_isp_lock);
+    return NULL;
+}
+
+static void jmx_isp_refresh_async(int idx)
+{
+    pthread_attr_t attr;
+    pthread_t tid;
+    int created;
+
+    if (idx < 0 || idx >= JMX_ISP_MAX_WANS)
+        return;
+    pthread_mutex_lock(&g_isp_lock);
+    if (g_isp_refresh_inflight & (1U << (unsigned int)idx)) {
+        pthread_mutex_unlock(&g_isp_lock);
+        return;
+    }
+    g_isp_refresh_inflight |= 1U << (unsigned int)idx;
+    g_isp_cache[idx].entry.pending = 1;
+    pthread_mutex_unlock(&g_isp_lock);
+
+    pthread_attr_init(&attr);
+    pthread_attr_setdetachstate(&attr, PTHREAD_CREATE_DETACHED);
+    created = pthread_create(&tid, &attr, jmx_isp_refresh_thread,
+                             (void *)(intptr_t)idx);
+    pthread_attr_destroy(&attr);
+    if (created != 0) {
+        pthread_mutex_lock(&g_isp_lock);
+        g_isp_refresh_inflight &= ~(1U << (unsigned int)idx);
+        g_isp_cache[idx].entry.pending = 0;
+        pthread_mutex_unlock(&g_isp_lock);
+    }
+}
+
 int jmx_isp_get(const char *ifname, jmx_isp_entry_t *out)
 {
-    jmx_isp_entry_t detected;
+    jmx_isp_entry_t entry;
     time_t now = time(NULL);
     int idx;
     int ttl;
     int rc;
+    int pending;
 
     if (!ifname || !out || !jmx_isp_ifname_ok(ifname))
         return -1;
+    pthread_mutex_lock(&g_isp_lock);
     idx = jmx_isp_cache_find(ifname, 1);
-    if (idx < 0)
-        return jmx_isp_detect_sync(ifname, ifname, out);
+    if (idx < 0) {
+        pthread_mutex_unlock(&g_isp_lock);
+        return -1;
+    }
     ttl = g_isp_cache[idx].status == 0 ? JMX_ISP_CACHE_TTL_OK_S : JMX_ISP_CACHE_TTL_FAIL_S;
     if (g_isp_cache[idx].ts > 0 && now - g_isp_cache[idx].ts < ttl) {
         *out = g_isp_cache[idx].entry;
-        return g_isp_cache[idx].status;
+        rc = g_isp_cache[idx].status;
+        pthread_mutex_unlock(&g_isp_lock);
+        return rc;
     }
-    rc = jmx_isp_detect_sync(ifname, ifname, &detected);
-    g_isp_cache[idx].ts = now;
-    g_isp_cache[idx].status = rc;
-    g_isp_cache[idx].entry = detected;
-    *out = detected;
+    /*
+     * Cache miss or expired: answer from the last known value immediately and
+     * refresh off the ubus main loop. A curl subprocess must never stall every
+     * request on the core thread when the WAN IP lookup provider is slow.
+     */
+    entry = g_isp_cache[idx].entry;
+    rc = g_isp_cache[idx].status;
+    pending = g_isp_cache[idx].entry.pending;
+    pthread_mutex_unlock(&g_isp_lock);
+    if (!pending)
+        jmx_isp_refresh_async(idx);
+    *out = entry;
     return rc;
 }
 
 void jmx_isp_refresh(const char *ifname)
 {
-    jmx_isp_entry_t tmp;
     int idx;
-    int rc;
 
     if (!ifname || !jmx_isp_ifname_ok(ifname))
         return;
-    rc = jmx_isp_detect_sync(ifname, ifname, &tmp);
+    pthread_mutex_lock(&g_isp_lock);
     idx = jmx_isp_cache_find(ifname, 1);
-    if (idx >= 0) {
-        g_isp_cache[idx].ts = time(NULL);
-        g_isp_cache[idx].status = rc;
-        g_isp_cache[idx].entry = tmp;
-    }
+    pthread_mutex_unlock(&g_isp_lock);
+    jmx_isp_refresh_async(idx);
 }

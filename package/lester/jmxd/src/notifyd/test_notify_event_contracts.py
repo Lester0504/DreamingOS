@@ -7,11 +7,12 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
 ROUTE_EVENT = ROOT / "src" / "routed" / "jmx_route.c"
-NETCONFIG_DB = ROOT / "src" / "jmx_netconfig_db.c"
+NETCONFIG_DB = ROOT / "src" / "netconfig" / "023_nc_log.c"
 LOGD_EVENT = ROOT / "src" / "logd" / "logd_event.c"
 LOGD_UBUS = ROOT / "src" / "logd" / "logd_ubus.c"
 NOTIFYD_DB = ROOT / "src" / "notifyd" / "notifyd_db.c"
 NOTIFYD_UBUS = ROOT / "src" / "notifyd" / "notifyd_ubus.c"
+EVENT_SEMANTICS = ROOT / "src" / "event_semantics.c"
 
 
 def read(path: Path) -> str:
@@ -63,32 +64,48 @@ def c_function(source: str, marker: str) -> str:
     raise AssertionError(f"unterminated C function: {marker}")
 
 
-def catalog_event_rows(notifyd: str) -> list:
-    """Rows of notifyd_event_definitions[] only.
+def catalog_event_rows(source: str = None) -> list:
+    """Rows of dw_event_definitions[] from event_semantics.c.
 
-    Scoped to that one initializer on purpose: the file also holds a category
-    table whose rows look like `{ "SYSTEM", "System" },`, and a plain
-    startswith('{ "') scan swallows those too, which is part of how the old
-    hardcoded totals drifted without anyone noticing what they counted.
+    The catalog has been unified into a single shared table in
+    event_semantics.c. Parse the DW_EVENT() macro invocations.
     """
-    lines = notifyd.splitlines()
+    if source is None:
+        source = read(EVENT_SEMANTICS)
+    lines = source.splitlines()
     start = next(
         i for i, line in enumerate(lines)
-        if "notifyd_event_definitions[] = {" in line
+        if "dw_event_definitions[]" in line
     )
     rows = []
     for line in lines[start + 1:]:
         stripped = line.strip()
         if stripped.startswith("};"):
             break
-        if not (stripped.startswith('{ "') and stripped.endswith("},")):
+        if "DW_EVENT(" not in stripped:
             continue
         fields = re.findall(r'"([^"]*)"', stripped)
-        available = re.search(r",\s*(\d+)\s*\},$", stripped)
+        # DW_EVENT has 11 args; last is available (0/1)
+        available = re.search(r",\s*(\d+)\s*\),$", stripped)
+        if not available:
+            available = re.search(r",\s*(\d+)\s*\)", stripped)
         assert available, f"unparsable catalog row: {stripped}"
-        assert len(fields) == 8, f"unexpected field count in catalog row: {stripped}"
-        rows.append(fields + [available.group(1)])
-    assert rows, "notifyd_event_definitions[] parsed as empty"
+        # fields order: id, category, label_en, label_zh, producer,
+        #   recovery_event, recovers_event, unavailable_reason, severity, message_key
+        # Map to old 8-field layout: id, category, label, producer, recovery, recovers, reason, severity
+        assert len(fields) == 10, f"unexpected field count in catalog row: {stripped} got {len(fields)}"
+        mapped = [
+            fields[0],  # id
+            fields[1],  # category  
+            fields[2],  # label_en
+            fields[4],  # producer
+            fields[5],  # recovery_event
+            fields[6],  # recovers_event
+            fields[7],  # unavailable_reason
+            fields[8],  # severity
+        ]
+        rows.append(mapped + [available.group(1)])
+    assert rows, "dw_event_definitions[] parsed as empty"
     return rows
 
 
@@ -107,14 +124,22 @@ def test_route_health_source_reaches_logd_and_notifyd_contracts():
         "source": "routed.health",
     }.items():
         assert f'json_object_object_add(o, "{field}", json_object_new_string("{value}"));' in emitter
-    for field in ("id", "level", "iface", "title", "event", "detail", "state", "target", "ts"):
+    for field in ("id", "level", "iface", "wan_id", "title", "event",
+                  "detail_json", "dedupe_key", "state", "target", "ts"):
         assert f'json_object_object_add(o, "{field}"' in emitter
-    assert "wan=%s ifname=%s target=%s reason=%s fail_count=%u ok_count=%u" in emitter
+    for field in ("quality_level", "raw_level", "penalty_peak_level",
+                  "adaptive_weight", "reason", "latency_ms",
+                  "probe_loss_pct", "up_loss_pct", "down_loss_pct",
+                  "jitter_ms", "jitter_over_80_pct", "recovery_observing",
+                  "recovery_target_level", "rebind_mode"):
+        assert f'json_object_object_add(detail, "{field}"' in emitter
     assert 'json_object_object_add(o, "target", json_object_new_string(st->name));' in emitter
     assert "resp = jmx_log_center_event_add(o);" in emitter
     assert "return 0;" in emitter
-    assert 'route_health_event_emit(st, "warning", "wan.failover.down"' in route
-    assert 'route_health_event_emit(st, "notice", "wan.failover.recovered"' in route
+    for event in ("wan.quality.degraded", "wan.quality.critical",
+                  "wan.penalty.recovering", "wan.quality.recovered",
+                  "wan.quality.critical_recovered"):
+        assert f'"{event}"' in route
 
     store = c_function(netconfig, "static int nc_log_center_event_store(")
     assert store.count("nc_log_event_insert_obj(event)") == 1
@@ -167,32 +192,80 @@ def test_route_health_source_reaches_logd_and_notifyd_contracts():
 
 def test_catalog_available_matches_real_producer_contracts():
     logd = read(LOGD_EVENT)
-    notifyd = read(NOTIFYD_DB)
+    semantics = read(EVENT_SEMANTICS)
     expected = {
         "WAN_FAILOVER_ACTIVE": "dreamingwrt.routed.health",
         "WAN_FAILBACK": "dreamingwrt.routed.health",
+        "WAN_QUALITY_DEGRADED": "dreamingwrt.routed.health",
+        "WAN_QUALITY_CRITICAL": "dreamingwrt.routed.health",
+        "WAN_PENALTY_RECOVERING": "dreamingwrt.routed.health",
+        "WAN_QUALITY_RECOVERED": "dreamingwrt.routed.health",
         "PORT_LINK_DOWN": "dreamingwrt.logd.collector.port",
         "PORT_LINK_UP": "dreamingwrt.logd.collector.port",
+        "PORT_TX_RX_ERRORS": "dreamingwrt.logd.collector.port",
+        "PORT_DROPPED_TRAFFIC": "dreamingwrt.logd.collector.port",
+        "DEVICE_OFFLINE": "dreamingwrt-core.topology_history",
+        "DEVICE_RESTORED": "dreamingwrt-core.topology_history",
+        "CLIENT_IP_CONFLICT": "dreamingwrt-core.ipam",
+        "SECURITY_DETECTION": "dreamingwrt.aegisxd.suricata",
+        "APPLICATION_UPDATE_FAILED": "dreamingwrt.otad",
     }
     for event_code, producer in expected.items():
         assert f'"{event_code}"' in logd
-        assert f'"{producer}"' in logd
-        line = next(line for line in notifyd.splitlines() if f'{{ "{event_code}",' in line)
+        line = next(line for line in semantics.splitlines() if f'"{event_code}"' in line and 'DW_EVENT' in line)
         assert f'"{producer}"' in line
-        assert line.rstrip().endswith("1 },")
+        assert line.rstrip().endswith("1),")
         assert "producer_pending" not in line
 
 
+def test_config_commit_failure_catalog_has_real_producer():
+    semantics = read(EVENT_SEMANTICS)
+    line = next(line for line in semantics.splitlines()
+                if '"CONFIG_COMMIT_FAILED"' in line and 'DW_EVENT' in line)
+    assert '"dreamingwrt-core"' in line
+    assert line.rstrip().endswith("1),")
+    assert "producer_pending" not in line
+    reporter_source = read(ROOT / "src" / "dw_config_event.c")
+    reporter = c_function(reporter_source, "int dw_report_config_commit_failed(")
+    assert '#define DW_CFG_EVENT_ID       "CONFIG_COMMIT_FAILED"' in reporter_source
+    assert 'ubus_invoke(ctx, object_id, "event_add"' in reporter
+    assert "DW_CFG_EVENT_ID" in reporter
+    # Real configuration failure callers must remain connected to the reporter.
+    for relative in ("api/dw_api_dhcp.c", "netconfig/039_nc_ipam_contract.c",
+                     "netconfig/024_nc_system_settings.c"):
+        assert "dw_report_config_commit_failed(" in read(ROOT / "src" / relative)
+
+
 def test_pending_events_stay_unavailable_without_true_source():
-    notifyd = read(NOTIFYD_DB)
+    semantics = read(EVENT_SEMANTICS)
     pending = {
-        "SECURITY_DETECTION": "aegis_suricata_event_bridge_pending",
-        "APPLICATION_UPDATE_FAILED": "otad_failure_event_producer_pending",
+        "VPN_SITE_TO_SITE_DISCONNECTED": "vpn_state_producer_pending",
+        "VPN_SITE_TO_SITE_RESTORED": "vpn_state_producer_pending",
+        "IMPROPER_SHUTDOWN": "boot_marker_event_producer_pending",
     }
     for event_code, reason in pending.items():
-        line = next(line for line in notifyd.splitlines() if f'{{ "{event_code}",' in line)
+        line = next(line for line in semantics.splitlines() if f'"{event_code}"' in line and 'DW_EVENT' in line)
         assert f'"{reason}"' in line
-        assert line.rstrip().endswith("0 },")
+        assert line.rstrip().endswith("0),")
+
+
+def test_p1_structured_sources_have_contracts_and_catalog_entries():
+    logd = read(LOGD_EVENT)
+    semantics = read(EVENT_SEMANTICS)
+    contracts = {
+        ("port", "counter_errors"): ("PORT_TX_RX_ERRORS", "dreamingwrt.logd.collector.port"),
+        ("port", "counter_drops"): ("PORT_DROPPED_TRAFFIC", "dreamingwrt.logd.collector.port"),
+        ("topology.device", "device_offline"): ("DEVICE_OFFLINE", "dreamingwrt-core.topology_history"),
+        ("topology.device", "device_restored"): ("DEVICE_RESTORED", "dreamingwrt-core.topology_history"),
+        ("ipam", "ip_conflict"): ("CLIENT_IP_CONFLICT", "dreamingwrt-core.ipam"),
+        ("security", "suricata_detection"): ("SECURITY_DETECTION", "dreamingwrt.aegisxd.suricata"),
+        ("system", "application_update_failed"): ("APPLICATION_UPDATE_FAILED", "dreamingwrt.otad"),
+    }
+    for (category, event), (event_code, producer) in contracts.items():
+        assert f'"{category}", "{event}", "{event_code}"' in logd
+        line = next(line for line in semantics.splitlines() if f'"{event_code}"' in line and 'DW_EVENT' in line)
+        assert f'"{producer}"' in line
+        assert line.rstrip().endswith("1),")
     """
     WAN_DOWN used to sit in `pending` above with
     reason="confirmed_wan_reachability_producer_pending". It has a real producer
@@ -205,10 +278,10 @@ def test_pending_events_stay_unavailable_without_true_source():
     producer rename, still fails here.
     """
     for event_code in ("WAN_DOWN", "WAN_RESTORED"):
-        line = next(line for line in notifyd.splitlines() if f'{{ "{event_code}",' in line)
+        line = next(line for line in semantics.splitlines() if f'"{event_code}"' in line and 'DW_EVENT' in line)
         assert '"dreamingwrt-core"' in line
         assert "producer_pending" not in line
-        assert line.rstrip().endswith("1 },")
+        assert line.rstrip().endswith("1),")
 
     """
     This used to assert bare totals (18 available / 17 unavailable). The catalog
@@ -218,7 +291,7 @@ def test_pending_events_stay_unavailable_without_true_source():
     row can claim an event will arrive while naming nobody to send it, and none
     can be parked as pending without saying what is missing.
     """
-    definitions = catalog_event_rows(notifyd)
+    definitions = catalog_event_rows()
     assert len(definitions) > 40
     for row in definitions:
         event_code, producer, reason, available = (
@@ -564,6 +637,7 @@ if __name__ == "__main__":
         test_route_health_source_reaches_logd_and_notifyd_contracts,
         test_catalog_available_matches_real_producer_contracts,
         test_pending_events_stay_unavailable_without_true_source,
+        test_p1_structured_sources_have_contracts_and_catalog_entries,
         test_route_health_end_to_end_sqlite_fixture,
         test_bridge_failure_does_not_rollback_legacy_insert,
     ):

@@ -221,6 +221,7 @@ struct json_object *otad_status_json(struct json_object *body)
     int inactive_bootable = boot_state_ready &&
         otad_json_bool(slot_status, "inactive_slot_bootable_verified", 0);
     int rollback_ready = inactive_bootable;
+    int is_single_slot = otad_json_bool(slot_status, "single_slot", 0);
 
     ok = otad_state_get("state", state, sizeof(state), "idle") == 0;
     if (otad_state_get("last_inventory_scan_at", scan_at, sizeof(scan_at), "0") != 0)
@@ -266,11 +267,13 @@ struct json_object *otad_status_json(struct json_object *body)
          * a gate that would not have opened either way, and it hid which
          * precondition was actually missing.
          */
-        int slot_write_ready = trust_ready && topology_supported && rollback_ready;
+        int slot_write_ready = is_single_slot ? trust_ready :
+                               (trust_ready && topology_supported && rollback_ready);
         const char *gate_reason =
             !trust_ready ? otad_json_str(trust, "reason", "release_trust_unavailable") :
-            (!topology_supported ? "ab_topology_readonly_evidence_incomplete" :
-             (!rollback_ready ? "bootloader_slot_state_not_rollback_capable" : ""));
+            (is_single_slot ? "" :
+             (!topology_supported ? "ab_topology_readonly_evidence_incomplete" :
+              (!rollback_ready ? "bootloader_slot_state_not_rollback_capable" : "")));
 
         json_object_object_add(resp, "apply_enabled",
                                json_object_new_boolean(slot_write_ready));

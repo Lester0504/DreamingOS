@@ -1,0 +1,19 @@
+.task-center-layer .dwrt-kit-modal { --dwrt-kit-modal-width: 660px; }
+.task-center-layer .dwrt-kit-modal-body { overflow: auto; min-height: 0; }
+.task-center-layer .dwrt-kit-modal-header h2 { margin: 0; font-size: 18px; }
+.task-center-layer .dwrt-kit-modal-footer { font-size: 12px; color: var(--dwrt-kit-muted, var(--app-text-muted)); }
+.task-center-source { margin: 0 0 8px; font-size: 12px; color: var(--dwrt-kit-muted, var(--app-text-muted)); overflow-wrap: anywhere; }
+.task-center-source.is-error { color: var(--dwrt-kit-danger, #e5484d); }
+.task-center-list { display: grid; gap: 0; padding: 0; margin: 16px 0 0; list-style: none; }
+.task-center-row { display: grid; gap: 8px; padding: 16px 0; border-top: 1px solid var(--dwrt-kit-divider, rgba(128,128,128,.2)); min-width: 0; }
+.task-center-row header { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; }
+.task-center-row p { margin: 0; overflow-wrap: anywhere; }
+.task-center-row progress { width: 100%; height: 8px; accent-color: var(--dwrt-kit-accent, #258bff); }
+.task-center-row time, .task-center-row small { font-size: 12px; color: var(--dwrt-kit-muted, var(--app-text-muted)); }
+.task-center-empty { padding-block: 24px; color: var(--dwrt-kit-muted, var(--app-text-muted)); }
+
+.console-page-footer:has(#dwrtTaskCenterButton) { gap: 12px; flex-wrap: wrap; }
+.task-center-layer[hidden] { display: none !important; }
+/* Match the version strip's compact height while keeping its task entry interactive. */
+html:has(#dwrtTaskCenterButton) { --app-page-footer-compact: 36px; }
+#dwrtTaskCenterButton { pointer-events: auto; min-height: 24px; height: 24px; padding-block: 0; font-size: 12px; flex: none; }

@@ -1,13 +1,14 @@
 (() => {
   'use strict';
 
-  const VERSION = '20260817-audit-log-localization-03';
+  const VERSION = '20261006-log-center-workbench-06';
   const REFRESH_MS = 30000;
   const SEARCH_DEBOUNCE_MS = 650;
   const DEFAULT_PAGE_SIZE = 25;
   // 表格描述列的截断长度，超出后折叠为「…」，点击展开。
   const MESSAGE_CLAMP_CHARS = 120;
   const ENDPOINTS = {
+    audit: '/api/v1/audit/records',
     settings: '/api/v1/logs/settings',
     filters: '/api/v1/logs/filter-data',
     count: '/api/v1/logs/count',
@@ -27,9 +28,9 @@
     custom: { label: '自定义', ms: 86400000 }
   };
   const SEVERITIES = [
-    { id: 'LOW', label: '低', bars: 'low' },
-    { id: 'MEDIUM', label: '可疑', bars: 'medium' },
-    { id: 'HIGH', label: '高', bars: 'high' },
+    { id: 'LOW', label: '信息', bars: 'low' },
+    { id: 'MEDIUM', label: '警告', bars: 'medium' },
+    { id: 'HIGH', label: '错误', bars: 'high' },
     { id: 'VERY_HIGH', label: '严重', bars: 'critical' }
   ];
   const GENERAL_CATEGORIES = [
@@ -86,13 +87,22 @@
     'client.block': '阻止终端联网'
   };
   const AUDIT_RESULT_LABELS = {
+    unknown: '未知结果',
+    ok: '成功',
     success: '成功',
     applied: '已应用',
     denied: '被拒绝',
     failed: '失败',
+    partial: '部分完成',
     cancelled: '已取消',
     dry_run: '仅演练',
-    accepted: '已接受',
+    accepted: '已受理',
+    dispatched: '已调度',
+    observed: '已观察',
+    removed: '已移除',
+    recovered: '已恢复',
+    read_only: '已转只读',
+    retrying: '重试中',
     rolled_back: '已回滚'
   };
   const AUDIT_CHANNEL_LABELS = {
@@ -262,14 +272,28 @@
     const firstText = options.firstText || fallbackText;
     const firstNumber = options.firstNumber || fallbackNumber;
     const formatInteger = options.formatInteger || ((value) => Number(value || 0).toLocaleString('zh-CN'));
+    const formatDateTime = options.formatDateTime || ((value) => new Date(timeMs(value)).toLocaleString('zh-CN', { hour12: false }));
     const fetchApiResource = options.fetchApiResource || (async (name) => ({ name, ok: false, data: {}, error: new Error(`${name}: fetch unavailable`) }));
     const mountUiKit = options.mountUiKit || ((target) => window.DWRT_UI_KIT?.mountAll(target));
     const scheduleGlassCardsRender = options.scheduleGlassCardsRender || (() => {});
     const routeTo = options.routeTo || ((path) => { window.location.href = path; });
 
+    const desktop = document.documentElement?.dataset.desktopEmbedded === 'true';
+    const requests = new Set();
+    const modeStates = {};
+    let resizeObserver;
+    let filterSheetNode = null;
+    let composingSearch = false;
     const state = {
       mode: 'GENERAL',
-      sources: new Set(['general']),
+      sources: new Set(),
+      semantic: 'BUSINESS',
+      domain: '',
+      origin: 'ALL',
+      collector: '',
+      auditFilters: { actor: '', action: '', channel: '', result: '', risk: '', domain: '' },
+      capabilities: {},
+      filterOpen: false,
       view: 'logs',
       period: 'day',
       customRange: null,
@@ -304,7 +328,7 @@
       refreshSeq: 0,
       searchTimer: 0,
       newProtocolUnavailableUntil: 0,
-      newProtocolAvailable: false,
+      newProtocolAvailable: true,
       aiLoading: false,
       aiResult: null,
       pendingRefreshOptions: null,
@@ -337,15 +361,19 @@
           : (current.body && typeof current.body === 'object' ? current.body : null);
         if (!next) break;
         // 内层若已是数组或不再是 {ok,data} 包裹，则本层即为载荷宿主。
+        if (Array.isArray(next)) break;
         current = next;
-        if (Array.isArray(current)) break;
       }
       return current || {};
     }
 
     async function requestJson(name, url, init = {}) {
       const hasBody = init.body !== undefined;
+      const controller = new AbortController();
+      requests.add(controller);
+      try {
       const response = await fetch(url, {
+        signal: controller.signal,
         method: init.method || (hasBody ? 'POST' : 'GET'),
         credentials: 'same-origin',
         cache: 'no-store',
@@ -368,7 +396,10 @@
         error.payload = json;
         throw error;
       }
-      return unwrapApiData(json);
+      const payload = unwrapApiData(json);
+      if (payload.ok === false) { const error = new Error(`${name}: ${payload.error || '请求失败'}`); error.status = 503; throw error; }
+      return payload;
+      } finally { requests.delete(controller); }
     }
 
     function sourceMeta(id) {
@@ -468,30 +499,25 @@
     }
 
     function requestBody() {
-      const range = currentRange();
-      // 只提交属于当前 tab 的来源，避免后端把两个 tab 当成同一次查询。
-      const sourceIds = Array.from(state.sources).filter((id) => modeAllowsSource(id));
-      const effectiveSources = sourceIds.length ? sourceIds : [defaultSourceForMode()];
-      const sourceSections = sourceIds.flatMap((id) => sourceMeta(id)?.sections || []);
-      const categories = Array.from(state.categories);
       return {
-        type: state.mode,
-        searchText: state.search,
-        severities: Array.from(state.severities),
-        sources: effectiveSources,
-        sections: sourceSections.length ? sourceSections : (sourceMeta(defaultSourceForMode())?.sections || []),
-        logSources: effectiveSources,
-        timestampFrom: range.timestampFrom,
-        timestampTo: range.timestampTo,
-        pageNumber: state.pageNumber,
-        pageSize: state.pageSize,
-        categories,
-        events: Array.from(state.events),
-        deviceMacs: Array.from(state.deviceMacs),
-        clientDeviceMacs: Array.from(state.clientDeviceMacs),
-        adminIds: Array.from(state.adminIds),
-        programs: Array.from(state.programs)
+        type: state.mode, searchText: state.search,
+        severities: Array.from(state.severities), sources: Array.from(state.sources),
+        ...currentRange(), pageNumber: state.pageNumber, pageSize: state.pageSize,
+        categories: Array.from(state.categories), events: Array.from(state.events),
+        deviceMacs: Array.from(state.deviceMacs), clientDeviceMacs: Array.from(state.clientDeviceMacs),
+        adminIds: Array.from(state.adminIds), programs: Array.from(state.programs),
+        ...(state.domain ? { domain: state.domain } : {}),
+        ...(state.capabilities.semantic_filter ? { semantic: state.semantic } : {}),
+        ...(state.capabilities.origin_filter ? { origin: state.origin } : {}),
+        ...(state.collector ? { collectors: [state.collector] } : {})
       };
+    }
+
+    function auditQuery() {
+      const range = currentRange();
+      return new URLSearchParams({ ...state.auditFilters, q: state.search,
+        from: Math.floor(range.timestampFrom / 1000), to: Math.floor(range.timestampTo / 1000),
+        page: state.pageNumber + 1, page_size: state.pageSize });
     }
 
     function settingNumber(key, fallback) {
@@ -759,18 +785,7 @@
 
     function formatTime(value) {
       const ms = timeMs(value);
-      if (!ms) return '--';
-      const date = new Date(ms);
-      if (!Number.isFinite(date.getTime())) return '--';
-      return new Intl.DateTimeFormat('zh-CN', {
-        hour12: false,
-        year: 'numeric',
-        month: '2-digit',
-        day: '2-digit',
-        hour: '2-digit',
-        minute: '2-digit',
-        second: '2-digit'
-      }).format(date);
+      return ms ? formatDateTime(ms, { includeSeconds: true }) : '--';
     }
 
     function normalizeLogItem(item = {}, index = 0, sourceHint = '') {
@@ -785,9 +800,9 @@
       const sourceContext = objectValue(item.source_context, item.source_detail);
       const auditObject = objectValue(item.object, item.target_object, rawDetail.object_detail);
       const severity = severityKey(item.severity, item.level, item.priority, item.status, item.type);
-      const category = firstText(item.category, item.category_key, item.type === 'audit' ? 'AUDIT' : '', sourceHint);
+      const category = firstText(item.domain, item.category, item.category_key, item.type === 'audit' ? 'AUDIT' : '', sourceHint);
       const event = firstText(item.event_code, item.event, item.action, auditParams.action, rawDetail.action, item.key, item.event_key, item.message_type);
-      const message = firstText(item.message, item.message_raw, item.description, item.detail, item.title, item.title_raw, item.event, item.action);
+      const message = firstText(item.presentation?.description, item.message, item.message_raw, item.description, item.detail, item.title, item.title_raw, item.event, item.action);
       const timestamp = timeMs(firstNumber(item.timestamp, item.ts, item.time, item.created_at, item.date));
       const sourceEvidence = {
         ...item,
@@ -811,7 +826,7 @@
       const adminName = firstText(admin.name, rawDetail.admin_name, actor.name, item.admin_name, actorNameFromRaw(actorRaw), item.username, item.user);
       const adminId = firstText(actor.id, admin.id, rawDetail.admin_id, item.admin_id, item.actor_id, adminName);
       const channel = firstText(actor.channel, rawDetail.actor_channel, auditParams.channel, item.actor_channel, item.channel);
-      const clientIp = firstText(sourceContext.client_ip, item.client_ip, auditParams.client_ip, rawDetail.client_ip, client.ip, item.auth_ip);
+      const clientIp = firstText(sourceContext.client_ip, item.source_ip, item.client_ip, auditParams.client_ip, rawDetail.client_ip, client.ip, item.auth_ip);
       const objectName = firstText(auditObject.name, item.object_name, auditParams.object, rawDetail.object, item.object, item.target, device.name);
       const objectId = firstText(auditObject.id, item.object_id, rawDetail.object_id);
       const objectType = firstText(auditObject.type, item.object_type, rawDetail.object_type, item.target_type);
@@ -824,16 +839,16 @@
         id: firstText(item.id, item.external_id, item.uuid, `${sourceHint || 'log'}-${timestamp || Date.now()}-${index}`),
         externalId: firstText(item.external_id, item.uuid),
         category: category || (state.mode === 'AUDIT' ? 'AUDIT' : 'HOST'),
-        categoryLabel: categoryLabel(category || (state.mode === 'AUDIT' ? 'AUDIT' : 'HOST')),
+        categoryLabel: firstText(item.domain_label, state.filterData?.domain_catalog?.find(x => x.id === category)?.label, categoryLabel(category || 'SYSTEM')),
         event: event || 'LOG_EVENT',
         eventLabel: state.mode === 'AUDIT'
-          ? auditEventLabel(event)
-          : firstText(item.title, item.title_raw, eventLabel(event), event, '日志事件'),
+          ? firstText(item.action_label, item.presentation?.title, auditEventLabel(event))
+          : firstText(item.presentation?.title, item.title, item.title_raw, eventLabel(event), event, '日志事件'),
         message,
         severity,
         severityLabel: severityLabel(severity),
         status: firstText(item.status, ''),
-        target: firstText(item.target, item.target_type, ''),
+        target: firstText(item.message_args?.object_name, item.message_args?.object_id, item.message_args?.disk_id, item.target, item.target_type, ''),
         type: firstText(item.type, sourceHint),
         timestamp,
         source: firstText(item.source, item.facility, item.module, sourceHint),
@@ -886,6 +901,8 @@
           beforeValue: firstText(item.before_value, auditParams.before_value, rawDetail.before_value),
           afterValue: firstText(item.after_value, auditParams.after_value, rawDetail.after_value),
           readback: item.readback || auditParams.readback || rawDetail.readback || null,
+          beforeHash: firstText(item.before_hash), afterHash: firstText(item.after_hash),
+          requestId: firstText(item.request_id, rawDetail.request_id), taskId: firstText(item.task_id, rawDetail.task_id),
           changes
         },
         raw: item,
@@ -926,7 +943,7 @@
       };
       if (sourceId === 'audit') normalized.audit.structured = true;
       if (state.mode === 'AUDIT' && isAuditRow(normalized)) {
-        normalized.eventLabel = auditEventLabel(normalized.event);
+        normalized.eventLabel = firstText(item.action_label, item.presentation?.title, auditEventLabel(normalized.event));
         normalized.message = auditDetailText(normalized);
       }
       return normalized;
@@ -960,8 +977,14 @@
     }
 
     function legacyRows(payload) {
-      return legacySourceEntries(payload)
+      const data = unwrapApiData(payload);
+      if (Array.isArray(data)) {
+        return data.map((item, index) => normalizeLogItem(item, index, 'logs'));
+      }
+      const sectionRows = legacySourceEntries(data)
         .flatMap((entry) => entry.rows.map((item, index) => normalizeLegacyLogItem(item, index, entry.label, entry.id)));
+      if (sectionRows.length) return sectionRows;
+      return listFrom(data).map((item, index) => normalizeLogItem(item, index, 'logs'));
     }
 
     function rowSearchText(row) {
@@ -1114,9 +1137,14 @@
     function normalizeFilterData(payload) {
       const fallbackEvents = state.mode === 'AUDIT' ? Object.entries(AUDIT_EVENT_LABELS) : GENERAL_EVENTS;
       return {
-        sources: normalizeFilterList(payload, 'sources', LOG_SOURCE_FILTERS).filter((item) => !/^unifi/i.test(item.id)),
-        categories: normalizeFilterList(payload, 'categories', GENERAL_CATEGORIES).filter((item) => !/^UNIFI_/i.test(item.id)).map((item) => ({ ...item, label: categoryLabel(item.id) })),
-        events: normalizeFilterList(payload, 'events', fallbackEvents).map((item) => ({ ...item, label: eventLabel(item.id) })),
+        domain_catalog: asArray(payload?.domain_catalog),
+        domains: normalizeFilterList(payload, 'domains'),
+        collectors: normalizeFilterList(payload, 'collectors'),
+        origins: normalizeFilterList(payload, 'origins'),
+        semantics: normalizeFilterList(payload, 'semantics'),
+        sources: normalizeFilterList(payload, 'sources').filter((item) => !/^unifi/i.test(item.id)),
+        categories: normalizeFilterList(payload, 'categories').filter((item) => !/^UNIFI_/i.test(item.id)).map((item) => ({ ...item, label: categoryLabel(item.id) })),
+        events: normalizeFilterList(payload, 'events').map((item) => ({ ...item, label: eventLabel(item.id) })),
         programs: normalizeFilterList(payload, 'programs', []),
         deviceFilters: asArray(payload && (payload.deviceFilters || payload.devices || payload.device_filters)),
         clientFilters: asArray(payload && (payload.clientFilters || payload.clients || payload.client_filters)),
@@ -1140,36 +1168,38 @@
     }
 
     async function loadNewProtocol(seq) {
-      const body = requestBody();
-      const optional = (promise) => promise.catch(() => null);
-      const settingsPromise = state.settings
-        ? Promise.resolve(state.settings)
-        : optional(requestJson('logs.settings', ENDPOINTS.settings, { method: 'GET' }));
-      const [searchPayload, filterPayload, countPayload, settingsPayload] = await Promise.all([
-        requestJson('logs.search', ENDPOINTS.search, { method: 'POST', body }),
-        optional(requestJson('logs.filter-data', ENDPOINTS.filters, { method: 'POST', body })),
-        optional(requestJson('logs.count', ENDPOINTS.count, { method: 'POST', body })),
-        settingsPromise
-      ]);
-      if (seq !== state.refreshSeq) return false;
-      const search = normalizeSearchPayload(searchPayload);
-      state.allRows = search.rows;
-      // 30.1 实测后端只认 severities/categories/events，忽略 type 与 sources，
-      // 所以这里必须本地再裁一层，保证「风险」按钮和两个 tab 都有真实效果。
-      const constrained = applyLocalFilters(search.rows);
-      const locallyReduced = constrained.length !== search.rows.length;
-      state.rows = locallyReduced ? paginate(constrained) : search.rows;
-      state.total = locallyReduced
-        ? constrained.length
-        : firstNumber(countPayload && countPayload.total, countPayload && countPayload.total_count, search.total, search.rows.length);
-      state.filterLocallyEnforced = locallyReduced;
-      state.filterData = filterPayload ? normalizeFilterData(filterPayload) : filterDataFromRows(search.rows);
-      if (settingsPayload) state.settings = settingsPayload;
+      if (state.mode === 'AUDIT') {
+        const payload = await requestJson('audit.records', `${ENDPOINTS.audit}?${auditQuery()}`);
+        if (seq !== state.refreshSeq) return false;
+        state.rows = asArray(payload.items).map((item, i) => normalizeLogItem({ ...item, type: 'AUDIT' }, i));
+        state.allRows = state.rows;
+        state.total = firstNumber(payload.page?.total);
+        state.filterData = { auditFacets: payload.facets || {} };
+        state.source = 'audit/records';
+        state.notice = '';
+      } else {
+        const body = requestBody();
+        // logd processes ubus requests serially. Search already returns the
+        // exact total, so avoid a duplicate count and queue facets after it.
+        const payload = await requestJson('logs.search', ENDPOINTS.search, { method: 'POST', body });
+        if (seq !== state.refreshSeq) return false;
+        const filters = await requestJson('logs.filter-data', ENDPOINTS.filters, { method: 'POST', body });
+        if (seq !== state.refreshSeq) return false;
+        const hadSemantic = state.capabilities.semantic_filter;
+        state.capabilities = { ...state.capabilities, ...payload.capabilities, ...filters.capabilities };
+        if (!hadSemantic && state.capabilities.semantic_filter && state.semantic !== 'ALL') return loadNewProtocol(seq);
+        state.filterData = normalizeFilterData(filters);
+        const search = normalizeSearchPayload(payload);
+        state.rows = search.rows;
+        state.allRows = search.rows;
+        state.total = search.total;
+        state.filterData = normalizeFilterData(filters);
+        state.source = 'logs/search';
+        state.notice = state.capabilities.semantic_filter ? '' : '当前服务未提供语义筛选，显示全部记录。';
+      }
+      state.filterLocallyEnforced = false;
       pruneSelectedRow();
-      state.newProtocolAvailable = true;
-      state.source = 'logs/search';
       state.error = '';
-      state.notice = '';
       return true;
     }
 
@@ -1180,7 +1210,7 @@
         const message = result && result.error && result.error.message || reason || '日志接口不可用';
         throw new Error(message);
       }
-      const payload = result.data || {};
+      const payload = unwrapApiData(result.data || result);
       state.settings = {
         ...(payload.settings || {}),
         syslog: payload.syslog && typeof payload.syslog === 'object' ? payload.syslog : {},
@@ -1227,8 +1257,40 @@
         state.error = error && error.message || '保存日志设置失败';
       } finally {
         state.loading = false;
-        render();
+        if (state.bound) render();
       }
+    }
+
+    async function exportCurrent() {
+      const mode=state.mode;
+      try {
+        if (state.total > 50000) throw new Error('当前结果超过 50,000 条，请缩小时间或筛选范围后导出。');
+        let blob;
+        if (state.mode === 'AUDIT') {
+          const query = auditQuery(); query.set('page_size','200');
+          const records=[]; let page=1, total=Infinity;
+          while (records.length < total && records.length < 50000) {
+            query.set('page',String(page++));
+            const data = await requestJson('audit.export', `${ENDPOINTS.audit}?${query}`);
+            total=Number(data.page.total); records.push(...data.items);
+            if (!data.items.length) break;
+          }
+          const keys=['id','ts','actor','channel','domain','action','target','result','risk','source_ip','failure_stage','failure_reason','request_id','task_id','before_hash','after_hash'];
+          const cell=v=>'"'+String(v ?? '').replaceAll('"','""')+'"';
+          blob=new Blob([keys.join(',')+'\n'+records.map(x=>keys.map(k=>cell(x[k])).join(',')).join('\n')],{type:'text/csv;charset=utf-8'});
+        } else {
+          const out=await requestJson('logs.export',ENDPOINTS.export,{method:'POST',body:{...requestBody(),format:'csv',limit:50000}});
+          const controller=new AbortController(); requests.add(controller);
+          try {
+            const response=await fetch(out.download_url,{signal:controller.signal,headers:authHeaders(),credentials:'same-origin'});
+            if (!response.ok) throw new Error(`导出失败 (${response.status})`);
+            blob=await response.blob();
+          } finally { requests.delete(controller); }
+        }
+        if(!state.bound || state.mode!==mode)return;
+        const href=URL.createObjectURL(blob), a=document.createElement('a'); a.href=href;
+        a.download=mode==='AUDIT'?'audit.csv':'logs.csv'; a.click(); setTimeout(()=>URL.revokeObjectURL(href),1000);
+      } catch(error) { if(state.bound && error.name!=='AbortError') {state.error=error.message;renderRefreshState();} }
     }
 
     async function exportLogs(form) {
@@ -1250,91 +1312,46 @@
         state.error = error && error.message || '导出日志失败';
       } finally {
         state.loading = false;
-        render();
+        if (state.bound) render();
       }
     }
 
     async function refresh(options = {}) {
-      if (!root) return;
-      if (state.loading) {
-        state.pendingRefreshOptions = { ...(state.pendingRefreshOptions || {}), ...options };
-        return;
-      }
+      if (!root || !state.bound) return;
+      if (state.loading) { state.pendingRefreshOptions = { ...state.pendingRefreshOptions, ...options }; return; }
       if (options.resetPage) state.pageNumber = 0;
       const seq = ++state.refreshSeq;
-      state.loading = true;
-      state.error = '';
+      state.loading = true; state.error = '';
       renderRefreshState();
-      const canTryNewProtocol = state.newProtocolAvailable && Date.now() >= state.newProtocolUnavailableUntil;
-      if (!canTryNewProtocol) {
-        try {
-          await loadLegacy(seq);
-        } catch (legacyError) {
-          if (seq === state.refreshSeq) {
-            state.rows = [];
-            state.allRows = [];
-            state.total = 0;
-            state.filterData = filterDataFromRows([]);
-            state.source = '';
-            state.error = legacyError && legacyError.message || '日志接口不可用';
-          }
-        } finally {
-          if (seq === state.refreshSeq) {
-            finishRefresh();
-          }
-        }
-        return;
-      }
       try {
         await loadNewProtocol(seq);
-      } catch (newProtocolError) {
-        const status = Number(newProtocolError && newProtocolError.status);
-        const message = newProtocolError && newProtocolError.message || '';
-        if (status === 404 || status === 405 || status === 501 || /not found|unsupported|unavailable/i.test(message)) {
-          state.newProtocolUnavailableUntil = Date.now() + 60000;
-          state.newProtocolAvailable = false;
-        }
-        try {
-          await loadLegacy(seq, canTryNewProtocol ? message : '');
-        } catch (legacyError) {
-          if (seq === state.refreshSeq) {
-            state.rows = [];
-            state.allRows = [];
-            state.total = 0;
-            state.filterData = filterDataFromRows([]);
-            state.source = '';
-            state.error = legacyError && legacyError.message || message || '日志接口不可用';
-          }
+      } catch (error) {
+        if (seq !== state.refreshSeq || error.name === 'AbortError') return;
+        if ([404, 405, 501].includes(Number(error.status)) && state.mode === 'GENERAL') {
+          try { await loadLegacy(seq); state.notice = '当前服务使用旧日志接口，仅显示可读取的记录。'; }
+          catch (fallback) { state.error = fallback.message; }
+        } else {
+          state.error = Number(error.status) === 403 ? '无权查看此日志。' :
+            Number(error.status) === 503 ? '日志服务或数据库不可用，请稍后重试。' : error.message;
         }
       } finally {
-        if (seq === state.refreshSeq) {
-          finishRefresh();
+        if (seq === state.refreshSeq && state.bound) {
+          state.loading = false;
+          renderRefreshState();
+          const pending = state.pendingRefreshOptions; state.pendingRefreshOptions = null;
+          window.clearTimeout(state.refreshTimer);
+          state.refreshTimer = window.setTimeout(() => refresh(pending || {}), pending ? 0 : REFRESH_MS);
         }
       }
-    }
-
-  function finishRefresh() {
-      state.loading = false;
-      renderRefreshState();
-      const pending = state.pendingRefreshOptions;
-      state.pendingRefreshOptions = null;
-      if (pending) {
-        window.setTimeout(() => refresh(pending), 0);
-        return;
-      }
-      scheduleNextRefresh();
-    }
-
-    function scheduleNextRefresh() {
-      window.clearTimeout(state.refreshTimer);
-      state.refreshTimer = window.setTimeout(() => refresh(), REFRESH_MS);
     }
 
     function clearFilters() {
       state.search = '';
       state.eventSearch = '';
       state.severities = new Set(SEVERITIES.map((item) => item.id));
-      state.sources = new Set([defaultSourceForMode()]);
+      state.sources = new Set();
+      state.semantic = 'BUSINESS'; state.domain = ''; state.origin = 'ALL'; state.collector = '';
+      state.auditFilters = { actor: '', action: '', channel: '', result: '', risk: '', domain: '' };
       state.categories.clear();
       state.events.clear();
       state.deviceMacs.clear();
@@ -1346,21 +1363,24 @@
       refresh({ resetPage: true });
     }
 
-    function activeFilterCount() {
-      const severityChanged = state.severities.size !== SEVERITIES.length;
-      const sourceChanged = state.sources.size !== 1 || !state.sources.has(defaultSourceForMode());
-      return [
-        sourceChanged,
-        severityChanged,
-        state.search,
-        state.mode !== 'GENERAL',
-        state.categories.size,
-        state.events.size,
-        state.deviceMacs.size,
-        state.clientDeviceMacs.size,
-        state.adminIds.size,
-        state.programs.size
-      ].filter(Boolean).length;
+    function filterChips() {
+      const chips=[];
+      if(state.search) chips.push(['search',state.search]);
+      if(state.period!=='day') chips.push(['period',PERIODS[state.period]?.label || '自定义时间']);
+      if(state.mode==='AUDIT') Object.entries(state.auditFilters).forEach(([k,v])=>{if(v)chips.push(['audit:'+k,v]);});
+      else {
+        if(state.domain) chips.push(['domain',state.filterData?.domains?.find(x=>x.id===state.domain)?.label || state.domain]);
+        if(state.origin!=='ALL')chips.push(['origin',state.origin==='RAW'?'本机采集':'结构化来源']);
+        if(state.semantic!=='BUSINESS')chips.push(['semantic',state.semantic==='ALL'?'全部记录':'原始日志']);
+        if(state.collector)chips.push(['collector',state.collector]);
+        ['events','programs','clientDeviceMacs','categories'].forEach(k=>state[k].forEach(v=>chips.push([k+':'+v,v])));
+        if(state.severities.size!==SEVERITIES.length)chips.push(['severities','已选等级']);
+      }
+      return chips;
+    }
+    function activeFilterCount() { return filterChips().length; }
+    function filterSummaryMarkup() {
+      return `<div class="log-filter-summary">${filterChips().map(([k,v])=>`<button type="button" data-log-remove-filter="${html(k)}" aria-label="移除筛选 ${html(v)}">${html(v)} ×</button>`).join('')}</div>`;
     }
 
     function severityBarsMarkup(key) {
@@ -1369,7 +1389,7 @@
     }
 
     function modeTabsMarkup() {
-      return `<div class="dwrt-kit-tabs log-center-mode-tabs" data-dwrt-tabs aria-label="日志模式">
+      return `<div class="dwrt-kit-tabs log-center-mode-tabs dwrt-kit-page-tabs" data-dwrt-tabs aria-label="日志模式">
         <span class="dwrt-kit-tab-pill" aria-hidden="true"></span>
         <button type="button" class="dwrt-kit-tab ${state.mode === 'GENERAL' ? 'is-active' : ''}" aria-selected="${state.mode === 'GENERAL'}" data-log-mode="GENERAL">常规</button>
         <button type="button" class="dwrt-kit-tab ${state.mode === 'AUDIT' ? 'is-active' : ''}" aria-selected="${state.mode === 'AUDIT'}" data-log-mode="AUDIT">审计</button>
@@ -1401,7 +1421,7 @@
     function severityMarkup() {
       return `<section class="log-filter-group ${state.collapsed.has('severity') ? 'is-collapsed' : ''}" data-log-filter-group="severity">
         <button type="button" class="log-filter-trigger" data-log-collapse="severity" aria-expanded="${state.collapsed.has('severity') ? 'false' : 'true'}">
-          <span>风险</span>
+          <span>日志级别</span>
           <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M6.15 7.65a.5.5 0 0 1 .7 0L10 10.79l3.15-3.14a.5.5 0 0 1 .7.7l-3.5 3.5a.5.5 0 0 1-.7 0l-3.5-3.5a.5.5 0 0 1 0-.7Z"></path></svg>
         </button>
         <div class="log-filter-body">
@@ -1469,50 +1489,21 @@
     }
 
     function filtersMarkup() {
-      const filterData = state.filterData || filterDataFromRows(state.allRows);
-      const sourceCounts = countMap(state.allRows, (row) => row.sourceId || '');
-      const categories = normalizeFilterList(filterData, 'categories', GENERAL_CATEGORIES);
-      const eventsBase = normalizeFilterList(filterData, 'events', state.mode === 'AUDIT' ? Object.entries(AUDIT_EVENT_LABELS) : GENERAL_EVENTS);
-      const eventQuery = state.eventSearch.trim().toLowerCase();
-      const events = eventQuery
-        ? eventsBase.filter((item) => [item.label, item.id].join(' ').toLowerCase().includes(eventQuery))
-        : eventsBase;
-      const devices = asArray(filterData.deviceFilters || filterData.devices);
-      const clients = asArray(filterData.clientFilters || filterData.clients);
-      const admins = asArray(filterData.adminFilters || filterData.admins);
-      const programMap = new Map();
-      normalizeFilterList(filterData, 'programs', []).forEach((item) => programMap.set(item.id, item));
-      (filterDataFromRows(state.allRows).programs || []).forEach((item) => {
-        const current = programMap.get(item.id);
-        programMap.set(item.id, current && Number(current.count) > 0 ? current : item);
-      });
-      const programs = Array.from(programMap.values()).sort((left, right) => Number(right.count || 0) - Number(left.count || 0));
+      const data = state.filterData || {};
+      const select = (key, label, values, current, attr = 'data-log-query') => `<label class="dwrt-kit-field log-filter-select"><span>${html(label)}</span><select ${attr}="${html(key)}"><option value="">全部</option>${values.map(item => `<option value="${html(item.id || item.value)}" ${current === (item.id || item.value) ? 'selected' : ''}>${html(item.label || item.value || item.id)}${item.count !== undefined ? ` (${item.count})` : ''}</option>`).join('')}</select></label>`;
       if (state.mode === 'AUDIT') {
-        return `<div class="log-filter-scroll">
-          ${severityMarkup()}
-          ${periodMarkup()}
-          ${filterGroup('admins', '管理员', admins.map((item) => identityRow('adminIds', item, state.adminIds, 'id')).join('') || '<p class="log-filter-empty">暂无管理员筛选项</p>', { count: admins.length })}
-          ${filterGroup('events', '事件', `
-            <label class="log-filter-local-search">
-              <input type="search" value="${html(state.eventSearch)}" data-log-event-search placeholder="搜索事件">
-            </label>
-            ${events.map((item) => checkboxRow('events', item, state.events)).join('')}
-          `, { count: eventsBase.length })}
-        </div>`;
+        const facets = data.auditFacets || {};
+        return `<div class="log-filter-scroll">${periodMarkup()}${['actor','channel','action','result','risk','domain'].map((key,i) => select(key,['操作者','渠道','动作','执行结果','操作风险','业务类型'][i],asArray(facets[key]).map(x => ({...x,label: key === 'result' ? auditResultLabel(x.value) : key === 'risk' ? auditRiskLabel(x.value) : x.label || x.value})),state.auditFilters[key],'data-log-audit-filter')).join('')}</div>`;
       }
-      return `<div class="log-filter-scroll">
-        ${severityMarkup()}
-        ${periodMarkup()}
-        ${filterGroup('sources', '日志来源', modeSourceFilters().map((item) => sourceRow(item, sourceCounts)).join(''), { count: modeSourceFilters().length })}
-        ${programs.length ? filterGroup('programs', '程序 / 插件', programs.map((item) => checkboxRow('programs', item, state.programs)).join(''), { count: programs.length }) : ''}
-        ${filterGroup('categories', '日志分类', categories.map((item) => checkboxRow('categories', item, state.categories)).join(''), { count: categories.length })}
-        ${filterGroup('events', '事件', `
-          <label class="log-filter-local-search">
-            <input type="search" value="${html(state.eventSearch)}" data-log-event-search placeholder="搜索事件">
-          </label>
-          ${events.map((item) => checkboxRow('events', item, state.events)).join('')}
-        `, { count: eventsBase.length })}
-        ${filterGroup('clients', '客户端', clients.map((item) => identityRow('clientDeviceMacs', item, state.clientDeviceMacs, 'mac')).join('') || '<p class="log-filter-empty">暂无客户端筛选项</p>', { count: clients.length })}
+      return `<div class="log-filter-scroll">${periodMarkup()}${severityMarkup()}
+        <label class="dwrt-kit-field log-filter-select"><span>记录范围</span><select data-log-query="semantic" ${state.capabilities.semantic_filter ? '' : 'disabled'}>${[['BUSINESS','业务事件'],['UNCLASSIFIED','未解释的原始日志'],['ALL','全部记录']].map(([id,label])=>`<option value="${id}" ${state.semantic===id?'selected':''}>${label}</option>`).join('')}</select></label>
+        ${select('domain','业务类型',asArray(data.domains),state.domain)}
+        ${select('origin','采集来源',[{id:'RAW',label:'本机系统 / 内核采集'},{id:'STRUCTURED',label:'应用与结构化采集'}],state.origin)}
+        ${select('collector','采集器',asArray(data.collectors),state.collector)}
+        ${filterGroup('programs','程序 / 插件',asArray(data.programs).map(x=>checkboxRow('programs',x,state.programs)).join('') || '<p class="log-filter-empty">当前范围无程序记录</p>')}
+        ${filterGroup('events','事件',asArray(data.events).map(x=>checkboxRow('events',x,state.events)).join('') || '<p class="log-filter-empty">当前范围无事件记录</p>')}
+        ${filterGroup('clients','对象 / 客户端',asArray(data.clientFilters).map(x=>identityRow('clientDeviceMacs',x,state.clientDeviceMacs,'mac')).join('') || '<p class="log-filter-empty">当前范围无对象记录</p>')}
+        <details class="log-integration"><summary>领域接入情况</summary>${asArray(data.domain_catalog).map(x=>`<p>${html(x.label)}：${html(x.device_support === 'unsupported' ? '设备不支持' : x.integration_status === 'not_integrated' ? '生产者尚未接入' : '已声明生产者；设备支持情况未确认')}</p>`).join('')}</details>
       </div>`;
     }
 
@@ -1623,8 +1614,8 @@
       const truncatable = message.length > MESSAGE_CLAMP_CHARS;
       return `<tr class="${selected ? 'is-selected' : ''} ${checked ? 'is-ai-selected' : ''}" data-log-row="${html(row.id)}">
         <td class="log-table-select-cell"><label class="log-table-select" title="选择此日志"><input type="checkbox" data-log-row-select="${html(row.id)}" ${checked ? 'checked' : ''}><span aria-hidden="true"></span></label></td>
-        <td><span class="log-table-category">${html(row.sourceLabel || row.categoryLabel)}</span></td>
-        <td><strong>${html(row.eventLabel)}</strong></td>
+        <td><span class="log-table-category">${html(row.categoryLabel)}</span></td>
+        <td><button type="button" class="log-detail-trigger" data-log-detail="${html(row.id)}">${html(row.eventLabel)}</button></td>
         <td class="log-table-desc-cell">
           <span class="log-table-desc ${expanded ? 'is-expanded' : ''}" title="${html(message)}">${html(expanded || !truncatable ? message : `${message.slice(0, MESSAGE_CLAMP_CHARS).trimEnd()}…`)}</span>
           ${truncatable ? `<button type="button" class="log-table-desc-toggle" data-log-desc-toggle="${html(row.id)}" aria-expanded="${expanded}" title="${expanded ? '收起完整描述' : '展开完整描述'}">${expanded ? '收起' : '…'}</button>` : ''}
@@ -1642,13 +1633,13 @@
       const truncatable = message.length > MESSAGE_CLAMP_CHARS;
       return `<tr class="log-audit-row ${selected ? 'is-selected' : ''} ${checked ? 'is-ai-selected' : ''}" data-log-row="${html(row.id)}">
         <td class="log-table-select-cell"><label class="log-table-select" title="选择此日志"><input type="checkbox" data-log-row-select="${html(row.id)}" ${checked ? 'checked' : ''}><span aria-hidden="true"></span></label></td>
-        <td data-log-label="类别"><span class="log-audit-category">审计</span></td>
-        <td data-log-label="事件"><strong class="log-audit-event">${html(row.eventLabel)}</strong></td>
+        <td data-log-label="操作者"><span class="log-audit-category">${html(row.admin.name || row.admin.id || "未记录身份")}</span><small>${html(row.audit.channelLabel)}</small></td>
+        <td data-log-label="事件"><button type="button" class="log-detail-trigger log-audit-event" data-log-detail="${html(row.id)}">${html(row.eventLabel)}</button></td>
         <td class="log-table-desc-cell log-audit-detail-cell" data-log-label="详情">
           <span class="log-table-desc ${expanded ? 'is-expanded' : ''}" title="${html(message)}">${html(expanded || !truncatable ? message : `${message.slice(0, MESSAGE_CLAMP_CHARS).trimEnd()}…`)}</span>
           ${truncatable ? `<button type="button" class="log-table-desc-toggle" data-log-desc-toggle="${html(row.id)}" aria-expanded="${expanded}" title="${expanded ? '收起完整详情' : '展开完整详情'}">${expanded ? '收起' : '…'}</button>` : ''}
         </td>
-        <td data-log-label="严重性"><span class="log-table-severity">${severityBarsMarkup(row.severity)}<em>${html(row.severityLabel)}</em></span></td>
+        <td data-log-label="结果 / 风险"><strong>${html(row.audit.resultLabel || "未知结果")}</strong><small>风险：${html(row.audit.riskLabel || "未知")}</small></td>
         <td class="num" data-log-label="日期 / 时间">${html(formatTime(row.timestamp))}</td>
       </tr>`;
     }
@@ -1659,7 +1650,7 @@
       const end = Math.min(state.total, (state.pageNumber + 1) * state.pageSize);
       const visibleIds = state.rows.map((row) => row.id);
       const allVisibleSelected = visibleIds.length > 0 && visibleIds.every((id) => state.selectedRows.has(id));
-      const body = state.loading
+      const body = state.loading && !state.rows.length
         ? `<tr><td colspan="6"><div class="log-table-empty">正在读取日志</div></td></tr>`
         : state.rows.length
           ? state.rows.map(rowMarkup).join('')
@@ -1672,8 +1663,12 @@
             <span>${html(state.loading ? '正在读取' : (auditMode ? '管理员与系统管理操作' : '日志列表'))}</span>
           </div>
           <div class="log-center-toolbar-actions">
-            ${state.notice ? `<span class="log-center-notice">${html(state.notice)}</span>` : ''}
+            <span class="log-center-notice" ${state.error || state.notice ? '' : 'hidden'}>${html(state.error || state.notice)}</span>
+            ${filterSummaryMarkup()}
             ${searchMarkup()}
+            <button type="button" class="dwrt-kit-button" data-dwrt-component="button" data-log-open-filter>筛选</button>
+            <button type="button" class="dwrt-kit-button" data-dwrt-component="button" data-log-export-current>导出</button>
+            <button type="button" class="dwrt-kit-button" data-dwrt-component="button" data-log-action="settings">设置</button>
             <button type="button" class="log-ai-button" data-log-ask-ai ${state.selectedRows.size && !state.aiLoading ? '' : 'disabled'} aria-label="让 AI 分析选中的日志">
               <svg viewBox="0 0 20 20" fill="currentColor" aria-hidden="true"><path d="M10 2.5c.27 0 .49.2.55.46a4.3 4.3 0 0 0 3.2 3.2c.26.06.45.29.45.55s-.19.49-.45.55a4.3 4.3 0 0 0-3.2 3.2.56.56 0 0 1-1.1 0 4.3 4.3 0 0 0-3.2-3.2.56.56 0 0 1 0-1.1 4.3 4.3 0 0 0 3.2-3.2c.06-.26.28-.46.55-.46Zm5.2 8.8c.22 0 .4.16.45.37a2.64 2.64 0 0 0 1.98 1.98.46.46 0 0 1 0 .9 2.64 2.64 0 0 0-1.98 1.98.46.46 0 0 1-.9 0 2.64 2.64 0 0 0-1.98-1.98.46.46 0 0 1 0-.9 2.64 2.64 0 0 0 1.98-1.98.46.46 0 0 1 .45-.37Z"></path></svg>
               ${html(state.aiLoading ? '分析中' : `问 AI${state.selectedRows.size ? ` (${state.selectedRows.size})` : ''}`)}
@@ -1684,7 +1679,7 @@
         ${state.aiResult ? `<section class="log-ai-result" aria-live="polite"><strong>AI 分析</strong><p>${html(state.aiResult)}</p><button type="button" data-log-ai-dismiss aria-label="关闭 AI 分析">关闭</button></section>` : ''}
         <div class="dwrt-kit-table-scroll log-center-table-scroll">
           <table class="dwrt-kit-table log-center-table" aria-label="${auditMode ? '操作审计列表' : '日志列表'}">
-            <thead><tr><th class="log-table-select-head"><label class="log-table-select" title="选择本页日志"><input type="checkbox" data-log-select-page ${allVisibleSelected ? 'checked' : ''}><span aria-hidden="true"></span></label></th><th>${auditMode ? '类别' : '日志来源'}</th><th>事件</th><th>${auditMode ? '详情' : '描述'}</th><th>${auditMode ? '严重性' : '级别'}</th><th class="num">日期 / 时间</th></tr></thead>
+            <thead><tr><th class="log-table-select-head"><label class="log-table-select" title="选择本页日志"><input type="checkbox" data-log-select-page ${allVisibleSelected ? 'checked' : ''}><span aria-hidden="true"></span></label></th><th>${auditMode ? '操作者 / 渠道' : '业务类型'}</th><th>事件</th><th>${auditMode ? '详情' : '描述'}</th><th>${auditMode ? '结果 / 风险' : '级别'}</th><th class="num">日期 / 时间</th></tr></thead>
             <tbody>${body}</tbody>
           </table>
         </div>
@@ -1744,6 +1739,7 @@
           return detailRow(path, value);
         }).join('');
       }
+      if (audit.beforeHash || audit.afterHash) return `${detailRow('信息范围', '仅记录前后哈希，未提供字段差异')}${detailRow('修改前哈希', audit.beforeHash)}${detailRow('修改后哈希', audit.afterHash)}`;
       return `${detailRow('修改前', audit.beforeValue)}${detailRow('修改后', audit.afterValue)}`;
     }
 
@@ -1761,7 +1757,7 @@
             <h3>操作详情</h3>
             <dl>
               ${detailRow('事件', row.eventLabel)}
-              ${detailRow('严重性', row.severityLabel)}
+              ${detailRow('操作风险', audit.riskLabel || '未知')}
               ${detailRow('管理员名称', row.admin.name || row.admin.id || '未提供')}
               ${detailRow('访问方式', audit.channelLabel || '未提供')}
               ${detailRow('源 IP 地址', audit.clientIp || row.client.ip || '未提供')}
@@ -1781,6 +1777,9 @@
               ${detailRow('对象类型', audit.objectType)}
               ${detailRow('对象标识', audit.objectId)}
               ${detailRow('作用域', audit.scope)}
+              ${detailRow('请求 ID', audit.requestId)}
+              ${detailRow('任务 ID', audit.taskId)}
+              ${detailRow('账本记录 ID', row.raw.audit_record_id || row.raw.id)}
             </dl>
           </section>
           ${auditChangesMarkup(row) ? `<section class="log-detail-section"><h3>字段变更</h3><dl>${auditChangesMarkup(row)}</dl></section>` : ''}
@@ -1814,10 +1813,25 @@
               ${detailRow('事件', row.eventLabel)}
               ${detailRow('级别', row.severityLabel)}
               ${detailRow('日志来源', row.sourceLabel)}
-              ${detailRow('原始分类', row.categoryLabel)}
+              ${detailRow('业务类型', row.categoryLabel)}
+              ${detailRow('执行结果', auditResultLabel(row.raw.result))}
+              ${detailRow('首次 / 末次', `${formatTime(row.raw.first_seen)} / ${formatTime(row.raw.last_seen)}`)}
+              ${detailRow('重复次数', row.raw.count)}
+              ${detailRow('任务', row.audit.taskId || row.raw.message_args?.task_id)}
+              ${detailRow('呈现状态', row.raw.presentation?.render_status)}
               ${detailRow('状态', row.status)}
               ${detailRow('目标', row.target)}
               ${detailRow('原始来源', row.source)}
+              ${detailRow('来源程序', row.programLabel || row.programId)}
+              ${detailRow('协议', row.raw.message_args?.protocol || row.raw.message_args?.service || row.raw.protocol)}
+              ${detailRow('操作者', row.raw.message_args?.actor || row.raw.username)}
+              ${detailRow('来源 IP', row.raw.source_ip)}
+              ${detailRow('失败阶段', row.raw.message_args?.failure_stage)}
+              ${detailRow('失败原因', row.raw.message_args?.failure_reason)}
+              ${detailRow('触发方式', row.raw.message_args?.trigger)}
+              ${detailRow('文件大小（字节）', row.raw.message_args?.size_bytes || row.raw.message_args?.bytes)}
+              ${detailRow('校验摘要', row.raw.message_args?.checksum)}
+              ${detailRow('系统启动时间', row.raw.message_args?.boot_time ? formatTime(row.raw.message_args.boot_time) : '')}
             </dl>
           </section>
           <section class="log-detail-section">
@@ -1835,13 +1849,13 @@
             <h3>描述</h3>
             <p>${html(row.message || '当前日志没有结构化描述。')}</p>
           </section>
-          <section class="log-detail-section log-detail-raw">
+          <details class="log-detail-section log-detail-raw">
+            <summary>原始日志证据</summary>
             <div class="log-detail-title-row">
-              <h3>CEF / 原始日志</h3>
               <button type="button" data-log-copy="${html(row.id)}">复制</button>
             </div>
             <pre>${html(raw)}</pre>
-          </section>
+          </details>
         </div>`;
       // 与 AI 抽屉同一套 kit 组件（copilot 变体），不再手搓玻璃层。
       return `<button class="dwrt-kit-sheet-overlay is-open" type="button" data-log-close-drawer aria-label="关闭日志详情"></button><aside class="log-center-drawer dwrt-kit-sheet dwrt-kit-glass-surface is-open" data-dwrt-component="sheet" data-dwrt-sheet-variant="copilot" aria-label="日志详情">
@@ -1892,28 +1906,38 @@
       restoreScroll('.log-filter-scroll', snapshot.filterTop, snapshot.filterLeft);
     }
 
+    function railMarkup() {
+      return `<nav class="dwrt-rail log-center-rail" aria-label="日志视图"><div class="dwrt-rail-list">${[['GENERAL','常规日志'],['AUDIT','审计日志']].map(([id,label])=>`<button type="button" class="dwrt-rail-item ${state.mode===id?'is-active':''}" data-log-mode="${id}" title="${label}" aria-label="${label}" aria-current="${state.mode===id?'page':'false'}"><span class="dwrt-rail-item-icon"><img src="/static/desktop/assets/log-center.png" alt=""></span><span class="dwrt-rail-item-text"><span class="dwrt-rail-item-title">${label}</span></span></button>`).join('')}</div></nav>`;
+    }
+
+    function filterSheetMarkup() {
+      if (!state.filterOpen) return '';
+      return `<button type="button" class="dwrt-kit-sheet-overlay is-open" data-log-close-filter aria-label="关闭筛选"></button><aside class="dwrt-kit-sheet dwrt-kit-glass-surface is-open log-filter-sheet" data-dwrt-component="sheet" aria-label="日志筛选"><header class="dwrt-kit-sheet-header"><strong>筛选日志</strong><button type="button" class="dwrt-kit-sheet-close" data-log-close-filter aria-label="关闭筛选">×</button></header><div class="dwrt-kit-sheet-body log-center-filter">${filtersMarkup()}${filterFooterMarkup()}</div></aside>`;
+    }
+
+    function syncFilterSheet() {
+      const host = root.querySelector('[data-log-filter-host]');
+      if (!host) return;
+      window.DWRT_UI_KIT?.unmount?.(host);
+      host.innerHTML = filterSheetMarkup();
+      filterSheetNode = host.querySelector('.log-filter-sheet');
+      mountUiKit(host);
+    }
+
     function render() {
       if (!root) return;
       const interaction = captureInteractionState();
+      window.DWRT_UI_KIT?.unmount?.(root);
       root.classList.add('route-workspace', 'route-log-center-host');
-      root.classList.remove('route-line-status', 'route-data-page', 'route-client-details-host', 'route-insights-host', 'route-insights-home');
       root.hidden = false;
-      root.innerHTML = `<section class="log-center-shell ${state.selectedRow ? 'is-drawer-open' : ''}" data-log-center-shell>
-        <aside class="log-center-filter dwrt-glass-card insights-stable-glass" aria-label="日志筛选">
-          <div class="log-filter-head">
-            ${modeTabsMarkup()}
-          </div>
-          ${filtersMarkup()}
-          ${filterFooterMarkup()}
-        </aside>
-        <main class="log-center-main">
-          ${state.view === 'settings' ? settingsMarkup() : tableMarkup()}
-        </main>
+      root.innerHTML = `<section class="log-center-shell ${desktop?'is-desktop':'is-console dwrt-kit-page-surface'}" data-log-center-shell>
+        ${desktop ? railMarkup() : modeTabsMarkup()}
+        <main class="log-center-main">${state.view === 'settings' ? settingsMarkup() : tableMarkup()}</main>
+        <div data-log-filter-host>${filterSheetMarkup()}</div>
         <div class="log-center-drawer-host" data-log-drawer-host>${state.view === 'settings' ? '' : drawerMarkup()}</div>
       </section>`;
-      mountUiKit(root);
-      scheduleGlassCardsRender(160);
-      restoreInteractionState(interaction);
+      filterSheetNode = root.querySelector('.log-filter-sheet');
+      mountUiKit(root); scheduleGlassCardsRender(160); restoreInteractionState(interaction);
     }
 
     // 抽屉独立挂载：开关抽屉不再改变表格所在的 grid 结构。
@@ -1930,25 +1954,9 @@
       const nextId = shouldOpen ? String(state.selectedRow.id) : '';
       if (openId === nextId) return;
       host.setAttribute('data-log-drawer-id', nextId);
+      window.DWRT_UI_KIT?.unmount?.(host);
       host.innerHTML = shouldOpen ? drawerMarkup() : '';
       if (shouldOpen) {
-        // Sheets move into the Kit portal. Clear the page selection during the
-        // original close click, before the Kit starts its animated replay path.
-        const closeBridge = (event) => {
-          const target = event.target.closest('[data-log-close-drawer]');
-          if (!target || target.dataset.dwrtSheetBypass === 'true') return;
-          const sheet = target.closest('.log-center-drawer')
-            || (target.classList.contains('dwrt-kit-sheet-overlay') ? target.nextElementSibling : null);
-          const overlay = sheet && sheet.previousElementSibling;
-          closeDrawer();
-          window.setTimeout(() => {
-            window.DWRT_UI_KIT?.unmount?.(sheet);
-            overlay?.remove();
-            sheet?.remove();
-          }, 520);
-        };
-        host.querySelector('.log-center-drawer')?.addEventListener('click', closeBridge, true);
-        host.querySelector('.dwrt-kit-sheet-overlay')?.addEventListener('click', closeBridge, true);
         mountUiKit(host);
         scheduleGlassCardsRender(120);
       }
@@ -1983,41 +1991,40 @@
 
     // 局部重绘：表格区域。筛选栏与抽屉保持原节点，不参与重排。
     function renderTableRegion() {
-      const main = root && root.querySelector('.log-center-main');
-      if (!main) {
-        render();
-        return;
-      }
-      const scroll = main.querySelector('.log-center-table-scroll');
-      const scrollTop = scroll ? scroll.scrollTop : 0;
-      const scrollLeft = scroll ? scroll.scrollLeft : 0;
-      main.innerHTML = state.view === 'settings' ? settingsMarkup() : tableMarkup();
-      const nextScroll = main.querySelector('.log-center-table-scroll');
-      if (nextScroll) {
-        nextScroll.scrollTop = scrollTop;
-        nextScroll.scrollLeft = scrollLeft;
-      }
-      mountUiKit(main);
+      const main = root?.querySelector('.log-center-main');
+      if (!state.bound) return;
+      if (!main) { render(); return; }
+      if (state.view === 'settings') return;
+      const card = main.querySelector('.log-center-table-card');
+      if (!card) { main.innerHTML = tableMarkup(); mountUiKit(main); return; }
+      const template = document.createElement('template'); template.innerHTML = tableMarkup();
+      const next = template.content;
+      const scroll = card.querySelector('.log-center-table-scroll');
+      const top = scroll.scrollTop, left = scroll.scrollLeft;
+      card.querySelector('tbody').innerHTML = next.querySelector('tbody').innerHTML;
+      card.querySelector('.log-center-pagination').replaceWith(next.querySelector('.log-center-pagination'));
+      card.querySelector('.dwrt-kit-table-count').textContent = state.error ? '读取失败' : `${formatInteger(state.total)} 条`;
+      const notice = card.querySelector('.log-center-notice');
+      notice.textContent = state.error || state.notice; notice.hidden = !notice.textContent;
+      card.setAttribute('aria-busy', String(state.loading));
+      scroll.scrollTop = top; scroll.scrollLeft = left;
+      card.querySelector('.log-ai-result')?.remove();
+      const ai = next.querySelector('.log-ai-result');
+      if (ai) card.querySelector('.log-center-table-scroll').before(ai);
+      card.classList.toggle('has-ai-result', Boolean(ai));
+      syncToolbar();
     }
 
-    // 局部重绘：筛选栏。表格与抽屉保持原节点。
     function renderFilterRegion() {
-      const aside = root && root.querySelector('.log-center-filter');
-      if (!aside) {
-        render();
-        return;
-      }
-      const interaction = captureInteractionState();
-      const scroll = aside.querySelector('.log-filter-scroll');
-      const scrollTop = scroll ? scroll.scrollTop : 0;
-      aside.innerHTML = `<div class="log-filter-head">${modeTabsMarkup()}</div>${filtersMarkup()}${filterFooterMarkup()}`;
-      const nextScroll = aside.querySelector('.log-filter-scroll');
-      if (nextScroll) nextScroll.scrollTop = scrollTop;
-      mountUiKit(aside);
-      restoreInteractionState(interaction);
+      if (!state.filterOpen || !filterSheetNode?.isConnected) return;
+      const body = filterSheetNode.querySelector('.log-center-filter');
+      if (!body) return;
+      const paint = (target) => { target.innerHTML = filtersMarkup() + filterFooterMarkup(); };
+      if (window.DWRT_UI_KIT?.preserveInteractionState) {
+        window.DWRT_UI_KIT.preserveInteractionState(body, paint, { skipWhileInteracting: true });
+      } else if (!body.contains(document.activeElement)) paint(body);
     }
 
-    // 最轻量更新：只刷工具栏（选中计数、提示、AI 按钮可用性）。
     function syncToolbar() {
       const toolbar = root && root.querySelector('.log-center-toolbar');
       if (!toolbar) {
@@ -2102,9 +2109,15 @@
     }
 
     async function askAiAboutSelection() {
+      const mode=state.mode;
       if (!state.selectedRows.size || state.aiLoading) return;
       const rows = state.allRows.filter((row) => state.selectedRows.has(row.id));
       if (!rows.length) return;
+      if (!state.settings) {
+        try { state.settings = await requestJson('logs.settings', ENDPOINTS.settings); }
+        catch (error) { if (state.bound && error.name !== 'AbortError') { state.notice = error.message; syncToolbar(); } return; }
+        if (!state.bound || state.mode !== mode) return;
+      }
       const capabilities = state.settings && state.settings.capabilities || {};
       if (capabilities.ai_analysis !== true && capabilities.log_ai_analysis !== true) {
         state.notice = '后端尚未提供日志 AI 分析能力。';
@@ -2133,8 +2146,10 @@
           locale: 'zh-CN',
           task: 'diagnose_logs'
         });
+        if(!state.bound || mode!==state.mode)return;
         state.aiResult = aiResponseText(payload) || 'AI 已完成分析，但没有返回可显示的摘要。';
       } catch (error) {
+        if(!state.bound || mode!==state.mode || error.name==='AbortError')return;
         const unavailable = [404, 405, 501].includes(Number(error && error.status));
         state.notice = unavailable ? '后端尚未提供日志 AI 分析接口。' : (error && error.message || '日志 AI 分析失败');
       } finally {
@@ -2144,6 +2159,20 @@
     }
 
     function onClick(event) {
+      const remove=event.target.closest('[data-log-remove-filter]');
+      if(remove) {
+        const key=remove.dataset.logRemoveFilter, [group,...tail]=key.split(':'), value=tail.join(':');
+        if(group==='audit')state.auditFilters[value]='';
+        else if(state[group] instanceof Set) { if(group==='severities')state.severities=new Set(SEVERITIES.map(x=>x.id)); else state[group].delete(value); }
+        else state[group]=group==='period'?'day':group==='semantic'?'BUSINESS':group==='origin'?'ALL':'';
+        refresh({resetPage:true}); return;
+      }
+
+      if (event.target.closest('[data-log-open-filter]')) { state.filterOpen = true; syncFilterSheet(); return; }
+      if (event.target.closest('[data-log-close-filter]')) { state.filterOpen = false; syncFilterSheet(); return; }
+      if (event.target.closest('[data-log-detail]')) { selectRow(event.target.closest('[data-log-detail]').dataset.logDetail); return; }
+      if (event.target.closest('[data-log-export-current]')) { exportCurrent(); return; }
+
       if (event.target.closest('[data-log-row-select], [data-log-select-page]')) return;
       const descToggle = event.target.closest('[data-log-desc-toggle]');
       if (descToggle) {
@@ -2168,21 +2197,22 @@
       const modeButton = event.target.closest('[data-log-mode]');
       if (modeButton) {
         const nextMode = modeButton.dataset.logMode === 'AUDIT' ? 'AUDIT' : 'GENERAL';
-        if (nextMode === state.mode) return;
+        if (nextMode === state.mode && state.view === 'logs') return;
+        const keys = ['sources','semantic','domain','origin','collector','auditFilters','search','period','customRange','severities','categories','events','deviceMacs','clientDeviceMacs','adminIds','programs','pageNumber','rows','allRows','total','filterData'];
+        modeStates[state.mode] = Object.fromEntries(keys.map(k=>[k,state[k]]));
+        requests.forEach(c=>c.abort()); state.refreshSeq++; state.loading=false;
+        window.clearTimeout(state.searchTimer); window.clearTimeout(state.refreshTimer); state.pendingRefreshOptions=null;
+        state.aiLoading=false; state.aiResult=null; state.error=''; state.notice='';
         state.mode = nextMode;
-        state.sources = new Set([defaultSourceForMode(nextMode)]);
-        state.view = 'logs';
-        state.pageNumber = 0;
-        state.selectedId = '';
-        state.selectedRow = null;
-        state.events.clear();
-        state.categories.clear();
-        state.deviceMacs.clear();
-        state.clientDeviceMacs.clear();
-        state.adminIds.clear();
-        state.programs.clear();
-        state.selectedRows.clear();
-        refresh({ resetPage: true });
+        const saved = modeStates[nextMode];
+        if (saved) Object.assign(state,saved);
+        else { state.search=''; state.period='day'; state.customRange=null; state.pageNumber=0; state.rows=[]; state.allRows=[]; state.total=0; state.filterData=null;
+          state.semantic='BUSINESS'; state.domain=''; state.origin='ALL'; state.collector='';
+          state.auditFilters={actor:'',action:'',channel:'',result:'',risk:'',domain:''};
+          state.severities=new Set(SEVERITIES.map(x=>x.id));
+          ['sources','categories','events','deviceMacs','clientDeviceMacs','adminIds','programs'].forEach(k=>state[k]=new Set()); }
+        state.view='logs'; state.selectedId=''; state.selectedRow=null; state.selectedRows.clear(); state.filterOpen=false;
+        render(); refresh();
         return;
       }
       const periodButton = event.target.closest('[data-log-period]');
@@ -2250,10 +2280,11 @@
         const action = actionButton.dataset.logAction;
         if (action === 'settings' || action === 'siem') {
           state.view = 'settings';
+          state.filterOpen = false;
+          if (!state.settings) requestJson('logs.settings', ENDPOINTS.settings).then(x => { if(!state.bound)return; state.settings=x; if(state.view==='settings') render(); }).catch(e=>{if(!state.bound || e.name==='AbortError')return; state.error=e.message;render();});
           state.selectedId = '';
           state.selectedRow = null;
-          renderTableRegion();
-          syncDrawer();
+          render();
           return;
         }
         if (action === 'notifications') {
@@ -2267,6 +2298,7 @@
       if (event.target.matches('[data-log-search]')) {
         state.search = event.target.value || '';
         window.clearTimeout(state.searchTimer);
+        if (composingSearch || event.isComposing) return;
         state.searchTimer = window.setTimeout(() => refresh({ resetPage: true }), SEARCH_DEBOUNCE_MS);
       }
       if (event.target.matches('[data-log-event-search]')) {
@@ -2276,6 +2308,12 @@
     }
 
     function onChange(event) {
+      if (event.target.matches('[data-log-query], [data-log-audit-filter]')) {
+        if (event.target.dataset.logAuditFilter) state.auditFilters[event.target.dataset.logAuditFilter] = event.target.value;
+        else state[event.target.dataset.logQuery] = event.target.value || (event.target.dataset.logQuery === 'origin' ? 'ALL' : '');
+        refresh({ resetPage:true }); return;
+      }
+
       const rowSelect = event.target.closest('[data-log-row-select]');
       if (rowSelect) {
         const id = rowSelect.dataset.logRowSelect;
@@ -2341,12 +2379,26 @@
       }
     }
 
+    function onCompositionStart(event) {
+      if (!event.target.matches('[data-log-search]')) return;
+      composingSearch = true;
+      window.clearTimeout(state.searchTimer);
+    }
+
+    function onCompositionEnd(event) {
+      if (!event.target.matches('[data-log-search]')) return;
+      composingSearch = false;
+      onInput(event);
+    }
+
     function bind() {
       if (!root || state.bound) return;
       root.addEventListener('click', onClick);
       root.addEventListener('input', onInput);
       root.addEventListener('change', onChange);
       root.addEventListener('submit', onSubmit);
+      root.addEventListener('compositionstart', onCompositionStart);
+      root.addEventListener('compositionend', onCompositionEnd);
       state.bound = true;
     }
 
@@ -2356,6 +2408,8 @@
       root.removeEventListener('input', onInput);
       root.removeEventListener('change', onChange);
       root.removeEventListener('submit', onSubmit);
+      root.removeEventListener('compositionstart', onCompositionStart);
+      root.removeEventListener('compositionend', onCompositionEnd);
       state.bound = false;
     }
 
@@ -2366,12 +2420,21 @@
       const alreadyMounted = state.bound && Boolean(root.querySelector('[data-log-center-shell]'));
       applyInitialRoute(params);
       bind();
+      resizeObserver?.disconnect();
+      resizeObserver = new ResizeObserver(entries => root.classList.toggle('log-compact', entries[0].contentRect.width <= 720));
+      resizeObserver.observe(root);
       if (!alreadyMounted) render();
       refresh({ resetPage: true });
       return { unmount };
     }
 
     function unmount() {
+      window.DWRT_UI_KIT?.unmount?.(root);
+      filterSheetNode = null;
+      composingSearch = false;
+      resizeObserver?.disconnect();
+      requests.forEach(c=>c.abort());
+      requests.clear();
       window.clearTimeout(state.refreshTimer);
       window.clearTimeout(state.searchTimer);
       state.refreshTimer = 0;

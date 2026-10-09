@@ -43,7 +43,11 @@ static void toolkit_usage(FILE *out)
         "Usage: dreamingwrt-toolkit <command>\n"
         "Commands: status router-check port-mirror-list port-mirror-set "
         "port-mirror-delete ddns-list ddns-set ddns-delete ddns-update "
-        "wake-on-lan throughput-start throughput-status throughput-stop\n"
+        "wake-on-lan throughput-start throughput-status throughput-stop "
+        "port-scan port-check tcp-udp-test ssl-check local-ports local-info "
+        "arp-scan mtu-detect latency-monitor whois dns-query http-request "
+        "headers website-check public-ip ip-geo mac-lookup mdns "
+        "speedtest-start speedtest-status speedtest-stop\n"
         "Request JSON is read from stdin; exactly one JSON response is written to stdout.\n");
 }
 
@@ -82,6 +86,7 @@ int main(int argc, char **argv)
     else if (!strcmp(command, "throughput-start")) resp = toolkit_throughput_start(body);
     else if (!strcmp(command, "throughput-status")) resp = toolkit_throughput_status(body);
     else if (!strcmp(command, "throughput-stop")) resp = toolkit_throughput_stop(body);
+    else if ((resp = toolkit_net_dispatch(command, body)) != NULL) { /* handled by toolkit_net.c */ }
     else resp = toolkit_error("unknown_command", "unsupported toolkit command");
 
 done:

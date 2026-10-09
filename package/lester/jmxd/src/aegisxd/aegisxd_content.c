@@ -1314,8 +1314,8 @@ static int content_apply_requested(struct json_object *body, struct json_object 
 static int content_resource_count(void)
 {
     sqlite3_stmt *st = aegisxd_config_prepare(
-        "SELECT (SELECT COUNT(*) FROM aegis_content_policies)+"
-        "(SELECT COUNT(*) FROM aegis_domain_overrides)+"
+        "SELECT (SELECT COUNT(*) FROM aegis_content_policies WHERE enforcement<>'dns_exact')+"
+        "(SELECT COUNT(*) FROM aegis_domain_overrides WHERE match_kind='suffix')+"
         "(SELECT COUNT(*) FROM aegis_pcdn_settings WHERE enabled=1)");
     int count = -1;
 
@@ -1381,9 +1381,9 @@ static int content_apply_state_set(const char *state, const char *error)
         "UPDATE aegis_content_meta SET last_apply_state=?1,last_error=?2,updated_at=?3 WHERE id=1",
         "UPDATE aegis_content_policies SET apply_state=CASE "
             "WHEN enabled=0 OR mode='off' THEN 'disabled' ELSE ?1 END,"
-            "last_error=?2,updated_at=?3",
+            "last_error=?2,updated_at=?3 WHERE enforcement<>'dns_exact'",
         "UPDATE aegis_domain_overrides SET apply_state=CASE "
-            "WHEN enabled=0 THEN 'disabled' ELSE ?1 END,last_error=?2,updated_at=?3",
+            "WHEN enabled=0 THEN 'disabled' ELSE ?1 END,last_error=?2,updated_at=?3 WHERE match_kind='suffix'",
     };
 
     for (size_t i = 0; i < ARRAY_SIZE(updates); i++) {
@@ -1399,6 +1399,11 @@ static int content_apply_state_set(const char *state, const char *error)
     return 0;
 }
 
+static int content_is_exact(const char *table,const char *id) {
+    char sql[256];snprintf(sql,sizeof(sql),"SELECT 1 FROM %s WHERE id=?1 AND %s",table,!strcmp(table,"aegis_content_policies")?"enforcement='dns_exact'":"match_kind='exact'");
+    sqlite3_stmt *st=aegisxd_config_prepare(sql);int yes=0;if(st){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);yes=sqlite3_step(st)==SQLITE_ROW;sqlite3_finalize(st);}return yes;
+}
+
 struct json_object *aegisxd_content_policy_set_json(struct json_object *body)
 {
     struct json_object *validation = aegisxd_content_policy_validate_json(body), *policy = NULL, *apply = NULL;
@@ -1409,6 +1414,7 @@ struct json_object *aegisxd_content_policy_set_json(struct json_object *body)
     if (!aegisxd_json_bool(validation, "ok", 0) || !confirm) return validation;
     json_object_object_get_ex(validation, "policy", &policy); id = aegisxd_json_str(policy, "id", "");
     snprintf(stable_id, sizeof(stable_id), "%s", id);
+    if(content_is_exact("aegis_content_policies",id)){json_object_put(validation);return aegisxd_error("exact_policy_managed","此策略范围由广告分析管理；可在域名规则中修改或删除单条规则");}
     name = aegisxd_json_str(policy, "name", ""); mode = aegisxd_json_str(policy, "mode", "basic");
     enabled = aegisxd_json_bool(policy, "enabled", 1); ad_block = aegisxd_json_bool(policy, "ad_block", 0);
     json_object_object_get_ex(policy, "scope", &scope); json_object_object_get_ex(policy, "safe_search", &safe);
@@ -1463,6 +1469,7 @@ struct json_object *aegisxd_content_policy_delete_json(struct json_object *body)
 
     if (!content_id_ok(id))
         return aegisxd_error("invalid_content_policy_id", "content policy id is invalid");
+    if(content_is_exact("aegis_content_policies",id))return aegisxd_error("exact_policy_managed","请在域名规则中删除精确规则；策略范围由广告分析管理");
     st = aegisxd_config_prepare("SELECT 1 FROM aegis_content_policies WHERE id=?1");
     if (st) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
@@ -1532,7 +1539,7 @@ rollback:
 
 static struct json_object *content_override_row(sqlite3_stmt *st)
 {
-    struct json_object *o=json_object_new_object();aegisxd_json_add_string(o,"id",aegisxd_sqlite_text(st,0,""));aegisxd_json_add_string(o,"policy_id",aegisxd_sqlite_text(st,1,""));aegisxd_json_add_string(o,"domain",aegisxd_sqlite_text(st,2,""));aegisxd_json_add_string(o,"action",aegisxd_sqlite_text(st,3,""));json_object_object_add(o,"enabled",json_object_new_boolean(sqlite3_column_int(st,4)));aegisxd_json_add_string(o,"note",aegisxd_sqlite_text(st,5,""));aegisxd_json_add_string(o,"apply_state",aegisxd_sqlite_text(st,6,"pending"));aegisxd_json_add_string(o,"last_error",aegisxd_sqlite_text(st,7,""));json_object_object_add(o,"created_at",json_object_new_int64(sqlite3_column_int64(st,8)));json_object_object_add(o,"updated_at",json_object_new_int64(sqlite3_column_int64(st,9)));return o;
+    struct json_object *o=json_object_new_object();aegisxd_json_add_string(o,"id",aegisxd_sqlite_text(st,0,""));aegisxd_json_add_string(o,"policy_id",aegisxd_sqlite_text(st,1,""));aegisxd_json_add_string(o,"domain",aegisxd_sqlite_text(st,2,""));aegisxd_json_add_string(o,"action",aegisxd_sqlite_text(st,3,""));json_object_object_add(o,"enabled",json_object_new_boolean(sqlite3_column_int(st,4)));aegisxd_json_add_string(o,"note",aegisxd_sqlite_text(st,5,""));aegisxd_json_add_string(o,"apply_state",aegisxd_sqlite_text(st,6,"pending"));aegisxd_json_add_string(o,"last_error",aegisxd_sqlite_text(st,7,""));json_object_object_add(o,"created_at",json_object_new_int64(sqlite3_column_int64(st,8)));json_object_object_add(o,"updated_at",json_object_new_int64(sqlite3_column_int64(st,9)));aegisxd_json_add_string(o,"match",aegisxd_sqlite_text(st,10,"suffix"));return o;
 }
 
 struct json_object *aegisxd_domain_overrides_json(struct json_object *body)
@@ -1541,7 +1548,7 @@ struct json_object *aegisxd_domain_overrides_json(struct json_object *body)
     struct json_object *items = json_object_new_array();
     const char *id = aegisxd_json_str(body, "id", "");
     sqlite3_stmt *st = aegisxd_config_prepare(
-        "SELECT id,policy_id,domain,action,enabled,note,apply_state,last_error,created_at,updated_at "
+        "SELECT id,policy_id,domain,action,enabled,note,apply_state,last_error,created_at,updated_at,match_kind "
         "FROM aegis_domain_overrides WHERE (?1='' OR id=?1) ORDER BY domain");
 
     if (st)
@@ -1566,6 +1573,7 @@ struct json_object *aegisxd_domain_overrides_json(struct json_object *body)
 
 struct json_object *aegisxd_domain_override_set_json(struct json_object *body)
 {
+    if(content_is_exact("aegis_domain_overrides",aegisxd_json_str(body,"id","")))return aegisxd_ad_dns_canonical(body,0);
     char domain[256],generated[96],existing_id[96]="";const char *id=aegisxd_json_str(body,"id","");const char *policy_id=aegisxd_json_str(body,"policy_id","");const char *action=aegisxd_json_str(body,"action","");const char *note=aegisxd_json_str(body,"note","");int enabled=aegisxd_json_bool(body,"enabled",1),confirm=aegisxd_json_bool(body,"confirm",0),do_apply=aegisxd_json_bool(body,"apply",0),rc;sqlite3_stmt *st;struct json_object *resp,*apply=NULL;uint64_t hash=1469598103934665603ULL;
     content_domain_normalize(domain,sizeof(domain),aegisxd_json_str(body,"domain",""));if(!content_domain_ok(domain))return aegisxd_error("invalid_domain","domain override is invalid");if(strcmp(action,"allow")&&strcmp(action,"block"))return aegisxd_error("invalid_domain_override_action","action must be allow or block");if(policy_id[0]&&!content_id_ok(policy_id))return aegisxd_error("invalid_content_policy_id","policy id is invalid");if(!content_text_ok(note,256,0))return aegisxd_error("invalid_note","domain override note is invalid");if(!id[0]){for(const unsigned char *p=(const unsigned char*)policy_id;*p;p++){hash^=*p;hash*=1099511628211ULL;}hash^=(unsigned char)'|';hash*=1099511628211ULL;for(const unsigned char *p=(const unsigned char*)domain;*p;p++){hash^=*p;hash*=1099511628211ULL;}snprintf(generated,sizeof(generated),"domain-override-%016" PRIx64,hash);id=generated;}if(!content_id_ok(id))return aegisxd_error("invalid_domain_override_id","domain override id is invalid");
     if(policy_id[0]){int policy_exists=0;st=aegisxd_config_prepare("SELECT 1 FROM aegis_content_policies WHERE id=?1");if(st){sqlite3_bind_text(st,1,policy_id,-1,SQLITE_TRANSIENT);policy_exists=sqlite3_step(st)==SQLITE_ROW;sqlite3_finalize(st);}if(!policy_exists)return aegisxd_error("content_policy_not_found","domain override policy does not exist");}
@@ -1580,6 +1588,7 @@ rollback:sqlite3_exec(g_aegisxd_config_db,"ROLLBACK",NULL,NULL,NULL);if(do_apply
 
 struct json_object *aegisxd_domain_override_delete_json(struct json_object *body)
 {
+    if(content_is_exact("aegis_domain_overrides",aegisxd_json_str(body,"id","")))return aegisxd_ad_dns_canonical(body,1);
     const char *id=aegisxd_json_str(body,"id","");int confirm=aegisxd_json_bool(body,"confirm",0),do_apply=aegisxd_json_bool(body,"apply",0),exists=0;sqlite3_stmt *st;struct json_object *resp,*apply=NULL;if(!content_id_ok(id))return aegisxd_error("invalid_domain_override_id","domain override id is invalid");st=aegisxd_config_prepare("SELECT 1 FROM aegis_domain_overrides WHERE id=?1");if(st){sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);exists=sqlite3_step(st)==SQLITE_ROW;sqlite3_finalize(st);}if(!exists)return aegisxd_error("domain_override_not_found","domain override does not exist");if(!confirm){resp=json_object_new_object();json_object_object_add(resp,"ok",json_object_new_boolean(1));json_object_object_add(resp,"dry_run",json_object_new_boolean(1));json_object_object_add(resp,"confirm_required",json_object_new_boolean(1));json_object_object_add(resp,"changed",json_object_new_boolean(0));json_object_object_add(resp,"dataplane_changed",json_object_new_boolean(0));return resp;}if(sqlite3_exec(g_aegisxd_config_db,"BEGIN IMMEDIATE",NULL,NULL,NULL)!=SQLITE_OK)return aegisxd_error("storage_error","domain override transaction could not start");st=aegisxd_config_prepare("DELETE FROM aegis_domain_overrides WHERE id=?1");if(!st)goto rollback;sqlite3_bind_text(st,1,id,-1,SQLITE_TRANSIENT);exists=sqlite3_step(st)==SQLITE_DONE;sqlite3_finalize(st);if(!exists||content_meta_mark(do_apply?"applying":"pending","")!=0)goto rollback;if(do_apply&&content_apply_requested(body,&apply)!=0)goto rollback_apply;if(do_apply&&content_apply_state_set(content_apply_success_state(apply),"")!=0)goto rollback_apply;if(sqlite3_exec(g_aegisxd_config_db,"COMMIT",NULL,NULL,NULL)!=SQLITE_OK)goto rollback_apply;resp=aegisxd_domain_overrides_json(NULL);json_object_object_add(resp,"changed",json_object_new_boolean(1));json_object_object_add(resp,"dataplane_changed",json_object_new_boolean(content_apply_changed(apply)));aegisxd_json_add_string(resp,"id",id);aegisxd_json_add_string(resp,"action","deleted");if(apply)json_object_object_add(resp,"apply",apply);return resp;
 rollback_apply:if(apply)json_object_put(apply);
 rollback:sqlite3_exec(g_aegisxd_config_db,"ROLLBACK",NULL,NULL,NULL);if(do_apply){struct json_object *restore=NULL;(void)content_apply_requested(body,&restore);if(restore)json_object_put(restore);}resp=aegisxd_error("domain_override_delete_failed","delete failed; previous configuration remains authoritative");json_object_object_add(resp,"rollback_ok",json_object_new_boolean(1));return resp;
@@ -1588,7 +1597,7 @@ rollback:sqlite3_exec(g_aegisxd_config_db,"ROLLBACK",NULL,NULL,NULL);if(do_apply
 void *aegisxd_content_filter_load(void)
 {
     struct content_filter *f=calloc(1,sizeof(*f));sqlite3_stmt *st;if(!f)return NULL;st=aegisxd_config_prepare("SELECT managed FROM aegis_content_meta WHERE id=1");if(st&&sqlite3_step(st)==SQLITE_ROW)f->managed=sqlite3_column_int(st,0);if(st)sqlite3_finalize(st);if(!f->managed)return f;
-    st=aegisxd_config_prepare("SELECT mode,ad_block,categories_json,safe_search_json,scope_json,schedule_json,id FROM aegis_content_policies WHERE enabled=1 AND mode<>'off' ORDER BY id");
+    st=aegisxd_config_prepare("SELECT mode,ad_block,categories_json,safe_search_json,scope_json,schedule_json,id FROM aegis_content_policies WHERE enabled=1 AND mode<>'off' AND enforcement<>'dns_exact' ORDER BY id");
     if (!st) { free(f); return NULL; }
     while (sqlite3_step(st) == SQLITE_ROW) {
         const char *mode = aegisxd_sqlite_text(st, 0, "");
@@ -1653,7 +1662,7 @@ void *aegisxd_content_filter_load(void)
      * policy_id='' overrides stay global; a scoped policy's own overrides are
      * attached to that policy so they are not applied to every client.
      */
-    st=aegisxd_config_prepare("SELECT domain,action,policy_id FROM aegis_domain_overrides WHERE enabled=1 ORDER BY domain");
+    st=aegisxd_config_prepare("SELECT domain,action,policy_id FROM aegis_domain_overrides WHERE enabled=1 AND match_kind='suffix' ORDER BY domain");
     while (st && sqlite3_step(st) == SQLITE_ROW) {
         const char *d = aegisxd_sqlite_text(st, 0, "");
         const char *a = aegisxd_sqlite_text(st, 1, "");
@@ -1933,4 +1942,34 @@ int aegisxd_content_filter_write_scoped_nft(void *opaque, FILE *fp)
     }
     fprintf(fp, "  }\n}\n");
     return rules;
+}
+
+/* A precise DNS allow cannot override an already scoped IP reject. Surface the
+ * actual matching policy rather than silently changing its device/global scope. */
+struct json_object *aegisxd_content_dns_conflicts(struct json_object *body)
+{
+    struct json_object *out=json_object_new_array(),*rules=NULL;
+    struct content_filter *f=aegisxd_content_filter_load();
+    if(!f)return out;
+    json_object_object_get_ex(body,"rules",&rules);
+    const char *mac=aegisxd_json_str(body,"device_id","");
+    for(size_t i=0;i<f->scoped_count;i++) {
+        struct content_scoped_policy *sp=&f->scoped[i];
+        if(sp->devices.count&&!content_list_has(&sp->devices,mac))continue;
+        struct content_string_list domains={0};
+        if(content_scoped_domains(f,sp,&domains))continue;
+        for(size_t j=0;j<json_object_array_length(rules);j++) {
+            struct json_object *rule=json_object_array_get_idx(rules,j);
+            const char *domain=aegisxd_json_str(rule,"domain","");
+            if(strcmp(aegisxd_json_str(rule,"action",""),"allow")||!content_domain_list_matches(&domains,domain))continue;
+            struct json_object *v=json_object_new_object();
+            aegisxd_json_add_string(v,"domain",domain);
+            aegisxd_json_add_string(v,"provider","aegisxd-content-policy");
+            aegisxd_json_add_string(v,"rule_id",sp->id);
+            aegisxd_json_add_string(v,"reason","scoped_resolved_ip_reject");
+            json_object_array_add(out,v);
+        }
+        content_list_free(&domains);
+    }
+    aegisxd_content_filter_free(f);return out;
 }

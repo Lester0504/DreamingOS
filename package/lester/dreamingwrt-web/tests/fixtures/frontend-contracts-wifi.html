@@ -1,0 +1,140 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/wifi-management.css">
+  <style>
+    :root {
+      --app-page-gutter-block:14px; --app-page-gutter-inline:14px; --app-page-gap:16px;
+      --app-radius-card:20px; --app-radius-panel:18px; --app-radius-control:12px; --app-radius-compact:8px;
+      --dwrt-kit-radius:20px; --dwrt-kit-text:#172033; --dwrt-kit-muted:#667085;
+      --dwrt-kit-liquid-surface:rgba(255,255,255,.28); --dwrt-kit-liquid-backdrop:blur(3px) saturate(130%);
+      --dwrt-glass-edge:rgba(255,255,255,.5); --dwrt-glass-shadow:0 12px 28px rgba(0,0,0,.10);
+    }
+    * { box-sizing:border-box; }
+    html, body, .console-stage { width:100%; height:100%; margin:0; }
+    body { color:#172033; background:linear-gradient(135deg,#b9d4e5,#e6c3a0); font:13px/1.45 system-ui,sans-serif; }
+    .console-stage { display:grid; }
+    .route-preview { height:100%; }
+    .policy-create-button { min-height:38px; padding:0 14px; border:0; border-radius:999px; color:#fff; background:#1677ff; display:inline-flex; align-items:center; gap:7px; }
+    .dwrt-kit-page-tabs { display:flex; }
+  </style>
+</head>
+<body data-fixture="synthetic-wifi-operation-contract">
+  <div class="console-stage"><main id="routePreview" class="route-preview"></main></div>
+  <link rel="stylesheet" href="/static/css/notifications.css">
+  <script src="/static/ui-kit/dwrt-ui-kit.js"></script>
+  <script src="/static/js/notifications.js"></script>
+  <script src="/static/js/dwrt-data-registry.js"></script>
+  <script type="module">
+    const triBandRadios = [
+      { id:'radio0', name:'phy0', band:'2.4GHz', channel:6, width:40, tx_power:24, online:true, supported_widths:[20,40], excluded_channels:[] },
+      { id:'radio1', name:'phy1', band:'5GHz', channel:36, width:160, tx_power:27, online:true, supported_widths:[20,40,80,160], excluded_channels:[] },
+      { id:'radio2', name:'phy2', band:'6GHz', channel:33, width:320, tx_power:24, online:false, supported_widths:[20,40,80,160,320], excluded_channels:[] }
+    ];
+    const triBandConfig = {
+      capabilities:{
+        wifi:true, bands:['2g','5g','6g'], save_config:true, apply_config:true, scan:false,
+        global_update:true,
+        radio_width_profile:{ write:true, apply:true, readback:true, supported_profiles:['maximum','conservative','custom'] },
+        ssid_create:false, ssid_update:true, ssid_set_enabled:false, ssid_delete:false,
+        reasons:{ ssid_set_enabled:'ssid_enabled_readback_pending', ssid_delete:'resource_crud_pending' },
+        write_scopes:{ local:{ supported:true, ssid_set_enabled:false, ssid_delete:false, reasons:{ ssid_set_enabled:'ssid_enabled_readback_pending', ssid_delete:'resource_crud_pending' } } }
+      },
+      regdomains:[{code:'CN',name:'中国'}],
+      global:{ country:'CN', speed_profile:'custom', widths:{'2g':40,'5g':80,'6g':320}, dfs_enabled:true, mesh:false, mesh_monitor:'gateway', band_steering:true, fast_roaming:true, mlo:false },
+      radios:triBandRadios,
+      ssids:[{ id:'default', name:'DreamingWrt', network:'lan', broadcast:'全部 AP', bands:['2g','5g','6g'], clients:4, enabled:true, security:'wpa3-personal' }],
+      speed_limits:[{ id:'default', name:'Default', download_mbps:0, upload_mbps:0 }]
+    };
+    const clone = value => JSON.parse(JSON.stringify(value));
+    const scenarioConfig = name => {
+      const config = clone(triBandConfig);
+      if (name === 'dual-band') {
+        config.capabilities.bands = ['2g','5g'];
+        config.radios = config.radios.filter(radio => radio.id !== 'radio2');
+        config.ssids[0].bands = ['2g','5g'];
+        delete config.global.widths['6g'];
+      }
+      if (name === 'missing-widths') {
+        config.capabilities.global_update = false;
+        config.capabilities.radio_width_profile = { write:false, apply:false, readback:false, supported_profiles:[] };
+        config.capabilities.reasons.global_update = 'transactional_apply_readback_pending';
+        config.global.speed_profile = 'conservative';
+        config.global.widths = {'2g':20,'5g':80,'6g':80};
+        config.radios.forEach((radio, index) => {
+          delete radio.supported_widths;
+          radio.width = [20, 80, 80][index];
+        });
+      }
+      if (name === 'channel-catalog') {
+        const entry = (channel, frequency_mhz, flags = {}) => ({ channel, frequency_mhz, disabled:false, no_ir:false, radar_detection:false, ...flags });
+        const channels2g = Array.from({ length:14 }, (_, index) => entry(index + 1, 2412 + index * 5, index === 12 ? { no_ir:true } : {}));
+        const channels5g = [36,40,44,48,52,56,60,64,100,104,108,112,116,120,124,128,132,136,140,144,149,153,157,161,165]
+          .map(channel => entry(channel, 5000 + channel * 5, channel === 52 ? { radar_detection:true } : channel === 149 ? { disabled:true } : {}));
+        const channels6g = [1,5,9,13,17,21,25,29,33,37,41,45,49,53,57,61,65,69,73,77,81,85,89,93,97,101,105,109,113,117,121,125,129,133,137,141,145,149,153,157,161,165,169,173,177,181,185,189,193,197,201,205,209,213,217,221,225,229,233]
+          .map(channel => entry(channel, 5950 + channel * 5, channel >= 129 ? { no_ir:true } : {}));
+        config.radios[0].supported_widths = [20,40];
+        config.radios[0].channel_catalog = { complete:true, regdomain:'CN', supported_widths_mhz:[20,40], channels:channels2g };
+        config.radios[0].excluded_channels = [11];
+        config.radios[1].supported_widths = [20,40,80,160,240];
+        config.radios[1].channel_catalog = { complete:true, regdomain:'CN', supported_widths_mhz:[20,40,80,160,240], channels:channels5g };
+        config.radios[2].supported_widths = [20,40,80,160,320];
+        config.radios[2].channel_catalog = { complete:true, regdomain:'CN', supported_widths_mhz:[20,40,80,160,320], channels:channels6g };
+      }
+      if (name === 'power-contract') {
+        config.capabilities.radio_tx_power = { read:true, write:true, apply:true, readback:true };
+        config.radios.forEach((radio, index) => {
+          radio.radio_tx_power = { read:true, write:true, apply:true, readback:true };
+          radio.tx_power_dbm = [24,27,35][index];
+          radio.tx_power_limits_dbm = { min:1, max:index === 2 ? 35 : 30, step:1 };
+        });
+      }
+      return config;
+    };
+    let scenario = 'tri-band';
+    let canonical = scenarioConfig(scenario);
+    window.fixtureCalls = [];
+    window.fixtureMode = new URLSearchParams(location.search).get('mode') || 'stale';
+    window.fetch = async (url, options = {}) => {
+      const method = options.method || 'GET';
+      fixtureCalls.push({ url, method, body: options.body ? JSON.parse(options.body) : null });
+      let body = { data: canonical }, status = 200;
+      if (method === 'PUT' && window.fixtureMode === 'stale') { status = 409; body = { ok:false, error:{ code:'stale_local_snapshot', message:'本机快照已过期' } }; }
+      else if (method === 'PUT') canonical = { ...canonical, ...JSON.parse(options.body) };
+      if (String(url).includes('/apply')) body = window.fixtureMode === 'applyfail' ? { data:{ applied:false, readback_verified:false, reason:'radio_not_beaconing' } } : { data:{ applied:true, readback_verified:true } };
+      if (method === 'GET' && window.fixtureMode === 'loadfail') { status = 503; body = { ok:false, error:{ code:'source_unavailable', message:'读取失败' } }; }
+      return { ok: status < 400, status, text:async () => JSON.stringify(body) };
+    };
+    const { mount } = await import('../../files/www/dreamingwrt/plugins/native/wifi-management.js');
+    const ui = window.DWRT_UI_KIT;
+    const context = root => ({ root, item:{ id:'wifi-config' }, ui, utils:{ escapeHtml:value => String(value ?? '').replace(/[&<>"']/g, character => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character])) } });
+    let root = document.getElementById('routePreview');
+    let instance = mount(context(root));
+    window.fixtureController = instance;
+    window.WIFI_CONFIG_FIXTURE = {
+      async ready() {
+        for (let attempt = 0; attempt < 80; attempt += 1) {
+          if (root.querySelector('.wifi-config-table tbody tr')) return true;
+          await new Promise(resolve => setTimeout(resolve, 25));
+        }
+        return false;
+      },
+      async mountScenario(nextScenario) {
+        instance?.unmount?.();
+        scenario = nextScenario;
+        const nextRoot = document.createElement('main');
+        nextRoot.id = 'routePreview';
+        nextRoot.className = 'route-preview';
+        root.replaceWith(nextRoot);
+        root = nextRoot;
+        instance = mount(context(root));
+        window.fixtureController = instance;
+        return this.ready();
+      }
+    };
+  </script>
+</body>
+</html>

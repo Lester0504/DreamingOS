@@ -16,10 +16,24 @@ extern sqlite3 *g_ac_db;
 #define EPOCH \
     "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
 #define DIGEST \
-    "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+    "sha256:405485f4df88d2e869ec5a360ce2073e00f17a8c1b8614d8d51445984a6d53f3"
 #define DIGEST_B \
-    "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+    "sha256:500c76731b9453afce2fc9c18ab290ea8015fee781a3749c224de29f58895564"
 #define FINISH_1 "55555555-5555-4555-8555-555555555555"
+#define FINISH_2 "66666666-6666-4666-8666-666666666666"
+#define OTHER_EPOCH \
+    "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+#define CANDIDATE \
+    "{\"format\":\"uci-wireless-candidate.v1\",\"candidate_digest\":\"" \
+    DIGEST "\",\"sections\":[{\"section\":\"radio0\",\"options\":" \
+    "{\"channel\":\"36\"}}]}"
+#define CANDIDATE_B \
+    "{\"format\":\"uci-wireless-candidate.v1\",\"candidate_digest\":\"" \
+    DIGEST_B "\",\"sections\":[{\"section\":\"radio1\",\"options\":" \
+    "{\"channel\":\"44\"}}]}"
+#define READBACK \
+    "{\"ok\":true,\"match\":true,\"candidate_digest\":\"" DIGEST \
+    "\",\"readback_digest\":\"" DIGEST "\"}"
 
 enum ac_config_job_result {
     AC_CONFIG_JOB_ERROR = -1,
@@ -46,11 +60,14 @@ struct ac_config_job {
     char finish_id[37];
     char outcome[15];
     char error_code[128];
+    char operation[9];
+    char rollback_of_job_id[37];
 };
 
 int ac_db_init(void);
 void ac_db_close(void);
-int ac_db_ap_session_begin(const char *, const char *, int, int64_t);
+int ac_db_ap_session_begin_with_capabilities(const char *, const char *, int,
+                                             int, int64_t);
 int ac_db_config_job_create(const char *, const char *, const char *,
                             const char *, struct ac_config_job *);
 int ac_db_config_job_status(const char *, struct ac_config_job *);
@@ -79,35 +96,41 @@ int main(void)
     struct ac_config_job leased;
     struct ac_config_job second;
     char *candidate = NULL;
+    char sql[256];
 
     CHECK("init", ac_db_init() == 0);
 
     /* Creation is idempotent by (ap_id, idempotency_key); a different
      * candidate under the same key is a conflict, not a replacement. */
-    CHECK("create", ac_db_config_job_create(AP_ID, "{\"c\":1}", DIGEST,
+    CHECK("create", ac_db_config_job_create(AP_ID, CANDIDATE, DIGEST,
               "web.apply.1", &job) == AC_CONFIG_JOB_OK);
     CHECK("create state", !strcmp(job.state, "queued"));
-    CHECK("create replay", ac_db_config_job_create(AP_ID, "{\"c\":1}",
+    CHECK("create replay", ac_db_config_job_create(AP_ID, CANDIDATE,
               DIGEST, "web.apply.1", &job) == AC_CONFIG_JOB_IDEMPOTENT);
-    CHECK("create drift", ac_db_config_job_create(AP_ID, "{\"c\":2}",
+    CHECK("create drift", ac_db_config_job_create(AP_ID, CANDIDATE_B,
               DIGEST_B, "web.apply.1", NULL) == AC_CONFIG_JOB_CONFLICT);
 
-    /* Leasing requires the current v2 session and serializes per AP. */
+    /* Leasing requires the current v3 write-capable session. */
     CHECK("lease no session", ac_db_config_job_lease_next(AP_ID, EPOCH,
               1000, &leased, &candidate) == AC_CONFIG_JOB_ERROR);
     CHECK("adopt", sqlite3_exec(g_ac_db,
               "INSERT INTO ac_aps(ap_id,site_id,name,adoption_state,"
               "last_seen_at) VALUES('" AP_ID "','default','Fixture AP',"
               "'adopted',1000)", NULL, NULL, NULL) == SQLITE_OK);
-    CHECK("session", ac_db_ap_session_begin(AP_ID, EPOCH, 2, 1000) == 0);
+    CHECK("v2 session", ac_db_ap_session_begin_with_capabilities(
+              AP_ID, EPOCH, 2, 0, 1000) == 0);
+    CHECK("lease v2 rejected", ac_db_config_job_lease_next(AP_ID, EPOCH,
+              1001, &leased, &candidate) == AC_CONFIG_JOB_ERROR);
+    CHECK("v3 write session", ac_db_ap_session_begin_with_capabilities(
+              AP_ID, EPOCH, 3, 1, 1001) == 0);
     CHECK("lease", ac_db_config_job_lease_next(AP_ID, EPOCH, 1001,
               &leased, &candidate) == AC_CONFIG_JOB_OK);
     CHECK("lease state", !strcmp(leased.state, "leased"));
     CHECK("lease generation", leased.dispatch_generation == 1);
-    CHECK("lease candidate", candidate && !strcmp(candidate, "{\"c\":1}"));
+    CHECK("lease candidate", candidate && !strcmp(candidate, CANDIDATE));
     free(candidate);
     candidate = NULL;
-    CHECK("create 2", ac_db_config_job_create(AP_ID, "{\"c\":3}", DIGEST_B,
+    CHECK("create 2", ac_db_config_job_create(AP_ID, CANDIDATE_B, DIGEST_B,
               "web.apply.2", &second) == AC_CONFIG_JOB_OK);
     CHECK("serialized", ac_db_config_job_lease_next(AP_ID, EPOCH, 1002,
               &job, &candidate) == AC_CONFIG_JOB_NOT_FOUND);
@@ -132,13 +155,18 @@ int main(void)
     CHECK("finish", ac_db_config_job_finish(leased.job_id,
               leased.attempt_id, leased.dispatch_generation,
               leased.request_digest, AP_ID, EPOCH, FINISH_1, "applied", "",
-              "{\"match\":true}", 1007, &job) == AC_CONFIG_JOB_OK);
+              READBACK, 1007, &job) == AC_CONFIG_JOB_OK);
     CHECK("finish state", !strcmp(job.state, "applied"));
     CHECK("finish replay", ac_db_config_job_finish(leased.job_id,
               leased.attempt_id, leased.dispatch_generation,
               leased.request_digest, AP_ID, EPOCH, FINISH_1, "applied", "",
-              "{\"match\":true}", 1008, &job) ==
+              READBACK, 1008, &job) ==
           AC_CONFIG_JOB_IDEMPOTENT);
+    CHECK("finish replay drift", ac_db_config_job_finish(leased.job_id,
+              leased.attempt_id, leased.dispatch_generation,
+              leased.request_digest, AP_ID, EPOCH, FINISH_1, "applied", "",
+              "{\"ok\":true,\"match\":false}", 1009, &job) ==
+          AC_CONFIG_JOB_CONFLICT);
 
     /* Terminal state releases the per-AP serialization; an expired lease
      * recovers back to queued. */
@@ -151,6 +179,49 @@ int main(void)
               2000 + 61) == AC_CONFIG_JOB_OK);
     CHECK("recover state", ac_db_config_job_status(second.job_id, &job) ==
           AC_CONFIG_JOB_OK && !strcmp(job.state, "queued"));
+
+    /* A lost AP can return after the controller expired its action. The
+     * receipt must not reconnect-loop or turn cancellation into success. */
+    CHECK("lease expired action", ac_db_config_job_lease_next(
+              AP_ID, EPOCH, 2100, &leased, &candidate) == AC_CONFIG_JOB_OK);
+    free(candidate);
+    candidate = NULL;
+    snprintf(sql, sizeof(sql),
+             "UPDATE ac_config_jobs SET state='cancelled',"
+             "error_code='roaming_action_expired',lease_expires_at=0 "
+             "WHERE job_id='%s'", leased.job_id);
+    CHECK("controller expires action", sqlite3_exec(
+              g_ac_db, sql, NULL, NULL, NULL) == SQLITE_OK);
+    CHECK("late finish stale session", ac_db_config_job_finish(
+              leased.job_id, leased.attempt_id, leased.dispatch_generation,
+              leased.request_digest, AP_ID, OTHER_EPOCH, FINISH_2, "failed",
+              "interrupted_before_apply", "", 2101, &job) ==
+          AC_CONFIG_JOB_CONFLICT);
+    CHECK("late finish wrong digest", ac_db_config_job_finish(
+              leased.job_id, leased.attempt_id, leased.dispatch_generation,
+              DIGEST, AP_ID, EPOCH, FINISH_2, "failed",
+              "interrupted_before_apply", "", 2101, &job) ==
+          AC_CONFIG_JOB_CONFLICT);
+    CHECK("late finish ack", ac_db_config_job_finish(
+              leased.job_id, leased.attempt_id, leased.dispatch_generation,
+              leased.request_digest, AP_ID, EPOCH, FINISH_2, "failed",
+              "interrupted_before_apply", "", 2101, &job) ==
+          AC_CONFIG_JOB_IDEMPOTENT);
+    CHECK("late finish ack identity", !strcmp(job.finish_id, FINISH_2) &&
+          !strcmp(job.state, "cancelled"));
+    CHECK("late finish leaves cancellation", ac_db_config_job_status(
+              leased.job_id, &job) == AC_CONFIG_JOB_OK &&
+          !strcmp(job.state, "cancelled") && !job.finish_id[0] &&
+          !job.outcome[0] &&
+          !strcmp(job.error_code, "roaming_action_expired"));
+    CHECK("late success stays cancelled", ac_db_config_job_finish(
+              leased.job_id, leased.attempt_id, leased.dispatch_generation,
+              leased.request_digest, AP_ID, EPOCH, FINISH_2, "applied",
+              "", READBACK, 2102, &job) == AC_CONFIG_JOB_IDEMPOTENT &&
+          !strcmp(job.state, "cancelled"));
+    CHECK("no replay after cancellation", ac_db_config_job_lease_next(
+              AP_ID, EPOCH, 2103, &job, &candidate) ==
+          AC_CONFIG_JOB_NOT_FOUND);
 
     ac_db_close();
     printf("ok\n");

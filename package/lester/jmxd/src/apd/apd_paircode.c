@@ -12,6 +12,8 @@
  * daemon's dependencies just to parse a code.
  */
 #include <openssl/crypto.h>
+#include <openssl/rand.h>
+#include <json-c/json.h>
 
 #define APD_PAIRCODE_SCHEMA 1
 #define APD_PAIRCODE_PAYLOAD_MAX 320
@@ -777,4 +779,47 @@ void apd_paircode_controller_cleanse(struct apd_paircode_controller *value)
     if (!value)
         return;
     OPENSSL_cleanse(value, sizeof(*value));
+}
+
+int apd_binding_qr_generate_nonce(char *out, size_t len)
+{
+    static const char alphabet[] =
+        "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz";
+    if (!out || len == 0) return -1;
+    for (size_t i = 0; i < len; i++) {
+        unsigned char c;
+        if (RAND_bytes(&c, 1) != 1) return -1;
+        out[i] = alphabet[c % (sizeof(alphabet) - 1)];
+    }
+    out[len] = '\0';
+    return 0;
+}
+
+int apd_binding_qr_encode(const struct apd_binding_qr *in,
+                           char *out, size_t out_size)
+{
+    struct json_object *o;
+    const char *s;
+    size_t slen;
+    if (!in || !out || out_size == 0) return -1;
+    o = json_object_new_object();
+    if (!o) return -1;
+    json_object_object_add(o, "ap_id", json_object_new_string(in->ap_id));
+    json_object_object_add(o, "key_id", json_object_new_string(in->key_id));
+    if (in->mac[0])
+        json_object_object_add(o, "mac", json_object_new_string(in->mac));
+    if (in->model[0])
+        json_object_object_add(o, "model", json_object_new_string(in->model));
+    if (in->mgmt_ip[0]) {
+        json_object_object_add(o, "ip", json_object_new_string(in->mgmt_ip));
+        json_object_object_add(o, "port", json_object_new_int(in->mgmt_port));
+    }
+    json_object_object_add(o, "nonce", json_object_new_string(in->nonce));
+    json_object_object_add(o, "te", json_object_new_int64(in->expires_at));
+    s = json_object_to_json_string(o);
+    slen = strlen(s);
+    if (slen >= out_size) { json_object_put(o); return -1; }
+    memcpy(out, s, slen + 1);
+    json_object_put(o);
+    return 0;
 }

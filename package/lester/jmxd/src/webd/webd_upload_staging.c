@@ -35,6 +35,7 @@
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
@@ -53,14 +54,61 @@
 #define UPLOAD_META_NAME "meta.txt"
 #define UPLOAD_META_TMP "meta.tmp"
 #define UPLOAD_LOCK_NAME "lock"
+#define UPLOAD_GC_PREFIX ".gc-"
+#define UPLOAD_CLEANUP_STATUS_NAME ".cleanup-status"
+#define UPLOAD_CLEANUP_STATUS_TMP ".cleanup-status.tmp"
 #define UPLOAD_ROOT_MAX 512
 #define UPLOAD_META_MAX (16 * 1024)
 #define UPLOAD_MAX_FIRMWARE (8ULL * 1024ULL * 1024ULL * 1024ULL)
 #define UPLOAD_MAX_BACKUP (64ULL * 1024ULL * 1024ULL)
 #define UPLOAD_MAX_SIGNATURE (64ULL * 1024ULL * 1024ULL)
+#define UPLOAD_MAX_CERTIFICATE (1024ULL * 1024ULL)
 #define UPLOAD_TTL_MAX_SECONDS (24U * 3600U)
 
 static char g_upload_root[UPLOAD_ROOT_MAX] = WEBD_UPLOAD_DEFAULT_ROOT;
+static struct webd_upload_cleanup_status g_cleanup_status;
+static int write_all_fd(int fd, const char *buf, size_t len);
+
+static void cleanup_status_persist_at(int rootfd)
+{
+    char buf[768];
+    int fd;
+    int n;
+
+    if (rootfd < 0)
+        return;
+    n = snprintf(buf, sizeof(buf),
+                 "version=1\nlast_run_at=%lld\nlast_success_at=%lld\n"
+                 "scanned_count=%llu\ndeleted_count=%llu\nbusy_count=%llu\n"
+                 "failed_count=%llu\nrecovered_count=%llu\nlast_error=%s\n",
+                 (long long)g_cleanup_status.last_run_at,
+                 (long long)g_cleanup_status.last_success_at,
+                 (unsigned long long)g_cleanup_status.scanned_count,
+                 (unsigned long long)g_cleanup_status.deleted_count,
+                 (unsigned long long)g_cleanup_status.busy_count,
+                 (unsigned long long)g_cleanup_status.failed_count,
+                 (unsigned long long)g_cleanup_status.recovered_count,
+                 g_cleanup_status.last_error);
+    if (n < 0 || (size_t)n >= sizeof(buf))
+        return;
+    (void)unlinkat(rootfd, UPLOAD_CLEANUP_STATUS_TMP, 0);
+    fd = openat(rootfd, UPLOAD_CLEANUP_STATUS_TMP,
+                O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0)
+        return;
+    if (write_all_fd(fd, buf, (size_t)n) != 0 || fsync(fd) != 0) {
+        close(fd);
+        (void)unlinkat(rootfd, UPLOAD_CLEANUP_STATUS_TMP, 0);
+        return;
+    }
+    close(fd);
+    if (renameat(rootfd, UPLOAD_CLEANUP_STATUS_TMP,
+                 rootfd, UPLOAD_CLEANUP_STATUS_NAME) != 0) {
+        (void)unlinkat(rootfd, UPLOAD_CLEANUP_STATUS_TMP, 0);
+        return;
+    }
+    (void)fsync(rootfd);
+}
 
 static void upload_err(char *err, size_t err_len, const char *msg)
 {
@@ -88,7 +136,8 @@ int webd_upload_type_allowed(const char *upload_type)
     return upload_type &&
         (!strcmp(upload_type, "firmware") ||
          !strcmp(upload_type, "backup") ||
-         !strcmp(upload_type, "signature"));
+         !strcmp(upload_type, "signature") ||
+         !strcmp(upload_type, "ssl-certificate"));
 }
 
 uint64_t webd_upload_type_default_max(const char *upload_type)
@@ -99,6 +148,8 @@ uint64_t webd_upload_type_default_max(const char *upload_type)
         return UPLOAD_MAX_BACKUP;
     if (!strcmp(upload_type ? upload_type : "", "signature"))
         return UPLOAD_MAX_SIGNATURE;
+    if (!strcmp(upload_type ? upload_type : "", "ssl-certificate"))
+        return UPLOAD_MAX_CERTIFICATE;
     return 0;
 }
 
@@ -124,8 +175,13 @@ static int owner_id_ok(const char *owner_id)
 
 static int origin_ok(const char *origin)
 {
+    /* "browser" = a web-UI upload; "config_backup" = the config-export flow;
+     * "ota-remote" = the server-initiated OTA fetch in api_ota_remote.c that
+     * streams a distributor artifact into staging for the existing
+     * verify/apply path. otad remains the sole signature authority. */
     return origin && (!strcmp(origin, "browser") ||
-                      !strcmp(origin, "config_backup"));
+                      !strcmp(origin, "config_backup") ||
+                      !strcmp(origin, "ota-remote"));
 }
 
 static int write_all_fd(int fd, const char *buf, size_t len)
@@ -173,6 +229,23 @@ static int upload_id_ok(const char *id)
         if (!isxdigit((unsigned char)id[i]))
             return 0;
     return 1;
+}
+
+static int upload_gc_id_ok(const char *id)
+{
+    if (!id || strlen(id) != WEBD_UPLOAD_ID_LEN || strncmp(id, UPLOAD_GC_PREFIX, 4))
+        return 0;
+    for (size_t i = 4; i < WEBD_UPLOAD_ID_LEN; i++)
+        if (!isxdigit((unsigned char)id[i]))
+            return 0;
+    return 1;
+}
+
+static void upload_gc_id(const char *upload_id,
+                         char out[WEBD_UPLOAD_ID_LEN + 1])
+{
+    snprintf(out, WEBD_UPLOAD_ID_LEN + 1, "%s%s", UPLOAD_GC_PREFIX,
+             upload_id + 4);
 }
 
 static int sha256_hex_ok(const char *hex)
@@ -249,8 +322,13 @@ static int production_data_mount_ready(void)
 
     if (strcmp(g_upload_root, WEBD_UPLOAD_DEFAULT_ROOT))
         return 1;
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+    return stat("/", &root_st) == 0 && stat("/tmp", &data_st) == 0 &&
+           S_ISDIR(data_st.st_mode) && root_st.st_dev != data_st.st_dev;
+#else
     return stat("/", &root_st) == 0 && stat("/data", &data_st) == 0 &&
            S_ISDIR(data_st.st_mode) && root_st.st_dev != data_st.st_dev;
+#endif
 }
 
 static int open_root(char *err, size_t err_len)
@@ -258,7 +336,11 @@ static int open_root(char *err, size_t err_len)
     int fd;
     struct stat st;
     if (!production_data_mount_ready()) {
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+        upload_err(err, err_len, "temporary_mount_unavailable");
+#else
         upload_err(err, err_len, "data_mount_unavailable");
+#endif
         return -1;
     }
     if (mkdir_p_private(g_upload_root) != 0) {
@@ -272,6 +354,57 @@ static int open_root(char *err, size_t err_len)
         return -1;
     }
     return fd;
+}
+
+int webd_upload_staging_check_capacity(uint64_t additional_bytes,
+                                      char *err, size_t err_len)
+{
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+    const uint64_t reserve = 128ULL * 1024ULL * 1024ULL;
+    struct statvfs vfs;
+    uint64_t available;
+    int fd = open_root(err, err_len);
+    if (fd < 0) return -1;
+    int rc = fstatvfs(fd, &vfs);
+    close(fd);
+    if (rc != 0 || !vfs.f_frsize) {
+        upload_err(err, err_len, "staging_space_probe_failed");
+        return -1;
+    }
+    available = (uint64_t)vfs.f_bavail * vfs.f_frsize;
+#ifdef __linux__
+    /* tmpfs capacity is not RAM availability: enforce both budgets. */
+    FILE *mem = fopen("/proc/meminfo", "r");
+    char line[256];
+    unsigned long long kb = 0;
+    if (mem) {
+        while (fgets(line, sizeof(line), mem))
+            if (sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+        fclose(mem);
+    }
+    if (!kb) {
+        upload_err(err, err_len, "staging_memory_probe_failed");
+        return -1;
+    }
+    if (kb * 1024ULL < available) available = kb * 1024ULL;
+#endif
+    if (available < reserve || additional_bytes > available - reserve) {
+        upload_err(err, err_len, "staging_insufficient_space");
+        return -1;
+    }
+#else
+    (void)additional_bytes; (void)err; (void)err_len;
+#endif
+    return 0;
+}
+
+static int upload_capacity(const char *type, uint64_t expected,
+                           uint64_t written, char *err, size_t err_len)
+{
+    uint64_t required = expected > written ? expected - written : 0;
+    /* Single-slot apply consumes and compacts the existing staging inode. */
+    (void)type;
+    return webd_upload_staging_check_capacity(required, err, err_len);
 }
 
 static int open_upload_dir_at(int rootfd, const char *id, char *err, size_t err_len)
@@ -308,6 +441,21 @@ static int lock_upload_dir(int dirfd, char *err, size_t err_len)
         upload_err(err, err_len, "lock_failed");
         return -1;
     }
+}
+
+static int try_lock_upload_dir(int dirfd)
+{
+    int lockfd = openat(dirfd, UPLOAD_LOCK_NAME,
+                        O_RDWR | O_CREAT | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (lockfd < 0)
+        return -1;
+    if (flock(lockfd, LOCK_EX | LOCK_NB) != 0) {
+        int saved = errno;
+        close(lockfd);
+        errno = saved;
+        return -1;
+    }
+    return lockfd;
 }
 
 static void hex_encode(const char *in, char *out, size_t out_len)
@@ -599,6 +747,10 @@ int webd_upload_begin(const char *owner_id, const char *origin,
     struct webd_upload_meta m;
     time_t now = time(NULL);
 
+    /* Best effort: reclaim expired objects before reserving space for another
+     * upload. The bounded nonblocking scan must never make begin unavailable. */
+    (void)webd_upload_cleanup_expired(now, NULL, NULL, 0);
+
     if (!owner_id_ok(owner_id)) {
         upload_err(err, err_len, "bad_owner_id");
         return -1;
@@ -633,6 +785,10 @@ int webd_upload_begin(const char *owner_id, const char *origin,
     rootfd = open_root(err, err_len);
     if (rootfd < 0) return -1;
 
+    if (upload_capacity(upload_type, expected_size_bytes, 0, err, err_len) != 0) {
+        close(rootfd);
+        return -1;
+    }
     meta_init_empty(&m);
     for (int tries = 0; tries < 8; tries++) {
         if (gen_upload_id(m.upload_id) != 0) {
@@ -756,6 +912,10 @@ int webd_upload_append(const char *owner_id, const char *upload_id,
         upload_err(err, err_len, "size_limit_exceeded");
         goto fail;
     }
+    if (upload_capacity(m.upload_type,
+                        m.expected_size_bytes ? m.expected_size_bytes : offset + chunk_len,
+                        offset, err, err_len) != 0)
+        goto fail;
     for (size_t done = 0; done < chunk_len; done += (size_t)wrote) {
         wrote = write(fd, (const char *)chunk + done, chunk_len - done);
         if (wrote < 0 && errno == EINTR) { wrote = 0; continue; }
@@ -866,18 +1026,118 @@ int webd_upload_get(const char *owner_id, const char *upload_id,
     return rc;
 }
 
+static int unlink_upload_file_at(int dirfd, const char *name)
+{
+    if (unlinkat(dirfd, name, 0) == 0 || errno == ENOENT)
+        return 0;
+    return -1;
+}
+
+static int webd_upload_remove_locked(int rootfd, int dirfd, int lockfd,
+                                     const char *gc_id,
+                                     char *err, size_t err_len)
+{
+    int rc = 0;
+
+    if (unlink_upload_file_at(dirfd, UPLOAD_DATA_NAME) != 0 ||
+        unlink_upload_file_at(dirfd, UPLOAD_META_NAME) != 0 ||
+        unlink_upload_file_at(dirfd, UPLOAD_META_TMP) != 0)
+        rc = -1;
+    (void)fsync(dirfd);
+    if (unlink_upload_file_at(dirfd, UPLOAD_LOCK_NAME) != 0)
+        rc = -1;
+    close(lockfd);
+    close(dirfd);
+    if (rc == 0 && unlinkat(rootfd, gc_id, AT_REMOVEDIR) != 0 && errno != ENOENT)
+        rc = -1;
+    (void)fsync(rootfd);
+    if (rc != 0)
+        upload_err(err, err_len, "delete_failed");
+    return rc;
+}
+
+static int webd_upload_recover_gc_at(int rootfd, const char *gc_id,
+                                     int nonblocking,
+                                     char *err, size_t err_len)
+{
+    int dirfd;
+    int lockfd;
+
+    if (!upload_gc_id_ok(gc_id)) {
+        upload_err(err, err_len, "bad_upload_id");
+        return -1;
+    }
+    dirfd = openat(rootfd, gc_id,
+                   O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+    if (dirfd < 0) {
+        if (errno == ENOENT)
+            return 0;
+        upload_err(err, err_len, "upload_not_found");
+        return -1;
+    }
+    lockfd = nonblocking ? try_lock_upload_dir(dirfd) :
+                           lock_upload_dir(dirfd, err, err_len);
+    if (lockfd < 0) {
+        close(dirfd);
+        if (nonblocking && (errno == EWOULDBLOCK || errno == EAGAIN))
+            return 1;
+        upload_err(err, err_len, "lock_failed");
+        return -1;
+    }
+    return webd_upload_remove_locked(rootfd, dirfd, lockfd, gc_id,
+                                     err, err_len);
+}
+
 static int webd_upload_delete_internal(const char *owner_id, int enforce_owner,
-                                       const char *upload_id,
+                                       const char *upload_id, int nonblocking,
+                                       int missing_ok, int *deleted,
                                        char *err, size_t err_len)
 {
     int rootfd = open_root(err, err_len);
-    int dirfd, lockfd;
+    int dirfd;
+    int lockfd;
+    int rc;
+    char gc_id[WEBD_UPLOAD_ID_LEN + 1];
     struct webd_upload_meta m;
-    if (rootfd < 0) return -1;
+
+    if (err && err_len)
+        err[0] = '\0';
+    if (deleted)
+        *deleted = 0;
+    if (rootfd < 0)
+        return -1;
+    if (!upload_id_ok(upload_id)) {
+        close(rootfd);
+        upload_err(err, err_len, "bad_upload_id");
+        return -1;
+    }
+    upload_gc_id(upload_id, gc_id);
     dirfd = open_upload_dir_at(rootfd, upload_id, err, err_len);
-    if (dirfd < 0) { close(rootfd); return -1; }
-    lockfd = lock_upload_dir(dirfd, err, err_len);
-    if (lockfd < 0) { close(dirfd); close(rootfd); return -1; }
+    if (dirfd < 0) {
+        if (missing_ok) {
+            rc = webd_upload_recover_gc_at(rootfd, gc_id, nonblocking,
+                                           err, err_len);
+            close(rootfd);
+            if (rc == 0) {
+                if (err && err_len)
+                    err[0] = '\0';
+                return 0;
+            }
+            return rc;
+        }
+        close(rootfd);
+        return -1;
+    }
+    lockfd = nonblocking ? try_lock_upload_dir(dirfd) :
+                           lock_upload_dir(dirfd, err, err_len);
+    if (lockfd < 0) {
+        close(dirfd);
+        close(rootfd);
+        if (nonblocking && (errno == EWOULDBLOCK || errno == EAGAIN))
+            return 1;
+        upload_err(err, err_len, "lock_failed");
+        return -1;
+    }
     if (meta_read_at(dirfd, &m, err, err_len) != 0 ||
         (enforce_owner && (!owner_id_ok(owner_id) || strcmp(m.owner_id, owner_id)))) {
         if (enforce_owner)
@@ -887,27 +1147,37 @@ static int webd_upload_delete_internal(const char *owner_id, int enforce_owner,
         close(rootfd);
         return -1;
     }
-    unlinkat(dirfd, UPLOAD_DATA_NAME, 0);
-    unlinkat(dirfd, UPLOAD_META_NAME, 0);
-    unlinkat(dirfd, UPLOAD_META_TMP, 0);
-    (void)fsync(dirfd);
-    close(lockfd);
-    unlinkat(dirfd, UPLOAD_LOCK_NAME, 0);
-    close(dirfd);
-    if (unlinkat(rootfd, upload_id, AT_REMOVEDIR) != 0) {
+
+    if (renameat(rootfd, upload_id, rootfd, gc_id) != 0) {
+        int saved = errno;
+        close(lockfd);
+        close(dirfd);
         close(rootfd);
-        upload_err(err, err_len, "delete_failed");
+        errno = saved;
+        upload_err(err, err_len, "delete_stage_failed");
         return -1;
     }
     (void)fsync(rootfd);
+    if (deleted)
+        *deleted = 1;
+    rc = webd_upload_remove_locked(rootfd, dirfd, lockfd, gc_id,
+                                   err, err_len);
     close(rootfd);
-    return 0;
+    return rc;
 }
 
 int webd_upload_delete(const char *owner_id, const char *upload_id,
                        char *err, size_t err_len)
 {
-    return webd_upload_delete_internal(owner_id, 1, upload_id, err, err_len);
+    return webd_upload_delete_internal(owner_id, 1, upload_id, 0, 0, NULL,
+                                       err, err_len);
+}
+
+int webd_upload_delete_privileged(const char *upload_id, int *deleted,
+                                  char *err, size_t err_len)
+{
+    return webd_upload_delete_internal(NULL, 0, upload_id, 0, 1, deleted,
+                                       err, err_len);
 }
 
 int webd_upload_list_all(struct webd_upload_list *out, char *err, size_t err_len)
@@ -995,20 +1265,123 @@ int webd_upload_list_owner(const char *owner_id, struct webd_upload_list *out,
 
 int webd_upload_cleanup_expired(time_t now, size_t *deleted_count, char *err, size_t err_len)
 {
-    struct webd_upload_list list;
+    struct {
+        char name[WEBD_UPLOAD_ID_LEN + 1];
+        int gc;
+    } entries[WEBD_UPLOAD_META_SCAN_LIMIT];
+    int rootfd;
+    int scanfd;
+    DIR *dir;
+    struct dirent *de;
+    size_t count = 0;
     size_t deleted = 0;
-    if (webd_upload_list_all(&list, err, err_len) != 0)
+    size_t busy = 0;
+    size_t failed = 0;
+    size_t recovered = 0;
+
+    memset(&g_cleanup_status, 0, sizeof(g_cleanup_status));
+    g_cleanup_status.last_run_at = now;
+    rootfd = open_root(err, err_len);
+    if (rootfd < 0) {
+        snprintf(g_cleanup_status.last_error,
+                 sizeof(g_cleanup_status.last_error), "%s",
+                 err && err[0] ? err : "root_unavailable");
         return -1;
-    for (size_t i = 0; i < list.count; i++) {
-        if (list.items[i].expires_at <= now) {
-            if (webd_upload_delete_internal(NULL, 0, list.items[i].upload_id,
-                                            NULL, 0) == 0)
-                deleted++;
+    }
+    scanfd = dup(rootfd);
+    if (scanfd < 0 || !(dir = fdopendir(scanfd))) {
+        if (scanfd >= 0)
+            close(scanfd);
+        close(rootfd);
+        upload_err(err, err_len, "list_failed");
+        snprintf(g_cleanup_status.last_error,
+                 sizeof(g_cleanup_status.last_error), "list_failed");
+        return -1;
+    }
+    while ((de = readdir(dir)) != NULL && count < WEBD_UPLOAD_META_SCAN_LIMIT) {
+        int is_gc = upload_gc_id_ok(de->d_name);
+        if (!is_gc && !upload_id_ok(de->d_name))
+            continue;
+        snprintf(entries[count].name, sizeof(entries[count].name), "%s",
+                 de->d_name);
+        entries[count].gc = is_gc;
+        count++;
+    }
+    closedir(dir);
+
+    for (size_t i = 0; i < count; i++) {
+        int rc;
+        if (entries[i].gc) {
+            rc = webd_upload_recover_gc_at(rootfd, entries[i].name, 1,
+                                           NULL, 0);
+            if (rc == 0)
+                recovered++;
+            else if (rc == 1)
+                busy++;
+            else
+                failed++;
+            continue;
+        }
+        {
+            int dirfd = openat(rootfd, entries[i].name,
+                               O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW);
+            int lockfd;
+            struct webd_upload_meta meta;
+            if (dirfd < 0)
+                continue;
+            lockfd = try_lock_upload_dir(dirfd);
+            if (lockfd < 0) {
+                if (errno == EWOULDBLOCK || errno == EAGAIN)
+                    busy++;
+                else
+                    failed++;
+                close(dirfd);
+                continue;
+            }
+            rc = meta_read_at(dirfd, &meta, NULL, 0);
+            close(lockfd);
+            close(dirfd);
+            if (rc != 0) {
+                failed++;
+                continue;
+            }
+            if (meta.expires_at <= now) {
+                int was_deleted = 0;
+                rc = webd_upload_delete_internal(NULL, 0, entries[i].name,
+                                                 1, 1, &was_deleted,
+                                                 NULL, 0);
+                if (rc == 0 && was_deleted)
+                    deleted++;
+                else if (rc == 1)
+                    busy++;
+                else if (rc != 0)
+                    failed++;
+            }
         }
     }
-    webd_upload_list_free(&list);
+    g_cleanup_status.last_success_at = failed ? 0 : now;
+    g_cleanup_status.scanned_count = count;
+    g_cleanup_status.deleted_count = deleted;
+    g_cleanup_status.busy_count = busy;
+    g_cleanup_status.failed_count = failed;
+    g_cleanup_status.recovered_count = recovered;
+    if (failed)
+        snprintf(g_cleanup_status.last_error,
+                 sizeof(g_cleanup_status.last_error), "cleanup_partial_failure");
+    cleanup_status_persist_at(rootfd);
+    close(rootfd);
     if (deleted_count) *deleted_count = deleted;
+    if (failed) {
+        upload_err(err, err_len, "cleanup_partial_failure");
+        return -1;
+    }
     return 0;
+}
+
+void webd_upload_cleanup_status_get(struct webd_upload_cleanup_status *out)
+{
+    if (out)
+        *out = g_cleanup_status;
 }
 
 int webd_upload_open_final_readonly(const char *owner_id, const char *upload_id,

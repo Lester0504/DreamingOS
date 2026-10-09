@@ -12,7 +12,7 @@
 #define AP_CONTROL_ALPN_V2 "dreamingwrt-ap/2"
 #define AP_CONTROL_ALPN_V3 "dreamingwrt-ap/3"
 #define AP_CONTROL_PROTOCOL_V3 "ap-control.v3"
-#define AP_CONTROL_CAPABILITY_COUNT 6U
+#define AP_CONTROL_CAPABILITY_COUNT 7U
 /* Enrollment and activation remain on the stable v1 protocol. */
 #define AP_CONTROL_ALPN AP_CONTROL_ALPN_V1
 #define AP_CONTROL_FRAME_MAX (64U * 1024U)
@@ -36,6 +36,8 @@ struct ap_control_capabilities {
     int apply;
     int readback;
     int rollback;
+    int secret_executor;
+    int certificate_executor;
 };
 
 int ap_control_json_parse_strict(const unsigned char *data, size_t length,
@@ -63,6 +65,7 @@ int ap_control_json_get_string(struct json_object *object, const char *name,
 int ap_control_json_get_int64(struct json_object *object, const char *name,
                               int64_t minimum, int64_t maximum,
                               int64_t *out);
+void ap_control_json_scrub_string(struct json_object *object, const char *name);
 int ap_control_uuid4(char out[37]);
 int ap_control_capabilities_add(struct json_object *object,
                                 const struct ap_control_capabilities *caps);

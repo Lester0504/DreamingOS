@@ -29,6 +29,89 @@ static int aegisxd_handle_status(struct ubus_context *ctx, struct ubus_object *o
     return UBUS_STATUS_OK;
 }
 
+static int aegisxd_storage_reply(struct ubus_context *ctx,
+                                 struct ubus_request_data *req,
+                                 const char *phase, int ok, const char *reason)
+{
+    struct json_object *resp = json_object_new_object();
+
+    json_object_object_add(resp, "ok", json_object_new_boolean(ok));
+    aegisxd_json_add_string(resp, "use", "aegis");
+    aegisxd_json_add_string(resp, "phase", phase ? phase : "status");
+    aegisxd_json_add_string(resp, "reason", reason ? reason : "");
+    aegisxd_json_add_string(resp, "active_path", g_aegisxd_db_path);
+    aegisxd_json_add_string(resp, "db_path", g_aegisxd_db_path);
+    json_object_object_add(resp, "frozen", json_object_new_boolean(g_aegisxd_storage_frozen));
+    json_object_object_add(resp, "control_db_migrated", json_object_new_boolean(0));
+    json_object_object_add(resp, "lifecycle_ready", json_object_new_boolean(
+        g_aegisxd_db && sqlite3_db_filename(g_aegisxd_db, "main") &&
+        !strcmp(sqlite3_db_filename(g_aegisxd_db, "main"), g_aegisxd_db_path)));
+    aegisxd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
+static int aegisxd_handle_storage_freeze(struct ubus_context *ctx,
+                                         struct ubus_object *obj,
+                                         struct ubus_request_data *req,
+                                         const char *method,
+                                         struct blob_attr *msg)
+{
+    int rc;
+
+    (void)obj; (void)method; (void)msg;
+    rc = aegisxd_storage_freeze();
+    return aegisxd_storage_reply(ctx, req, "freeze", rc == 0,
+                                 rc == 0 ? "frozen" :
+                                 (aegisxd_job_running_count() > 0 ?
+                                  "feed_job_running" : "freeze_failed"));
+}
+
+static int aegisxd_handle_storage_unfreeze(struct ubus_context *ctx,
+                                           struct ubus_object *obj,
+                                           struct ubus_request_data *req,
+                                           const char *method,
+                                           struct blob_attr *msg)
+{
+    int rc;
+
+    (void)obj; (void)method; (void)msg;
+    rc = aegisxd_storage_unfreeze();
+    return aegisxd_storage_reply(ctx, req, "unfreeze", rc == 0,
+                                 rc == 0 ? "ready" : "unfreeze_failed");
+}
+
+static int aegisxd_handle_storage_reopen(struct ubus_context *ctx,
+                                         struct ubus_object *obj,
+                                         struct ubus_request_data *req,
+                                         const char *method,
+                                         struct blob_attr *msg)
+{
+    struct json_object *body = aegisxd_json_from_blob(msg);
+    struct json_object *payload = aegisxd_payload_or_self(body);
+    const char *new_path = aegisxd_json_str(payload, "new_path", "");
+    int rc = aegisxd_db_reopen_path(new_path);
+
+    (void)obj; (void)method;
+    json_object_put(body);
+    return aegisxd_storage_reply(ctx, req, "reopen", rc == 0,
+                                 rc == 0 ? "reopened" : "reopen_failed");
+}
+
+static int aegisxd_handle_storage_status(struct ubus_context *ctx,
+                                         struct ubus_object *obj,
+                                         struct ubus_request_data *req,
+                                         const char *method,
+                                         struct blob_attr *msg)
+{
+    int ready = g_aegisxd_db && sqlite3_db_filename(g_aegisxd_db, "main") &&
+                !strcmp(sqlite3_db_filename(g_aegisxd_db, "main"), g_aegisxd_db_path);
+
+    (void)obj; (void)method; (void)msg;
+    return aegisxd_storage_reply(ctx, req, "status", ready,
+                                 g_aegisxd_storage_frozen ? "frozen" : "ready");
+}
+
 static int aegisxd_handle_feeds(struct ubus_context *ctx, struct ubus_object *obj,
                                 struct ubus_request_data *req, const char *method,
                                 struct blob_attr *msg)
@@ -694,8 +777,23 @@ static const struct blobmsg_policy aegisxd_any_policy[] = {
     { .name = "payload", .type = BLOBMSG_TYPE_UNSPEC },
 };
 
+static int aegisxd_handle_ad_dns(struct ubus_context *ctx, struct ubus_object *obj,
+                                struct ubus_request_data *req, const char *method,
+                                struct blob_attr *msg)
+{
+    (void)obj; (void)method;
+    struct json_object *body=aegisxd_json_from_blob(msg);
+    struct json_object *resp=aegisxd_ad_dns_json(aegisxd_payload_or_self(body));
+    aegisxd_send_json(ctx,req,resp);json_object_put(resp);json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
 static const struct ubus_method aegisxd_methods[] = {
     UBUS_METHOD("status", aegisxd_handle_status, aegisxd_any_policy),
+    UBUS_METHOD("storage_freeze", aegisxd_handle_storage_freeze, aegisxd_any_policy),
+    UBUS_METHOD("storage_reopen", aegisxd_handle_storage_reopen, aegisxd_any_policy),
+    UBUS_METHOD("storage_unfreeze", aegisxd_handle_storage_unfreeze, aegisxd_any_policy),
+    UBUS_METHOD("storage_lifecycle_status", aegisxd_handle_storage_status, aegisxd_any_policy),
     UBUS_METHOD("feeds", aegisxd_handle_feeds, aegisxd_any_policy),
     UBUS_METHOD("feed_status", aegisxd_handle_feed_status, aegisxd_any_policy),
     UBUS_METHOD("feed_update_status", aegisxd_handle_feed_status, aegisxd_any_policy),
@@ -745,6 +843,7 @@ static const struct ubus_method aegisxd_methods[] = {
     UBUS_METHOD("certificate_distributions", aegisxd_handle_certificate_distributions, aegisxd_any_policy),
     UBUS_METHOD("certificate_distribution_create", aegisxd_handle_certificate_distribution_create, aegisxd_any_policy),
     UBUS_METHOD("certificate_distribution_get", aegisxd_handle_certificate_distribution_get, aegisxd_any_policy),
+    UBUS_METHOD("ad_dns", aegisxd_handle_ad_dns, aegisxd_any_policy),
     UBUS_METHOD("domain_overrides", aegisxd_handle_domain_overrides, aegisxd_any_policy),
     UBUS_METHOD("add_domain_override", aegisxd_handle_domain_override_set, aegisxd_any_policy),
     UBUS_METHOD("remove_domain_override", aegisxd_handle_domain_override_delete, aegisxd_any_policy),

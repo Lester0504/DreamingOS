@@ -385,3 +385,65 @@ const char *jmx_uci_value_sanitize(const char *s, char *buf, size_t buf_len)
     buf[out] = '\0';
     return buf;
 }
+
+/*
+ * jmx_iface_is_lan - topology-based LAN-side detection.
+ *
+ * Returns 1 when ifname belongs to the LAN side of the network.  The check
+ * is based on actual bridge membership (/sys/class/net/<if>/master) rather
+ * than interface name prefixes, so it works correctly on boards where all
+ * physical ports are named ethN (e.g. BPI-R4 after the netdev rename).
+ *
+ * The br- prefix is retained as a device-type shortcut: a bridge interface
+ * is LAN-side unless its name explicitly marks it as WAN or Docker.
+ */
+int jmx_iface_is_lan(const char *ifname)
+{
+    char path[256];
+    char target[256];
+    ssize_t len;
+    const char *base;
+
+    if (!ifname || !ifname[0])
+        return 0;
+
+    /* Bridge device type: br- prefix means it is a bridge itself.
+     * Exclude known non-LAN bridges by name. */
+    if (!strncmp(ifname, "br-", 3)) {
+        if (!strncmp(ifname, "br-wan", 6) || !strncmp(ifname, "br-docker", 9))
+            return 0;
+        return 1;
+    }
+
+    /* Exclude known WAN / container interface names */
+    if (!strncmp(ifname, "wan", 3) || !strncmp(ifname, "wwan", 4) ||
+        !strncmp(ifname, "docker", 6))
+        return 0;
+
+    /* Topology check: read the master bridge symlink.  If this interface is
+     * enslaved to br-lan (or any other br- bridge that is not br-wan/br-docker),
+     * it is LAN-side. */
+    if ((size_t)snprintf(path, sizeof(path), "/sys/class/net/%s/master", ifname)
+        >= sizeof(path))
+        return 0;
+
+    len = readlink(path, target, sizeof(target) - 1);
+    if (len <= 0)
+        return 0;
+    target[len] = 0;
+
+    base = strrchr(target, '/');
+    if (!base)
+        return 0;
+    base++;
+
+    if (!strncmp(base, "br-lan", 6))
+        return 1;
+    /* Any other br- bridge that is not wan/docker is also LAN-side
+     * (covers br-guest, br-iot, etc.) */
+    if (!strncmp(base, "br-", 3) &&
+        strncmp(base, "br-wan", 6) && strncmp(base, "br-docker", 9))
+        return 1;
+
+    return 0;
+}

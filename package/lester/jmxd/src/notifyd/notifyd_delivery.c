@@ -36,7 +36,8 @@ static int notifyd_load_outbox_item(const char *id, struct notifyd_outbox_item *
     }
     memset(item, 0, sizeof(*item));
     st = notifyd_prepare(
-        "SELECT id,channel_id,payload_json,attempts,max_attempts "
+        "SELECT id,channel_id,payload_json,attempts,max_attempts,"
+        "delivery_options_json,action_index "
         "FROM notify_outbox WHERE id=?1");
     if (!st) {
         notifyd_error_set(error, error_len, "outbox_query_failed");
@@ -53,6 +54,9 @@ static int notifyd_load_outbox_item(const char *id, struct notifyd_outbox_item *
                  sqlite3_column_text(st, 2) ? (const char *)sqlite3_column_text(st, 2) : "{}");
         item->attempts = sqlite3_column_int(st, 3);
         item->max_attempts = sqlite3_column_int(st, 4);
+        snprintf(item->delivery_options_json, sizeof(item->delivery_options_json), "%s",
+                 sqlite3_column_text(st, 5) ? (const char *)sqlite3_column_text(st, 5) : "{}");
+        item->action_index = sqlite3_column_int(st, 6);
         if (item->max_attempts < 1)
             item->max_attempts = 1;
         found = 1;
@@ -247,19 +251,16 @@ static char *notifyd_relay_ingest_body(const struct notifyd_outbox_item *item,
         json_object_new_string(notifyd_json_str(payload, "source", "")));
     json_object_object_add(body, "title",
         json_object_new_string(notifyd_json_str(payload, "title", "")));
-    /* The native payload has no body field; only 6 keys are always present
-     * (id, severity, category, event, source, title).  Fall back through the
-     * optional text carriers and finally to the title so the relay never gets
-     * an empty body, which it would render as a blank notification. */
+    /* Default rendering always sets message. Diagnostic detail_json is
+     * intentionally excluded: exposing a serialized JSON object as the user
+     * body confuses technical evidence with the notification description. */
     detail_body = notifyd_json_str(payload, "body",
                        notifyd_json_str(payload, "message",
-                           notifyd_json_str(payload, "detail_json",
-                               notifyd_json_str(payload, "title", ""))));
+                           notifyd_json_str(payload, "title", "")));
     json_object_object_add(body, "body", json_object_new_string(detail_body));
     json_object_object_add(body, "body_source",
         json_object_new_string(notifyd_json_str(payload, "body", "")[0] ? "body" :
-            (notifyd_json_str(payload, "message", "")[0] ? "message" :
-                (notifyd_json_str(payload, "detail_json", "")[0] ? "detail_json" : "title"))));
+            (notifyd_json_str(payload, "message", "")[0] ? "message" : "title")));
     json_object_object_add(body, "dedupe_key",
         json_object_new_string(notifyd_json_str(payload, "dedupe_key", "")));
     json_object_object_add(body, "ts",
@@ -416,9 +417,72 @@ static void notifyd_mail_resolution_warning(char *warning, size_t warning_len,
         snprintf(warning + used, warning_len - used, "%s:%d", code, index);
 }
 
+/*
+ * A recipient this delivery must skip because the user silenced it. Returns 1
+ * when the address was dropped, and bumps the suppressed tally so the caller
+ * can tell "nobody wanted this" apart from "nobody could be resolved".
+ */
+static int notifyd_mail_mute_skip(const char *username, const char *channel_id,
+                                  int *suppressed_out)
+{
+    if (!username || !username[0])
+        return 0;
+    if (!notifyd_user_mute_active(username, channel_id))
+        return 0;
+    if (suppressed_out)
+        (*suppressed_out)++;
+    return 1;
+}
+
+/*
+ * Reverse-resolve a bare address to a single account so an explicitly listed
+ * email still honours that user's mute. Deliberately conservative: a shared
+ * mailbox or alias that several enabled accounts claim resolves to nobody,
+ * because muting one of them must not silence the others.
+ */
+static int notifyd_mail_unique_user_for_email(const char *email, char *out,
+                                              size_t out_len)
+{
+    sqlite3_stmt *st;
+    int matches = 0;
+
+    if (out && out_len) out[0] = '\0';
+    if (!email || !email[0] || !out || out_len == 0)
+        return 0;
+    st = notifyd_config_prepare(
+        "SELECT username FROM web_users WHERE status='enabled' "
+        "AND lower(email)=lower(?1) LIMIT 2");
+    if (!st)
+        return 0;
+    sqlite3_bind_text(st, 1, email, -1, SQLITE_TRANSIENT);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        if (++matches > 1)
+            break;
+        snprintf(out, out_len, "%s", notifyd_sqlite_text(st, 0, ""));
+    }
+    sqlite3_finalize(st);
+    if (matches != 1) {
+        out[0] = '\0';
+        return 0;
+    }
+    return out[0] != '\0';
+}
+
+static int notifyd_mail_email_mute_skip(const char *email, const char *channel_id,
+                                        int *suppressed_out)
+{
+    char username[128];
+
+    if (!notifyd_mail_unique_user_for_email(email, username, sizeof(username)))
+        return 0;
+    return notifyd_mail_mute_skip(username, channel_id, suppressed_out);
+}
+
 static int notifyd_mail_resolve_recipients(struct json_object *options,
                                            char recipients[][256], int *count,
-                                           char *warning, size_t warning_len)
+                                           char *warning, size_t warning_len,
+                                           const char *channel_id,
+                                           int *suppressed_out)
 {
     struct json_object *users = NULL, *extra = NULL;
     int i;
@@ -437,6 +501,10 @@ static int notifyd_mail_resolve_recipients(struct json_object *options,
                 notifyd_mail_resolution_warning(warning, warning_len, "directory_error", i);
                 continue;
             }
+            if (notifyd_mail_mute_skip(username, channel_id, suppressed_out)) {
+                sqlite3_finalize(st);
+                continue;
+            }
             sqlite3_bind_text(st, 1, username ? username : "", -1, SQLITE_TRANSIENT);
             if (sqlite3_step(st) == SQLITE_ROW)
                 email = notifyd_sqlite_text(st, 0, "");
@@ -451,10 +519,148 @@ static int notifyd_mail_resolve_recipients(struct json_object *options,
         json_object_is_type(extra, json_type_array)) {
         for (i = 0; i < (int)json_object_array_length(extra) && *count < 64; i++) {
             const char *email = json_object_get_string(json_object_array_get_idx(extra, i));
+            if (notifyd_mail_email_mute_skip(email, channel_id, suppressed_out))
+                continue;
             if (!notifyd_mail_recipient_add(recipients, count, email))
                 notifyd_mail_resolution_warning(warning, warning_len, "recipient_invalid", i);
         }
     }
+    return *count > 0;
+}
+
+static void notifyd_mail_resolve_user_ids(struct json_object *users,
+                                          char recipients[][256], int *count,
+                                          char *warning, size_t warning_len,
+                                          const char *channel_id,
+                                          int *suppressed_out)
+{
+    int i;
+
+    if (!users || !json_object_is_type(users, json_type_array))
+        return;
+    for (i = 0; i < (int)json_object_array_length(users) && *count < 64; i++) {
+        const char *username = json_object_get_string(json_object_array_get_idx(users, i));
+        sqlite3_stmt *st;
+        const char *status = "";
+        const char *email = "";
+
+        if (notifyd_mail_mute_skip(username, channel_id, suppressed_out))
+            continue;
+        st = notifyd_config_prepare(
+            "SELECT status,email FROM web_users WHERE username=?1");
+        if (!st) {
+            notifyd_mail_resolution_warning(warning, warning_len, "directory_error", i);
+            continue;
+        }
+        sqlite3_bind_text(st, 1, username ? username : "", -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) != SQLITE_ROW) {
+            notifyd_mail_resolution_warning(warning, warning_len, "user_missing", i);
+            sqlite3_finalize(st);
+            continue;
+        }
+        status = notifyd_sqlite_text(st, 0, "");
+        email = notifyd_sqlite_text(st, 1, "");
+        if (strcmp(status, "enabled"))
+            notifyd_mail_resolution_warning(warning, warning_len, "user_disabled", i);
+        else if (!email[0])
+            notifyd_mail_resolution_warning(warning, warning_len, "user_email_missing", i);
+        else if (!notifyd_mail_recipient_add(recipients, count, email))
+            notifyd_mail_resolution_warning(warning, warning_len, "user_email_invalid", i);
+        sqlite3_finalize(st);
+    }
+}
+
+static void notifyd_mail_resolve_admins(char recipients[][256], int *count,
+                                        char *warning, size_t warning_len,
+                                        const char *channel_id,
+                                        int *suppressed_out)
+{
+    sqlite3_stmt *st = notifyd_config_prepare(
+        "SELECT email,username FROM web_users WHERE status='enabled' "
+        "AND role IN ('owner','admin') ORDER BY username");
+    int index = 0;
+    int rc = SQLITE_DONE;
+
+    if (!st) {
+        notifyd_mail_resolution_warning(warning, warning_len, "directory_error", -1);
+        return;
+    }
+    while (*count < 64 && (rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *email = notifyd_sqlite_text(st, 0, "");
+        const char *username = notifyd_sqlite_text(st, 1, "");
+
+        if (notifyd_mail_mute_skip(username, channel_id, suppressed_out)) {
+            index++;
+            continue;
+        }
+        if (!email[0])
+            notifyd_mail_resolution_warning(warning, warning_len,
+                                             "admin_email_missing", index);
+        else if (!notifyd_mail_recipient_add(recipients, count, email))
+            notifyd_mail_resolution_warning(warning, warning_len,
+                                             "admin_email_invalid", index);
+        index++;
+    }
+    if (rc != SQLITE_DONE && *count < 64)
+        notifyd_mail_resolution_warning(warning, warning_len, "directory_error", index);
+    sqlite3_finalize(st);
+}
+
+static int notifyd_mail_resolve_route_recipients(
+    const struct notifyd_outbox_item *item, struct json_object *channel_options,
+    char recipients[][256], int *count, char *warning, size_t warning_len,
+    int *suppressed_out)
+{
+    struct json_object *delivery_options;
+    struct json_object *receivers = NULL;
+    struct json_object *items = NULL;
+    const char *mode = "channel";
+    const char *channel_id = item ? item->channel_id : "";
+    int i;
+
+    *count = 0;
+    if (suppressed_out)
+        *suppressed_out = 0;
+    if (warning && warning_len)
+        warning[0] = '\0';
+    delivery_options = notifyd_json_parse_or_object(item->delivery_options_json);
+    if (delivery_options &&
+        json_object_object_get_ex(delivery_options, "receivers", &receivers) &&
+        receivers && json_object_is_type(receivers, json_type_object))
+        mode = notifyd_json_str(receivers, "mode", "channel");
+
+    if (!strcmp(mode, "channel")) {
+        int ok = notifyd_mail_resolve_recipients(channel_options, recipients, count,
+                                                 warning, warning_len, channel_id,
+                                                 suppressed_out);
+        json_object_put(delivery_options);
+        return ok;
+    }
+    if (!strcmp(mode, "admins")) {
+        notifyd_mail_resolve_admins(recipients, count, warning, warning_len,
+                                    channel_id, suppressed_out);
+    } else if (!strcmp(mode, "users")) {
+        if (json_object_object_get_ex(receivers, "user_ids", &items))
+            notifyd_mail_resolve_user_ids(items, recipients, count,
+                                          warning, warning_len, channel_id,
+                                          suppressed_out);
+    } else if (!strcmp(mode, "emails")) {
+        if (json_object_object_get_ex(receivers, "recipients", &items) && items &&
+            json_object_is_type(items, json_type_array)) {
+            for (i = 0; i < (int)json_object_array_length(items) && *count < 64; i++) {
+                const char *email = json_object_get_string(json_object_array_get_idx(items, i));
+                if (notifyd_mail_email_mute_skip(email, channel_id, suppressed_out))
+                    continue;
+                if (!notifyd_mail_recipient_add(recipients, count, email))
+                    notifyd_mail_resolution_warning(warning, warning_len,
+                                                     "recipient_invalid", i);
+            }
+        }
+    } else {
+        notifyd_mail_resolution_warning(warning, warning_len,
+                                         "receiver_mode_invalid", item->action_index);
+    }
+    json_object_put(delivery_options);
     return *count > 0;
 }
 
@@ -782,7 +988,8 @@ fail:
 
 static int notifyd_deliver_email(const struct notifyd_outbox_item *item,
                                  const struct notifyd_channel *channel,
-                                 long *http_status, char *error, size_t error_len)
+                                 long *http_status, char *error, size_t error_len,
+                                 int *suppressed_out)
 {
     struct notifyd_settings settings;
     struct json_object *options = notifyd_json_parse_or_object(channel->options_json);
@@ -795,14 +1002,16 @@ static int notifyd_deliver_email(const struct notifyd_outbox_item *item,
     const char *category = notifyd_json_str(payload, "category", "");
     char recipients[64][256];
     int recipient_count = 0;
+    int suppressed = 0;
     char warning[256] = "";
     char safe_prefix[128], safe_title[256], safe_severity[32], safe_category[128];
     char *mail = NULL;
     size_t mail_len;
-    int ok = 0;
+    int outcome = NOTIFYD_DELIVERY_FAILED;
 
     memset(&settings, 0, sizeof(settings));
     if (http_status) *http_status = 0;
+    if (suppressed_out) *suppressed_out = 0;
     if (notifyd_settings_load(&settings) != 0) {
         notifyd_error_set(error, error_len, "smtp_settings_unavailable");
         goto done;
@@ -819,9 +1028,22 @@ static int notifyd_deliver_email(const struct notifyd_outbox_item *item,
         notifyd_error_set(error, error_len, "email_reply_to_invalid");
         goto done;
     }
-    if (!notifyd_mail_resolve_recipients(options, recipients, &recipient_count,
-                                         warning, sizeof(warning))) {
-        notifyd_error_set(error, error_len, warning[0] ? warning : "no_valid_recipients");
+    if (!notifyd_mail_resolve_route_recipients(item, options, recipients,
+                                               &recipient_count, warning,
+                                               sizeof(warning), &suppressed)) {
+        /*
+         * Everyone this event would have reached has silenced it. That is the
+         * outcome the user asked for, not a resolution failure, so it must not
+         * be reported as `no_valid_recipients` and retried.
+         */
+        if (suppressed > 0 && !warning[0]) {
+            outcome = NOTIFYD_DELIVERY_SUPPRESSED;
+            snprintf(error, error_len, "preference_suppressed_all_recipients:%d",
+                     suppressed);
+        } else {
+            notifyd_error_set(error, error_len,
+                              warning[0] ? warning : "no_valid_recipients");
+        }
         goto done;
     }
     notifyd_mail_header_text(prefix, safe_prefix, sizeof(safe_prefix));
@@ -846,9 +1068,10 @@ static int notifyd_deliver_email(const struct notifyd_outbox_item *item,
              settings.smtp_from, safe_prefix, safe_title, safe_severity, safe_category,
              reply_to[0] ? "Reply-To: <" : "", reply_to[0] ? reply_to : "", reply_to[0] ? ">\r\n" : "",
              message);
-    ok = notifyd_smtp_send_native(&settings, recipients, recipient_count,
-                                  mail, error, error_len);
-    if (ok && warning[0])
+    outcome = notifyd_smtp_send_native(&settings, recipients, recipient_count,
+                                       mail, error, error_len) ?
+                  NOTIFYD_DELIVERY_OK : NOTIFYD_DELIVERY_FAILED;
+    if (outcome == NOTIFYD_DELIVERY_OK && warning[0])
         snprintf(error, error_len, "delivered_with_resolution_warning:%.200s", warning);
 done:
     if (settings.smtp_password[0])
@@ -856,30 +1079,41 @@ done:
     free(mail);
     json_object_put(options);
     json_object_put(payload);
-    return ok;
+    if (suppressed_out) *suppressed_out = suppressed;
+    return outcome;
 }
 
 static int notifyd_deliver_channel(const struct notifyd_outbox_item *item,
-                                   long *http_status, char *error, size_t error_len)
+                                   long *http_status, char *error, size_t error_len,
+                                   int *suppressed_out)
 {
     struct notifyd_channel channel;
 
+    if (suppressed_out) *suppressed_out = 0;
     if (!notifyd_channel_get(item->channel_id, &channel)) {
         notifyd_error_set(error, error_len, "channel_not_found");
-        return 0;
+        return NOTIFYD_DELIVERY_FAILED;
     }
     if (!channel.enabled) {
         notifyd_error_set(error, error_len, "channel_disabled");
-        return 0;
+        return NOTIFYD_DELIVERY_FAILED;
     }
+    /*
+     * Only email carries a per-user destination. webhook and noop point at one
+     * shared endpoint, so honouring one user's mute there would silence the
+     * channel for everybody -- see the handoff's channel-scope note.
+     */
     if (!strcmp(channel.type, "noop"))
-        return notifyd_deliver_noop(item, &channel, http_status, error, error_len);
+        return notifyd_deliver_noop(item, &channel, http_status, error, error_len) ?
+                   NOTIFYD_DELIVERY_OK : NOTIFYD_DELIVERY_FAILED;
     if (!strcmp(channel.type, "webhook"))
-        return notifyd_deliver_webhook(item, &channel, http_status, error, error_len);
+        return notifyd_deliver_webhook(item, &channel, http_status, error, error_len) ?
+                   NOTIFYD_DELIVERY_OK : NOTIFYD_DELIVERY_FAILED;
     if (!strcmp(channel.type, "email"))
-        return notifyd_deliver_email(item, &channel, http_status, error, error_len);
+        return notifyd_deliver_email(item, &channel, http_status, error, error_len,
+                                     suppressed_out);
     notifyd_error_set(error, error_len, "unsupported_channel_type");
-    return 0;
+    return NOTIFYD_DELIVERY_FAILED;
 }
 
 struct json_object *notifyd_deliver_one(const char *id)
@@ -889,7 +1123,9 @@ struct json_object *notifyd_deliver_one(const char *id)
     char error[256] = "";
     char state[32];
     long http_status = 0;
+    int outcome;
     int ok;
+    int suppressed_recipients = 0;
     int state_saved;
     struct timespec started, finished;
     int duration_ms = 0;
@@ -900,17 +1136,26 @@ struct json_object *notifyd_deliver_one(const char *id)
         return resp;
     }
     clock_gettime(CLOCK_MONOTONIC, &started);
-    ok = notifyd_deliver_channel(&item, &http_status, error, sizeof(error));
+    outcome = notifyd_deliver_channel(&item, &http_status, error, sizeof(error),
+                                      &suppressed_recipients);
     clock_gettime(CLOCK_MONOTONIC, &finished);
+    ok = outcome != NOTIFYD_DELIVERY_FAILED;
     duration_ms = (int)((finished.tv_sec - started.tv_sec) * 1000 +
                         (finished.tv_nsec - started.tv_nsec) / 1000000);
     if (duration_ms < 0) duration_ms = 0;
-    state_saved = notifyd_mark_delivery_result(&item, ok, http_status, error, duration_ms);
+    state_saved = notifyd_mark_delivery_result(&item, outcome, http_status, error,
+                                               duration_ms, suppressed_recipients);
     notifyd_delivery_state(item.id, state, sizeof(state));
     json_object_object_add(resp, "ok", json_object_new_boolean(ok && state_saved));
     json_object_object_add(resp, "id", json_object_new_string(item.id));
     json_object_object_add(resp, "channel_id", json_object_new_string(item.channel_id));
-    json_object_object_add(resp, "delivered", json_object_new_boolean(ok));
+    json_object_object_add(resp, "action_index", json_object_new_int(item.action_index));
+    json_object_object_add(resp, "delivered",
+                           json_object_new_boolean(outcome == NOTIFYD_DELIVERY_OK));
+    json_object_object_add(resp, "suppressed",
+                           json_object_new_boolean(outcome == NOTIFYD_DELIVERY_SUPPRESSED));
+    json_object_object_add(resp, "suppressed_recipients",
+                           json_object_new_int(suppressed_recipients));
     json_object_object_add(resp, "state_saved", json_object_new_boolean(state_saved));
     json_object_object_add(resp, "state", json_object_new_string(state));
     json_object_object_add(resp, "http_status", json_object_new_int((int)http_status));
@@ -919,8 +1164,10 @@ struct json_object *notifyd_deliver_one(const char *id)
         json_object_object_add(resp, "error", json_object_new_string("delivery_state_update_failed"));
         if (error[0])
             json_object_object_add(resp, "delivery_error", json_object_new_string(error));
-    } else if (error[0])
-        json_object_object_add(resp, "error", json_object_new_string(error));
+    } else if (error[0]) {
+        json_object_object_add(resp, ok ? "warning" : "error",
+                               json_object_new_string(error));
+    }
     return resp;
 }
 
@@ -931,7 +1178,7 @@ struct json_object *notifyd_deliver_due(struct json_object *body)
     struct json_object *items = json_object_new_array();
     char ids[NOTIFYD_MAX_DELIVER_PER_TICK][NOTIFYD_MAX_ID];
     int limit = notifyd_json_int(body, "limit", NOTIFYD_MAX_DELIVER_PER_TICK);
-    int delivered = 0, failed = 0, queued = 0, backend_failed = 0;
+    int delivered = 0, failed = 0, queued = 0, backend_failed = 0, suppressed = 0;
     int64_t now = notifyd_now_s();
     int count = 0;
     int i;
@@ -983,6 +1230,8 @@ struct json_object *notifyd_deliver_due(struct json_object *body)
         }
         if (!strcmp(state, "delivered"))
             delivered++;
+        else if (!strcmp(state, "suppressed"))
+            suppressed++;
         else if (!strcmp(state, "failed"))
             failed++;
         else
@@ -992,6 +1241,7 @@ struct json_object *notifyd_deliver_due(struct json_object *body)
     json_object_object_add(resp, "ok", json_object_new_boolean(backend_failed == 0));
     json_object_object_add(resp, "delivered", json_object_new_int(delivered));
     json_object_object_add(resp, "failed", json_object_new_int(failed));
+    json_object_object_add(resp, "suppressed", json_object_new_int(suppressed));
     json_object_object_add(resp, "queued", json_object_new_int(queued));
     json_object_object_add(resp, "backend_failed", json_object_new_int(backend_failed));
     if (backend_failed > 0)

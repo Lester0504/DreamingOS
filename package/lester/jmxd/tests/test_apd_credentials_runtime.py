@@ -39,7 +39,7 @@ def compile_fixture(output: Path) -> None:
     command = [
         os.environ.get("CC", "cc"), "-std=c11",
         "-D_DARWIN_C_SOURCE" if sys.platform == "darwin" else "-D_GNU_SOURCE",
-        "-Wall", "-Wextra", "-Werror", *flags, str(FIXTURE), "-lcrypto",
+        "-Wall", "-Wextra", "-Werror", *flags, "-I/opt/homebrew/opt/json-c/include", "-L/opt/homebrew/opt/json-c/lib", str(FIXTURE), str(ROOT / "src/apd/apd_bootstrap_write.c"), "-ljson-c", "-lcrypto",
         "-o", str(output),
     ]
     subprocess.run(command, check=True, capture_output=True, text=True)

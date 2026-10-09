@@ -234,6 +234,7 @@ static struct ac_config_job fixture_config_job = {
     .idempotency_key = "fixture.config.1",
     .candidate_digest = "sha256:cccccccccccccccccccccccccccccccc"
                         "cccccccccccccccccccccccccccccccc",
+    .operation = "apply",
 };
 static const char fixture_config_candidate[] =
     "{\"format\":\"uci-wireless-candidate.v1\",\"sections\":[]}";

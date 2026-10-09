@@ -159,7 +159,7 @@ static int aps_list_valid(struct json_object *root)
         !json_object_object_get_ex(item, "model", &value) ||
         strcmp(json_object_get_string(value), "Fixture AP 1") != 0 ||
         !json_object_object_get_ex(item, "override_supported", &value) ||
-        json_object_get_boolean(value) ||
+        !json_object_get_boolean(value) ||
         !json_object_object_get_ex(item, "capabilities", &capabilities) ||
         !json_object_object_get_ex(capabilities, "remote_telemetry", &value) ||
         !json_object_get_boolean(value) ||

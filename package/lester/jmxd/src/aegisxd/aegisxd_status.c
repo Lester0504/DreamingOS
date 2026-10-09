@@ -862,7 +862,7 @@ static struct json_object *aegisxd_paths_json(void)
     struct json_object *paths = json_object_new_object();
 
     aegisxd_json_add_string(paths, "config_db", AEGISXD_CONFIG_DB_PATH);
-    aegisxd_json_add_string(paths, "aegis_db", AEGISXD_DB_PATH);
+    aegisxd_json_add_string(paths, "aegis_db", g_aegisxd_db_path);
     aegisxd_json_add_string(paths, "runtime_dir", AEGISXD_RUNTIME_DIR);
     aegisxd_json_add_string(paths, "work_dir", AEGISXD_WORK_DIR);
     aegisxd_json_add_string(paths, "feed_dir", AEGISXD_FEED_DIR);
@@ -1014,6 +1014,12 @@ struct json_object *aegisxd_status_json(void)
     aegisxd_json_add_string(resp, "migration_state",
                             schema_version == AEGISXD_SCHEMA_VERSION ? "current" :
                             (schema_version > 0 ? "version_mismatch" : "unknown"));
+    aegisxd_json_add_string(resp, "active_path", g_aegisxd_db_path);
+    json_object_object_add(resp, "frozen", json_object_new_boolean(g_aegisxd_storage_frozen));
+    json_object_object_add(resp, "control_db_migrated", json_object_new_boolean(0));
+    json_object_object_add(resp, "lifecycle_ready", json_object_new_boolean(
+        g_aegisxd_db && sqlite3_db_filename(g_aegisxd_db, "main") &&
+        !strcmp(sqlite3_db_filename(g_aegisxd_db, "main"), g_aegisxd_db_path)));
     json_object_object_add(dependencies, "config_db",
                            json_object_new_boolean(g_aegisxd_config_db != NULL));
     json_object_object_add(dependencies, "aegis_db",

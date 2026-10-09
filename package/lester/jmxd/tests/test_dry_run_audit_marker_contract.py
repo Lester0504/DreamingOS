@@ -14,7 +14,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-API = ROOT / "src/webd/jmx_app_api.c"
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text
 
 # Every client action that can be invoked with dry_run=true.
 DRY_RUN_ACTIONS = (
@@ -36,7 +37,7 @@ def check(condition: bool, message: str) -> None:
 
 
 def main() -> None:
-    source = API.read_text()
+    source = webd_dispatch_text()
 
     helper = re.search(
         r"static void jmx_app_audit_log_dry_run\([^)]*\)\s*\{(.*?)\n\}",
@@ -88,8 +89,11 @@ def main() -> None:
 
     # `kick` cannot actually deauthenticate a wireless station. The capability
     # must stay false with a reason so the App does not promise a disconnect.
+    # Phase 6B moved this into api/api_client_control.c and dropped `static` so
+    # webd_client_profile_response() can still call it across the split, so the
+    # definition is now `void`, not `static void`.
     caps = re.search(
-        r"static void webd_client_control_add_capabilities\([^)]*\)\s*\{(.*?)\n\}",
+        r"(?:static )?void webd_client_control_add_capabilities\([^)]*\)\s*\{(.*?)\n\}",
         source, re.S)
     check(caps is not None, "webd_client_control_add_capabilities() not found")
     if caps:

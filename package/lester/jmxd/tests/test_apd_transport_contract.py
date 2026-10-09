@@ -65,6 +65,11 @@ FIELDS = {
     "radio_job_start_ack": {"protocol", "kind", "ap_id", "session_epoch", "reply_to", "job_id", "attempt_id", "dispatch_generation", "request_digest", "controller_state", "cancel_requested"},
     "radio_job_finish": {"protocol", "kind", "ap_id", "session_epoch", "sequence", "job_id", "attempt_id", "dispatch_generation", "request_digest", "finish_id", "outcome", "error_code", "result_complete", "result"},
     "radio_job_finish_ack": {"protocol", "kind", "ap_id", "session_epoch", "reply_to", "job_id", "attempt_id", "dispatch_generation", "request_digest", "finish_id", "controller_state", "cancel_requested", "result_complete", "error_code"},
+    "txpower_mode_poll": {"protocol", "kind", "ap_id", "session_epoch", "sequence"},
+    "txpower_mode_idle": {"protocol", "kind", "ap_id", "session_epoch", "reply_to"},
+    "txpower_mode_offer": {"protocol", "kind", "ap_id", "session_epoch", "reply_to", "operation", "mode", "confirm"},
+    "txpower_mode_finish": {"protocol", "kind", "ap_id", "session_epoch", "sequence", "operation", "mode", "confirm", "result"},
+    "txpower_mode_finish_ack": {"protocol", "kind", "ap_id", "session_epoch", "reply_to"},
     "error": {"protocol", "kind", "error", "reason"},
 }
 
@@ -268,6 +273,32 @@ def server(listener: socket.socket, context: ssl.SSLContext, paths: dict[str, Pa
                                    "sequence": telemetry["sequence"],
                                    "accepted": True})
                         first_job_frame = receive_any(tls)
+                    # Txpower is a fixed, AP-initiated control family. Exercise
+                    # a method-absent finish before the ordinary radio job flow.
+                    if first_job_frame["kind"] == "txpower_mode_poll":
+                        poll = first_job_frame
+                        send(tls, {"protocol": wire_protocol,
+                                   "kind": "txpower_mode_offer",
+                                   "ap_id": AP_ID,
+                                   "session_epoch": session_epoch,
+                                   "reply_to": poll["sequence"],
+                                   "operation": "get", "mode": "",
+                                   "confirm": False})
+                        finish = receive(tls, "txpower_mode_finish")
+                        assert finish["operation"] == "get"
+                        assert finish["mode"] == ""
+                        assert finish["confirm"] is False
+                        assert finish["result"] == {
+                            "ok": False,
+                            "error": "apd_method_absent",
+                            "reason": "apd_method_absent",
+                        }
+                        send(tls, {"protocol": wire_protocol,
+                                   "kind": "txpower_mode_finish_ack",
+                                   "ap_id": AP_ID,
+                                   "session_epoch": session_epoch,
+                                   "reply_to": finish["sequence"]})
+                        first_job_frame = receive_any(tls)
                     job = {
                         "job_id": "11111111-1111-4111-8111-111111111111",
                         "attempt_id": "22222222-2222-4222-8222-222222222222",
@@ -308,6 +339,13 @@ def server(listener: socket.socket, context: ssl.SSLContext, paths: dict[str, Pa
                                        "sequence": heartbeat["sequence"]})
                             poll = receive_after_optional_telemetry(
                                 tls, session_epoch)
+                            if poll["kind"] == "txpower_mode_poll":
+                                send(tls, {"protocol": wire_protocol,
+                                           "kind": "txpower_mode_idle",
+                                           "ap_id": AP_ID,
+                                           "session_epoch": session_epoch,
+                                           "reply_to": poll["sequence"]})
+                                poll = receive(tls, "radio_job_poll")
                             assert poll["kind"] == "radio_job_poll"
                             send(tls, {"protocol": wire_protocol,
                                        "kind": "radio_job_idle", "ap_id": AP_ID,
@@ -404,20 +442,32 @@ def static_contract() -> None:
     assert "apd_radio_job_pending_finish_get" in source
     assert "apd_radio_job_pending_reconcile_get" in source
     assert "apd_radio_job_session_rebind" in source
-    # Phase W2c dormancy: the config job wire is compiled but the gate is a
-    # hard compile-time 0 in production, and the wire step only runs when
-    # the gate is set.
-    assert "#ifdef APD_CONFIG_JOBS_TEST_ENABLE" in source
+    # Config jobs are live only on v3 sessions whose negotiated write
+    # capabilities are all true; v1/v2 never enter this path.
+    assert "apd_config_executor_available_default()" in source
+    assert "connection.protocol_version == 3 && g_apd_transport.write_capable" in source
+    assert "apd_config_job_pending_reconcile_get" in source
+    assert "apd_config_job_session_rebind" in source
+    assert "apd_config_job_finish_ack" in source
     jobs_step = source[source.index("static int apd_v2_jobs_step("):
                        source.index("static int apd_v2_accept_or_start(")]
-    assert "apd_config_executor_enabled()" in jobs_step
-    assert jobs_step.index("apd_config_executor_enabled()") < jobs_step.index(
-        "apd_config_wire_step(ssl")
+    assert "apd_config_wire_step(" not in jobs_step
     config_start = source.index("static int apd_config_execute(")
     # Skip the forward declaration that precedes apd_config_execute.
     config_end = source.index("static int apd_config_wire_step(",
                               config_start)
     config_block = source[config_start:config_end]
+    assert config_block.index("apd_config_candidate_has_actions(") < \
+        config_block.index("apd_config_stage(")
+    action_block = source[source.index("static const char *apd_config_execute_runtime_action("):
+                          config_start]
+    assert action_block.index("backend->validate(candidate") < \
+        action_block.index("apd_config_job_mark_applying(")
+    assert action_block.index("apd_config_job_mark_applying(") < \
+        action_block.index("backend->apply(candidate")
+    assert action_block.index("backend->apply(candidate") < \
+        action_block.index("apd_config_job_mark_applied(")
+    assert "apd_config_rollback(" not in action_block
     # Executor ordering: stage -> capture rollback reference -> persist the
     # applying state -> mutate live config -> persist applied -> readback.
     # The rollback reference must be durable before the first live mutation.
@@ -439,6 +489,9 @@ def static_contract() -> None:
         "apd_config_accept(")
     assert wire_step.index("apd_config_accept(") < wire_step.index(
         "apd_config_execute(")
+    session_block = source[source.index("static int apd_session_run("):]
+    assert session_block.index("apd_config_pending_finish_replay(") < \
+        session_block.index("apd_config_wire_step(")
     assert 'strcmp(pending.entry.state, "completed")' in source
     assert 'strcmp(pending.entry.state, "failed")' in source
     assert "apd_backend_neighbor_scan(job->radio_id" in source
@@ -453,6 +506,15 @@ def static_contract() -> None:
         block = source[source.index(marker):source.index("};", source.index(marker))]
         for field in fields:
             assert f'"{field}"' in block, (kind, field)
+    txpower = source[source.index("static struct json_object *apd_txpower_method_absent"):
+                     source.index("static int apd_v2_finish_id")]
+    assert '"dreamingwrt.apd"' in txpower
+    assert '"dreamingos.apd"' in txpower
+    assert "UBUS_STATUS_METHOD_NOT_FOUND" in txpower
+    assert "apd_method_absent" in txpower
+    assert "apd_txpower_ubus_call" in txpower
+    assert "apd_txpower_wire_step" in txpower
+    assert "apd_json_add_boolean(request, \"confirm\", confirm)" in txpower
     log_calls = [line for line in source.splitlines() if "apd_transport_log(" in line]
     assert all("token" not in line and "body" not in line and "csr" not in line
                for line in log_calls)
@@ -460,22 +522,25 @@ def static_contract() -> None:
 
 def compile_fixture(binary: Path) -> None:
     compiler = shlex.split(os.environ.get("CC", "cc"))
+    json_prefix = Path(os.environ.get("APD_TRANSPORT_JSON_PREFIX", JSON_PREFIX))
+    openssl_prefix = Path(os.environ.get("APD_TRANSPORT_OPENSSL_PREFIX", OPENSSL_PREFIX))
     # A staging_dir .a is an LTO archive the host linker cannot read, so link
     # the .so when the prefix offers one.
     if JSON_SHARED:
-        json_link = ["-L", str(JSON_PREFIX / "lib"),
-                     f"-Wl,-rpath,{JSON_PREFIX / 'lib'}", "-ljson-c"]
+        json_link = ["-L", str(json_prefix / "lib"),
+                     f"-Wl,-rpath,{json_prefix / 'lib'}", "-ljson-c"]
     else:
-        json_archive = JSON_PREFIX / "lib/libjson-c.a"
+        json_archive = json_prefix / "lib/libjson-c.a"
         assert json_archive.is_file()
         json_link = [str(json_archive)]
     command(*compiler, "-std=c11",
             "-D_DARWIN_C_SOURCE" if sys.platform == "darwin" else "-D_GNU_SOURCE",
             "-Wall", "-Wextra", "-Werror", f"-I{ROOT / 'src'}",
-            f"-I{JSON_PREFIX / 'include'}", f"-I{OPENSSL_PREFIX / 'include'}",
+            f"-I{openssl_prefix / 'include'}",
+            "-idirafter", str(json_prefix / "include"),
             str(FIXTURE), str(WIRE), *json_link,
-            f"-L{OPENSSL_PREFIX / 'lib'}",
-            f"-Wl,-rpath,{OPENSSL_PREFIX / 'lib'}", "-lssl",
+            f"-L{openssl_prefix / 'lib'}",
+            f"-Wl,-rpath,{openssl_prefix / 'lib'}", "-lssl",
             "-lcrypto", "-lpthread", "-o", str(binary))
 
 

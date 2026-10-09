@@ -3,7 +3,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = (ROOT / "src/webd/jmx_app_api.c").read_text(encoding="utf-8")
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text, webd_function_text
+WEB = webd_dispatch_text()
 
 
 def between(text: str, start: str, end: str) -> str:
@@ -87,8 +90,7 @@ assert "UPDATE web_sessions SET revoked=1" in identity
 assert "webd_admin_identity_config_restore(ctx)" in identity
 assert "ctx->compensation_failed = 1" in identity
 
-save = between(WEB, "static struct json_object *webd_system_settings_save_response",
-               "static struct json_object *webd_capabilities_data")
+save = webd_function_text("jmx_app_api.c", "webd_system_settings_save_response")
 assert save.index("webd_system_settings_admin_preflight(") < save.index(
     "webd_system_settings_transaction_response("
 )

@@ -374,8 +374,100 @@ static const struct blobmsg_policy logd_any_policy[] = {
     { .name = "payload", .type = BLOBMSG_TYPE_UNSPEC },
 };
 
+static int logd_storage_reply(struct ubus_context *ctx, struct ubus_request_data *req,
+                              const char *phase, int ok, const char *reason)
+{
+    struct json_object *resp = json_object_new_object();
+
+    json_object_object_add(resp, "ok", json_object_new_boolean(ok));
+    json_object_object_add(resp, "use", json_object_new_string("log"));
+    json_object_object_add(resp, "phase", json_object_new_string(phase ? phase : "status"));
+    json_object_object_add(resp, "reason", json_object_new_string(reason ? reason : ""));
+    json_object_object_add(resp, "active_path", json_object_new_string(g_logd_db_path));
+    json_object_object_add(resp, "db_path", json_object_new_string(g_logd_db_path));
+    json_object_object_add(resp, "control_db_migrated", json_object_new_boolean(0));
+    json_object_object_add(resp, "frozen", json_object_new_boolean(g_logd_storage_frozen));
+    json_object_object_add(resp, "lifecycle_ready", json_object_new_boolean(
+        logd_storage_ready()));
+    logd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
+static int logd_handle_storage_freeze(struct ubus_context *ctx, struct ubus_object *obj,
+                                      struct ubus_request_data *req, const char *method,
+                                      struct blob_attr *msg)
+{
+    (void)obj; (void)method; (void)msg;
+    if (g_logd_storage_frozen)
+        return logd_storage_reply(ctx, req, "freeze", 0, "already_frozen");
+    logd_collectors_stop();
+    g_logd_storage_frozen = 1;
+    if (g_logd_db)
+        sqlite3_set_authorizer(g_logd_db, logd_storage_authorizer, NULL);
+    return logd_storage_reply(ctx, req, "freeze", 1, "frozen");
+}
+
+static int logd_handle_storage_unfreeze(struct ubus_context *ctx, struct ubus_object *obj,
+                                        struct ubus_request_data *req, const char *method,
+                                        struct blob_attr *msg)
+{
+    (void)obj; (void)method; (void)msg;
+    if (!g_logd_storage_frozen)
+        return logd_storage_reply(ctx, req, "unfreeze", 0, "not_frozen");
+    g_logd_storage_frozen = 0;
+    if (g_logd_db)
+        sqlite3_set_authorizer(g_logd_db, logd_storage_authorizer, NULL);
+    logd_collectors_start();
+    return logd_storage_reply(ctx, req, "unfreeze", 1, "ready");
+}
+
+static int logd_handle_storage_reopen(struct ubus_context *ctx, struct ubus_object *obj,
+                                      struct ubus_request_data *req, const char *method,
+                                      struct blob_attr *msg)
+{
+    struct json_object *body = logd_json_from_blob(msg);
+    const char *new_path = logd_json_str(logd_payload_or_self(body), "new_path", "");
+    int rc;
+
+    (void)obj; (void)method;
+    rc = logd_db_reopen_path(new_path);
+    json_object_put(body);
+    return logd_storage_reply(ctx, req, "reopen", rc == 0,
+                              rc == 0 ? "reopened" : "reopen_failed");
+}
+
+static int logd_handle_storage_status(struct ubus_context *ctx, struct ubus_object *obj,
+                                      struct ubus_request_data *req, const char *method,
+                                      struct blob_attr *msg)
+{
+    (void)obj; (void)method; (void)msg;
+    return logd_storage_reply(ctx, req, "status",
+                              logd_storage_ready(),
+                              g_logd_storage_frozen ? "frozen" : "ready");
+}
+
+static int logd_handle_ap_exchange(struct ubus_context *ctx, struct ubus_object *obj,
+    struct ubus_request_data *req, const char *method, struct blob_attr *msg)
+{
+    struct json_object *body = logd_json_from_blob(msg);
+    struct json_object *reply = logd_ap_exchange(method, logd_payload_or_self(body));
+    (void)obj;
+    logd_send_json(ctx, req, reply);
+    json_object_put(reply);
+    json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
 static const struct ubus_method logd_methods[] = {
+    UBUS_METHOD("ap_log_peek", logd_handle_ap_exchange, logd_any_policy),
+    UBUS_METHOD("ap_log_ack", logd_handle_ap_exchange, logd_any_policy),
+    UBUS_METHOD("ap_log_ingest", logd_handle_ap_exchange, logd_any_policy),
     UBUS_METHOD("status", logd_handle_status, logd_any_policy),
+    UBUS_METHOD("storage_freeze", logd_handle_storage_freeze, logd_any_policy),
+    UBUS_METHOD("storage_reopen", logd_handle_storage_reopen, logd_any_policy),
+    UBUS_METHOD("storage_unfreeze", logd_handle_storage_unfreeze, logd_any_policy),
+    UBUS_METHOD("storage_lifecycle_status", logd_handle_storage_status, logd_any_policy),
     UBUS_METHOD("settings_get", logd_handle_settings_get, logd_any_policy),
     UBUS_METHOD("settings_set", logd_handle_settings_set, logd_any_policy),
     UBUS_METHOD("syslog_test", logd_handle_syslog_test, logd_any_policy),

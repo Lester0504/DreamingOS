@@ -1,0 +1,15 @@
+#!/bin/sh
+# Generate the console TLS certificate on first boot after install.
+#
+# uci-defaults runs once, before nginx first starts on a fresh image, so 443 has
+# a valid cert the first time the ssl server block is parsed. Without a cert
+# file present nginx -t fails and the whole web server refuses to start, which
+# would take the admin UI on 80 down with it.
+
+CERT_TOOL="/usr/libexec/dreamingwrt/dreamingwrt-web-tls-cert"
+ENABLE_TOOL="/usr/libexec/dreamingwrt/dreamingwrt-web-tls-enable"
+
+[ -x "$CERT_TOOL" ] && "$CERT_TOOL" ensure || exit 0
+[ -x "$ENABLE_TOOL" ] && "$ENABLE_TOOL" enable-ssl
+
+exit 0

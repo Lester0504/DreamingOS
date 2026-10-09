@@ -77,6 +77,7 @@
       const num = Number(value);
       return Number.isFinite(num) && num > 0 ? `${Math.round(num)} ms` : '--';
     });
+    const formatDateTime = context.formatDateTime || ((value, options) => new Date(Number(value) * 1000).toLocaleString('zh-CN', { hour12: false, ...(options || {}) }));
     const carrierMarkup = context.carrierMarkup || (() => '');
     const fetchApiResource = context.fetchApiResource || (async (name) => ({ name, ok: false, data: {}, error: new Error('fetchApiResource unavailable') }));
     const scheduleGlassCardsRender = context.scheduleGlassCardsRender || (() => {});
@@ -276,6 +277,11 @@
         id: firstText(line.id, line.wan_id, line.name, line.ifname, `${type || 'line'}-${index + 1}`),
         order: Number(line.order || index + 1),
         type,
+        workMode: firstText(line.work_mode, line.canonical_mode).toLowerCase(),
+        logicalUplink: line.logical_uplink === true || line.uplink_kind === 'shared_l2' || line.shared_l2 === true,
+        uplinkKind: firstText(line.uplink_kind),
+        dedicatedPhysicalWan: line.dedicated_physical_wan !== false,
+        portRolePartitionApplicable: line.port_role_partition_applicable !== false,
         name: firstText(line.name, line.label, line.ifname, line.interface, line.id, `line${index + 1}`),
         note: firstText(line.note, line.remark, line.description, line.alias, line.device),
         ifname: firstText(line.ifname, line.interface),
@@ -285,6 +291,7 @@
         carrier_logo: firstText(line.carrier_logo, line.carrier_svg, line.logo, line.image, line.icon),
         carrier: firstText(line.carrier_key, line.carrier, line.carrier_name, line.isp, line.isp_name, line.provider, line.operator, line.operator_code),
         ip: firstText(
+          line.local_ip,
           line.ip,
           line.ipv4,
           line.ipaddr,
@@ -541,36 +548,43 @@
           id: firstText(wan.id, wan.wan_id, wan.name, wan.ifname, `wan${index + 1}`),
           order: Number(wan.order || index + 1),
           name: firstText(wan.name, wan.label, wan.ifname, `wan${index + 1}`),
+          workMode: firstText(wan.work_mode, wan.canonical_mode).toLowerCase(),
+          logicalUplink: wan.logical_uplink === true || wan.uplink_kind === 'shared_l2' || wan.shared_l2 === true,
+          uplinkKind: firstText(wan.uplink_kind),
+          dedicatedPhysicalWan: wan.dedicated_physical_wan !== false,
+          dialSessionApplicable: wan.dial_session_applicable !== false,
           note: firstText(wan.note, wan.remark, wan.description, wan.alias, wan.ifname),
           ifname: firstText(wan.ifname, wan.interface),
           carrier_key: firstText(wan.carrier_key, wan.isp_key, wan.operator_key, wan.operator_code),
           carrier_name: firstText(wan.carrier_name, wan.isp_name, wan.operator_name, wan.provider_name),
           carrier_logo: firstText(wan.carrier_logo, wan.carrier_svg, wan.logo, wan.image, wan.icon),
           carrier: firstText(wan.carrier_key, wan.carrier, wan.carrier_name, wan.isp),
-          accessMode: firstText(wan.access_mode, wan.proto, wan.protocol, wan.internet),
-          ip: firstText(wan.ip, wan.ipv4, wan.ipaddr),
+          accessMode: wan.logical_uplink === true || wan.uplink_kind === 'shared_l2' || wan.shared_l2 === true
+            ? '静态 / 共享二层'
+            : firstText(wan.access_mode, wan.proto, wan.protocol, wan.internet),
+          ip: firstText(wan.local_ip, wan.ip, wan.ipv4, wan.ipaddr),
           ipv6: firstGlobalIpv6(wan.ipv6_global, wan.global_ipv6, wan.public_ipv6, wan.wan_ipv6, wan.ipv6_addrs, wan.ipv6, wan.ipv6_addr, wan.ipv6_address),
-          gateway: firstText(wan.gateway, wan.gw),
+          gateway: firstText(wan.upstream_gateway, wan.gateway, wan.gw),
           status: firstText(wan.status, wan.state),
           online: typeof wan.online === 'boolean' ? wan.online : undefined,
           healthKnown: wan.health !== undefined || wan.health_measured !== undefined || wan.online !== undefined || wan.status !== undefined || wan.state !== undefined,
-          uptime: trustedConnectionSeconds(wan),
-          upLoss24h: lossValue(wan.up_loss_24h, wan.loss_up_24h, wan.loss_up, wan.packet_loss_up, wan.packet_loss),
-          downLoss24h: lossValue(wan.down_loss_24h, wan.loss_down_24h, wan.loss_down, wan.packet_loss_down, wan.packet_loss),
+          uptime: wan.dial_session_applicable === false ? null : trustedConnectionSeconds(wan),
+          upLoss24h: lossValue(wan.up_loss_24h, wan.loss_up_24h, wan.loss_up, wan.packet_loss_up, wan.packet_loss, wan.loss_pct),
+          downLoss24h: lossValue(wan.down_loss_24h, wan.loss_down_24h, wan.loss_down, wan.packet_loss_down, wan.packet_loss, wan.loss_pct),
           /*
            * 单一丢包读数：上下行同源于一次 ping，取二者中有值的较大者即可，
            * 全缺时保持 null 以便渲染成「不可用」而不是 0%。
            */
           loss24h: (() => {
-            const up = lossValue(wan.up_loss_24h, wan.loss_up_24h, wan.loss_up, wan.packet_loss_up, wan.packet_loss);
-            const down = lossValue(wan.down_loss_24h, wan.loss_down_24h, wan.loss_down, wan.packet_loss_down, wan.packet_loss);
+            const up = lossValue(wan.up_loss_24h, wan.loss_up_24h, wan.loss_up, wan.packet_loss_up, wan.packet_loss, wan.loss_pct);
+            const down = lossValue(wan.down_loss_24h, wan.loss_down_24h, wan.loss_down, wan.packet_loss_down, wan.packet_loss, wan.loss_pct);
             if (up === null) return down;
             if (down === null) return up;
             return Math.max(up, down);
           })(),
           lossSource: firstText(wan.loss_source),
           lossSamples: lossValue(wan.loss_sample_count),
-          latencyAvg: firstNumber(wan.latency_avg, wan.avg_latency, wan.latency),
+          latencyAvg: firstNumber(wan.latency_avg, wan.avg_latency, wan.latency_ms, wan.latency),
           avgUpRate: avgUp,
           avgDownRate: avgDown,
           busy,
@@ -631,11 +645,7 @@
     function formatHealthBucketTime(value) {
       const timestamp = Number(value);
       if (!Number.isFinite(timestamp) || timestamp <= 0) return '';
-      const date = new Date(timestamp * 1000);
-      if (Number.isNaN(date.getTime())) return '';
-      const hour = String(date.getHours()).padStart(2, '0');
-      const minute = String(date.getMinutes()).padStart(2, '0');
-      return `${date.getFullYear()}年${date.getMonth() + 1}月${date.getDate()}日${hour}:${minute}`;
+      return formatDateTime(timestamp, { includeSeconds: false });
     }
 
     function healthBucketTooltip(wan = {}, bucket = {}) {
@@ -767,7 +777,7 @@
           <td data-label="接入方式"><span class="line-mode">${escapeHtml(wan.accessMode || '--')}</span></td>
           <td data-label="IP地址">${escapeHtml(wan.ip || '--')}</td>
           <td data-label="网关">${escapeHtml(wan.gateway || '--')}</td>
-          <td data-label="连接时间">${escapeHtml(formatUptime(wan.uptime))}</td>
+          <td data-label="连接时间">${wan.logicalUplink || !wan.dialSessionApplicable ? '不适用' : escapeHtml(formatUptime(wan.uptime))}</td>
           <td data-label="探测丢包">${healthLossCellMarkup(wan)}</td>
           <td data-label="平均延迟" class="${healthClass(wan)}">${escapeHtml(formatLatency(wan.latencyAvg))}</td>
           <td data-label="平均带宽"><span class="rate-text"><span class="rate-down">↓ ${escapeHtml(formatRate(wan.avgDownRate))}</span><span class="rate-up">↑ ${escapeHtml(formatRate(wan.avgUpRate))}</span></span></td>
@@ -927,6 +937,40 @@
       return firstText(wan.id, wan.wan_id, wan.ifname, wan.interface, wan.name).toLowerCase();
     }
 
+    function isSharedLogicalWan(wan = {}) {
+      return wan.logical_uplink === true || wan.uplink_kind === 'shared_l2' || wan.shared_l2 === true;
+    }
+
+    function wanConfigContract(data = {}) {
+      const workMode = firstText(data.work_mode, data.canonical_mode, 'gateway').toLowerCase();
+      const rows = listFrom(data, ['wans', 'interfaces']);
+      const shared = data.shared_uplink && typeof data.shared_uplink === 'object' ? data.shared_uplink : null;
+      return {
+        workMode,
+        wans: rows.length ? rows : shared ? [shared] : [],
+        portRolePartitionApplicable: workMode === 'side-router' ? false : data.port_role_partition_applicable !== false
+      };
+    }
+
+    function canonicalizeWanRows(rows, canonicalRows = page?.canonicalWans || []) {
+      const list = asArray(rows);
+      if (page?.workMode !== 'side-router') return list;
+      const logical = list.filter(isSharedLogicalWan);
+      return logical.length ? logical : asArray(canonicalRows);
+    }
+
+    function canonicalizePanelData(data = {}, canonicalRows = [], keys = ['wans', 'items', 'lines', 'interfaces']) {
+      if (page?.workMode !== 'side-router') return data;
+      const existingRows = listFrom(data, keys);
+      const existingByKey = new Map(existingRows.map((wan) => [wanMergeKey(wan), wan]).filter(([key]) => key));
+      const rows = asArray(canonicalRows).map((wan, index) => {
+        const current = existingByKey.get(wanMergeKey(wan)) || {};
+        return { ...current, ...wan, type: 'wan', order: wan.order || index + 1 };
+      });
+      const key = keys.find((candidate) => Array.isArray(data[candidate])) || keys[0];
+      return { ...data, work_mode: 'side-router', port_role_partition_applicable: false, [key]: rows };
+    }
+
     function mergeWanRealtimeIntoHealth(existingData = {}, realtimePayload = {}) {
       const existingRows = listFrom(existingData, ['wans', 'items', 'lines', 'interfaces']);
       const realtimeRows = realtimeWanRows(realtimePayload);
@@ -1022,7 +1066,7 @@
 
     function applyWanRealtime(data) {
       if (!page || !page.active) return;
-      const wans = realtimeWanRows(data);
+      const wans = canonicalizeWanRows(realtimeWanRows(data));
       if (!wans.length) return;
       page.lastWsAt = Date.now();
       const payload = {
@@ -1070,17 +1114,26 @@
       }
       page.data[panel.id] = { ...(page.data[panel.id] || {}), loading: true, error: '' };
       if (page.mode === panel.id) renderPanel();
+      const needsWanContract = panel.id === 'line-load' || panel.id === 'line-health' || panel.id === 'ipv6-load';
       const requests = [fetchApiResource(panel.id, panel.endpoint)];
+      if (needsWanContract) {
+        requests.push(fetchApiResource(`${panel.id}-wans`, WAN_CONFIG_ENDPOINT));
+      }
       if (panel.id === 'line-health') {
         requests.push(
-          fetchApiResource('line-health-wans', WAN_CONFIG_ENDPOINT),
           fetchApiResource('line-health-system', SYSTEM_STATUS_ENDPOINT)
         );
       }
       const [res, wanConfig, systemStatus] = await Promise.all(requests);
       if (!page || !page.active) return;
+      if (needsWanContract && wanConfig?.ok) {
+        const contract = wanConfigContract(wanConfig.data || {});
+        page.workMode = contract.workMode;
+        page.canonicalWans = contract.wans;
+        page.portRolePartitionApplicable = contract.portRolePartitionApplicable;
+      }
       if (panel.id === 'line-health') {
-        const configuredWans = listFrom(wanConfig?.data || {}, ['wans', 'interfaces']);
+        const configuredWans = page.canonicalWans || [];
         if (wanConfig?.ok && configuredWans.length) {
           page.configuredWanKeys = new Set(configuredWans.flatMap((wan) => [wan.id, wan.ifname, wan.interface, wan.name])
             .map((value) => firstText(value).toLowerCase()).filter(Boolean));
@@ -1091,7 +1144,12 @@
         if (page.healthContractReady) page.lastHealthContractAt = Date.now();
       }
       if (res.ok) {
-        page.data[panel.id] = { data: res.data || {}, loading: false, error: '' };
+        page.data[panel.id] = {
+          data: canonicalizePanelData(res.data || {}, page.canonicalWans || [],
+            panel.id === 'line-load' ? ['interfaces', 'items', 'lines', 'wans'] : ['wans', 'items', 'lines', 'interfaces']),
+          loading: false,
+          error: ''
+        };
       } else {
         page.data[panel.id] = {
           data: page.data[panel.id]?.data || {},
@@ -1201,6 +1259,9 @@
         lastWsAt: 0,
         healthContractReady: false,
         configuredWanKeys: new Set(),
+        workMode: 'gateway',
+        canonicalWans: [],
+        portRolePartitionApplicable: true,
         systemUptime: 0,
         systemUptimeAt: 0,
         lastHealthContractAt: 0,

@@ -18,6 +18,25 @@ static int aegisxd_exec(sqlite3 *db, const char *sql)
     return 0;
 }
 
+int aegisxd_storage_authorizer(void *opaque, int action,
+                               const char *arg1, const char *arg2,
+                               const char *db_name, const char *trigger)
+{
+    (void)opaque; (void)arg1; (void)arg2; (void)db_name; (void)trigger;
+    if (!g_aegisxd_storage_frozen)
+        return SQLITE_OK;
+    switch (action) {
+    case SQLITE_INSERT: case SQLITE_UPDATE: case SQLITE_DELETE:
+    case SQLITE_CREATE_INDEX: case SQLITE_CREATE_TABLE: case SQLITE_CREATE_TRIGGER:
+    case SQLITE_CREATE_VIEW: case SQLITE_DROP_INDEX: case SQLITE_DROP_TABLE:
+    case SQLITE_DROP_TRIGGER: case SQLITE_DROP_VIEW: case SQLITE_ALTER_TABLE:
+    case SQLITE_ATTACH: case SQLITE_DETACH: case SQLITE_REINDEX:
+        return SQLITE_DENY;
+    default:
+        return SQLITE_OK;
+    }
+}
+
 static int aegisxd_column_exists(sqlite3 *db, const char *table, const char *column)
 {
     sqlite3_stmt *st = NULL;
@@ -290,11 +309,12 @@ int aegisxd_db_init(void)
         return aegisxd_db_init_fail();
     }
     sqlite3_busy_timeout(g_aegisxd_config_db, 3000);
-    if (sqlite3_open(AEGISXD_DB_PATH, &g_aegisxd_db) != SQLITE_OK) {
-        fprintf(stderr, "[dreamingwrt-aegisxd] open %s failed\n", AEGISXD_DB_PATH);
+    if (sqlite3_open(g_aegisxd_db_path, &g_aegisxd_db) != SQLITE_OK) {
+        fprintf(stderr, "[dreamingwrt-aegisxd] open %s failed\n", g_aegisxd_db_path);
         return aegisxd_db_init_fail();
     }
     sqlite3_busy_timeout(g_aegisxd_db, 3000);
+    sqlite3_set_authorizer(g_aegisxd_db, aegisxd_storage_authorizer, NULL);
     if (aegisxd_exec(g_aegisxd_config_db, "PRAGMA journal_mode=WAL") != 0 ||
         aegisxd_exec(g_aegisxd_config_db, "PRAGMA foreign_keys=ON") != 0 ||
         aegisxd_exec(g_aegisxd_db, "PRAGMA journal_mode=WAL") != 0 ||
@@ -398,6 +418,8 @@ int aegisxd_db_init(void)
         " last_error TEXT NOT NULL DEFAULT '',"
         " created_at INTEGER NOT NULL DEFAULT 0,"
         " updated_at INTEGER NOT NULL DEFAULT 0)") != 0 ||
+        aegisxd_add_column_if_missing(g_aegisxd_config_db,"aegis_content_policies",
+            "enforcement","ALTER TABLE aegis_content_policies ADD COLUMN enforcement TEXT NOT NULL DEFAULT 'legacy'") != 0 ||
         aegisxd_exec(g_aegisxd_config_db,
         "CREATE INDEX IF NOT EXISTS idx_aegis_content_policies_enabled "
         "ON aegis_content_policies(enabled,mode,updated_at)") != 0 ||
@@ -414,6 +436,8 @@ int aegisxd_db_init(void)
         " created_at INTEGER NOT NULL DEFAULT 0,"
         " updated_at INTEGER NOT NULL DEFAULT 0,"
         " UNIQUE(policy_id,domain))") != 0 ||
+        aegisxd_add_column_if_missing(g_aegisxd_config_db,"aegis_domain_overrides",
+            "match_kind","ALTER TABLE aegis_domain_overrides ADD COLUMN match_kind TEXT NOT NULL DEFAULT 'suffix'") != 0 ||
         aegisxd_exec(g_aegisxd_config_db,
         "CREATE INDEX IF NOT EXISTS idx_aegis_domain_overrides_action "
         "ON aegis_domain_overrides(enabled,action,domain)") != 0 ||
@@ -699,6 +723,84 @@ int aegisxd_db_init(void)
     if (aegisxd_seed_builtin_feeds() != 0)
         return aegisxd_db_init_fail();
     (void)aegisxd_migrate_legacy_feed_artifacts();
+    return 0;
+}
+
+int aegisxd_db_reopen_path(const char *new_path)
+{
+    char old_path[AEGISXD_MAX_PATH];
+    sqlite3 *old_db;
+    sqlite3 *old_config_db;
+    int was_frozen;
+    int reopen_rc;
+
+    if (!g_aegisxd_storage_frozen || !new_path || new_path[0] != '/' ||
+        strlen(new_path) >= sizeof(g_aegisxd_db_path))
+        return -1;
+    snprintf(old_path, sizeof(old_path), "%s", g_aegisxd_db_path);
+    was_frozen = g_aegisxd_storage_frozen;
+    /* db_init() owns schema/bootstrap DDL.  It must be allowed to perform
+     * that initialization before the frozen authorizer is restored; otherwise
+     * a valid migrated database is rejected by its own CREATE/ALTER probes. */
+    g_aegisxd_storage_frozen = 0;
+    old_db = g_aegisxd_db;
+    old_config_db = g_aegisxd_config_db;
+    g_aegisxd_db = NULL;
+    g_aegisxd_config_db = NULL;
+    if (old_db) {
+        sqlite3_exec(old_db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
+        sqlite3_close(old_db);
+    }
+    if (old_config_db)
+        sqlite3_close(old_config_db);
+    snprintf(g_aegisxd_db_path, sizeof(g_aegisxd_db_path), "%s", new_path);
+    reopen_rc = aegisxd_db_init();
+    if (reopen_rc != 0 || !g_aegisxd_db ||
+        !sqlite3_db_filename(g_aegisxd_db, "main") ||
+        strcmp(sqlite3_db_filename(g_aegisxd_db, "main"), g_aegisxd_db_path)) {
+        if (g_aegisxd_db) {
+            sqlite3_close(g_aegisxd_db);
+            g_aegisxd_db = NULL;
+        }
+        if (g_aegisxd_config_db) {
+            sqlite3_close(g_aegisxd_config_db);
+            g_aegisxd_config_db = NULL;
+        }
+        /* The migration coordinator restores old_path after this failure and
+         * then calls the hook again.  Never open/create old_path while it is
+         * still the coordinator's rollback backup. */
+        (void)old_path;
+        g_aegisxd_storage_frozen = was_frozen;
+        return reopen_rc == 0 ? -1 : reopen_rc;
+    }
+    g_aegisxd_storage_frozen = was_frozen;
+    sqlite3_set_authorizer(g_aegisxd_db, aegisxd_storage_authorizer, NULL);
+    return 0;
+}
+
+int aegisxd_storage_freeze(void)
+{
+    if (g_aegisxd_storage_frozen)
+        return -1;
+    if (aegisxd_job_running_count() > 0)
+        return -1;
+    aegisxd_hit_producer_stop();
+    aegisxd_feed_scheduler_stop();
+    g_aegisxd_storage_frozen = 1;
+    if (g_aegisxd_db)
+        sqlite3_set_authorizer(g_aegisxd_db, aegisxd_storage_authorizer, NULL);
+    return 0;
+}
+
+int aegisxd_storage_unfreeze(void)
+{
+    if (!g_aegisxd_storage_frozen)
+        return -1;
+    g_aegisxd_storage_frozen = 0;
+    if (g_aegisxd_db)
+        sqlite3_set_authorizer(g_aegisxd_db, aegisxd_storage_authorizer, NULL);
+    aegisxd_hit_producer_start();
+    aegisxd_feed_scheduler_start();
     return 0;
 }
 

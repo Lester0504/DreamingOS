@@ -167,7 +167,9 @@ def test_hostapd_runtime_is_bounded_secret_safe_and_normalized() -> None:
     assert "FD_CLOEXEC" in request
     assert "local_st.st_ino" in request and "cleanup_st.st_ino" in request
     assert "S_IWGRP | S_IWOTH" in backend
-    assert "st.st_uid != APD_HOSTAPD_EXPECTED_UID" in collect
+    assert "apd_hostapd_uid_trusted(dir_st.st_uid)" in collect
+    assert "apd_hostapd_uid_trusted(st.st_uid)" in collect
+    assert 'APD_HOSTAPD_SERVICE_USER "network"' in backend
     assert "name_len = strlen(entry->d_name)" in collect
     assert "name_len >= sizeof(names[0])" in collect
     assert "memcpy(names[name_count], entry->d_name, name_len + 1)" in collect

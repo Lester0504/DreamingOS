@@ -30,6 +30,7 @@ static const char *const required_new_tables[] = {
     "system_ui_settings",
     "appearance_settings",
     "work_mode_settings",
+    "observability_retention_profile",
 };
 
 /*
@@ -353,6 +354,7 @@ static int ensure_required_tables(sqlite3 *db, struct dwrt_migrate_report *repor
         "hostname TEXT NOT NULL DEFAULT '',"
         "timezone TEXT NOT NULL DEFAULT 'Asia/Shanghai',"
         "language TEXT NOT NULL DEFAULT 'zh-cn',"
+        "date_format TEXT NOT NULL DEFAULT 'M/D/YY',"
         "config_backend TEXT NOT NULL DEFAULT 'sqlite_to_uci',"
         "apply_state TEXT NOT NULL DEFAULT 'pending',"
         "updated_at INTEGER NOT NULL DEFAULT 0)",
@@ -370,6 +372,14 @@ static int ensure_required_tables(sqlite3 *db, struct dwrt_migrate_report *repor
         "CREATE TABLE IF NOT EXISTS work_mode_settings ("
         "id INTEGER PRIMARY KEY CHECK (id = 1),"
         "mode TEXT NOT NULL DEFAULT 'router',"
+        "updated_at INTEGER NOT NULL DEFAULT 0)",
+        "CREATE TABLE IF NOT EXISTS observability_retention_profile ("
+        "id INTEGER PRIMARY KEY CHECK (id = 1),"
+        "profile_name TEXT NOT NULL DEFAULT 'dwrt-observability-v1',"
+        "version INTEGER NOT NULL DEFAULT 1 CHECK(version>0),"
+        "age_days INTEGER NOT NULL DEFAULT 90 CHECK(age_days BETWEEN 1 AND 730),"
+        "row_cap INTEGER NOT NULL DEFAULT 65536 CHECK(row_cap BETWEEN 1024 AND 1000000),"
+        "byte_cap INTEGER NOT NULL DEFAULT 268435456 CHECK(byte_cap BETWEEN 16777216 AND 2147483648),"
         "updated_at INTEGER NOT NULL DEFAULT 0)",
     };
 
@@ -390,6 +400,9 @@ static int ensure_required_tables(sqlite3 *db, struct dwrt_migrate_report *repor
             "ON CONFLICT(id) DO NOTHING") != 0 ||
         exec_simple(db,
             "INSERT INTO work_mode_settings(id) VALUES(1) "
+            "ON CONFLICT(id) DO NOTHING") != 0 ||
+        exec_simple(db,
+            "INSERT INTO observability_retention_profile(id) VALUES(1) "
             "ON CONFLICT(id) DO NOTHING") != 0) {
         migrate_error(report, "required_row_seed_failed");
         return -1;

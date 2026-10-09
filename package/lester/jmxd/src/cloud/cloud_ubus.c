@@ -8,6 +8,7 @@
  * so it goes through the normal config authority instead of a second path.
  */
 #include "cloud_internal.h"
+#include "cloud_browser.h"
 
 struct ubus_context *g_cloud_ubus;
 struct blob_buf g_cloud_blob;
@@ -136,6 +137,7 @@ struct json_object *cloud_status_json(void)
     data = json_object_new_object();
     json_object_object_add(data, "uptime_seconds",
                            json_object_new_int64(cloud_now_s() - g_cloud_started_at));
+    json_object_object_add(data, "browser", cloud_browser_status_json());
     json_object_object_add(data, "router_id",
                            identity ? json_object_new_string(identity->router_id) :
                                       NULL);
@@ -373,10 +375,202 @@ static int cloud_handle_enroll(struct ubus_context *ctx, struct ubus_object *obj
     return UBUS_STATUS_OK;
 }
 
+enum {
+    CLOUD_CERT_ATTR_FORCE,
+    __CLOUD_CERT_ATTR_MAX,
+};
+
+static const struct blobmsg_policy cloud_cert_policy[__CLOUD_CERT_ATTR_MAX] = {
+    [CLOUD_CERT_ATTR_FORCE] = { .name = "force", .type = BLOBMSG_TYPE_BOOL },
+};
+
+static int cloud_handle_cert_obtain(struct ubus_context *ctx,
+                                    struct ubus_object *obj,
+                                    struct ubus_request_data *req,
+                                    const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *fields[__CLOUD_CERT_ATTR_MAX] = {0};
+    struct json_object *root = json_object_new_object();
+    struct json_object *job;
+    int force = 0;
+    int started;
+
+    (void)obj; (void)method;
+    if (!root)
+        return UBUS_STATUS_UNKNOWN_ERROR;
+    if (msg)
+        blobmsg_parse(cloud_cert_policy, __CLOUD_CERT_ATTR_MAX, fields,
+                      blob_data(msg), blob_len(msg));
+    if (fields[CLOUD_CERT_ATTR_FORCE])
+        force = blobmsg_get_bool(fields[CLOUD_CERT_ATTR_FORCE]);
+    started = cloud_cert_job_start(force);
+    json_object_object_add(root, "ok", json_object_new_boolean(started >= 0));
+    json_object_object_add(root, "code", json_object_new_string(
+                               started == 0 ? "cert_obtain_started" :
+                               started == 1 ? "cert_obtain_in_progress" :
+                               started == 2 ? "cert_not_due" :
+                               "cert_obtain_start_failed"));
+    json_object_object_add(root, "message", json_object_new_string(
+                               started == 2 ?
+                               "the installed certificate is not yet due for renewal" :
+                               started >= 0 ? "poll cert_status for the result" :
+                               "the certificate worker could not start"));
+    job = cloud_cert_job_json();
+    if (job)
+        json_object_object_add(root, "data", job);
+    cloud_send_json(ctx, req, root);
+    json_object_put(root);
+    return UBUS_STATUS_OK;
+}
+
+static int cloud_handle_cert_status(struct ubus_context *ctx,
+                                    struct ubus_object *obj,
+                                    struct ubus_request_data *req,
+                                    const char *method, struct blob_attr *msg)
+{
+    struct json_object *response = cloud_cert_status_json();
+
+    (void)obj; (void)method; (void)msg;
+    cloud_send_json(ctx, req, response);
+    if (response)
+        json_object_put(response);
+    return UBUS_STATUS_OK;
+}
+
+/*
+ * Account binding by stable code. webd is the only authenticated caller and
+ * enforces device-admin auth plus an explicit confirm before reaching here;
+ * ubus itself is root-only. The code is a bearer credential, so the work is
+ * handed to a detached worker that cleanses it, and this method returns
+ * immediately with the job snapshot for the caller to poll via bind_status.
+ */
+enum {
+    CLOUD_BIND_ATTR_CODE,
+    CLOUD_BIND_ATTR_DISPLAY_NAME,
+    __CLOUD_BIND_ATTR_MAX,
+};
+
+static const struct blobmsg_policy cloud_bind_policy[__CLOUD_BIND_ATTR_MAX] = {
+    [CLOUD_BIND_ATTR_CODE] = { .name = "code", .type = BLOBMSG_TYPE_STRING },
+    [CLOUD_BIND_ATTR_DISPLAY_NAME] = { .name = "display_name",
+                                       .type = BLOBMSG_TYPE_STRING },
+};
+
+static int cloud_handle_bind_code(struct ubus_context *ctx,
+                                  struct ubus_object *obj,
+                                  struct ubus_request_data *req,
+                                  const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *fields[__CLOUD_BIND_ATTR_MAX] = {0};
+    struct json_object *root = json_object_new_object();
+    struct json_object *job;
+    const char *code = NULL;
+    const char *display_name = NULL;
+    int started;
+
+    (void)obj; (void)method;
+    if (!root)
+        return UBUS_STATUS_UNKNOWN_ERROR;
+    json_object_object_add(root, "contract_version",
+                           json_object_new_string(CLOUD_CONTRACT_VERSION));
+    json_object_object_add(root, "source",
+                           json_object_new_string(CLOUD_SERVICE_NAME));
+
+    if (msg)
+        blobmsg_parse(cloud_bind_policy, __CLOUD_BIND_ATTR_MAX, fields,
+                      blob_data(msg), blob_len(msg));
+    if (fields[CLOUD_BIND_ATTR_CODE])
+        code = blobmsg_get_string(fields[CLOUD_BIND_ATTR_CODE]);
+    if (fields[CLOUD_BIND_ATTR_DISPLAY_NAME])
+        display_name = blobmsg_get_string(fields[CLOUD_BIND_ATTR_DISPLAY_NAME]);
+
+    if (!code || !code[0] || !display_name || !display_name[0]) {
+        json_object_object_add(root, "ok", json_object_new_boolean(0));
+        json_object_object_add(root, "code",
+                               json_object_new_string("invalid_request"));
+        json_object_object_add(root, "message",
+                               json_object_new_string(
+                                   "code and display_name are required"));
+        cloud_send_json(ctx, req, root);
+        json_object_put(root);
+        return UBUS_STATUS_OK;
+    }
+
+    started = cloud_bind_job_start(code, display_name);
+    json_object_object_add(root, "ok",
+                           json_object_new_boolean(started >= 0 ? 1 : 0));
+    json_object_object_add(root, "code",
+                           json_object_new_string(
+                               started == 1 ? "binding_in_progress" :
+                               started == 0 ? "binding_started" :
+                                              "binding_start_failed"));
+    json_object_object_add(root, "message",
+                           json_object_new_string(
+                               started >= 0 ?
+                                   "poll bind_status for the result" :
+                                   "the binding worker could not start"));
+    job = cloud_bind_job_json();
+    if (job)
+        json_object_object_add(root, "data", job);
+    cloud_send_json(ctx, req, root);
+    json_object_put(root);
+    return UBUS_STATUS_OK;
+}
+
+static int cloud_handle_bind_status(struct ubus_context *ctx,
+                                    struct ubus_object *obj,
+                                    struct ubus_request_data *req,
+                                    const char *method, struct blob_attr *msg)
+{
+    struct json_object *root = json_object_new_object();
+    struct json_object *job;
+
+    (void)obj; (void)method; (void)msg;
+    if (!root)
+        return UBUS_STATUS_UNKNOWN_ERROR;
+    json_object_object_add(root, "ok", json_object_new_boolean(1));
+    job = cloud_bind_job_json();
+    if (job)
+        json_object_object_add(root, "data", job);
+    cloud_send_json(ctx, req, root);
+    json_object_put(root);
+    return UBUS_STATUS_OK;
+}
+
+static const struct blobmsg_policy browser_policy[] = {
+    { .name = "action", .type = BLOBMSG_TYPE_STRING },
+    { .name = "actor", .type = BLOBMSG_TYPE_STRING },
+    { .name = "request", .type = BLOBMSG_TYPE_TABLE },
+};
+
+static int cloud_handle_browser(struct ubus_context *ctx, struct ubus_object *obj,
+                               struct ubus_request_data *req, const char *method,
+                               struct blob_attr *msg)
+{
+    struct blob_attr *fields[3] = {0};
+    (void)obj; (void)method;
+    if (msg) blobmsg_parse(browser_policy, 3, fields, blob_data(msg), blob_len(msg));
+    char *raw = fields[2] ? blobmsg_format_json(fields[2], true) : NULL;
+    struct json_object *request = raw ? json_tokener_parse(raw) : json_object_new_object();
+    struct json_object *response = cloud_browser_control(
+        fields[0] ? blobmsg_get_string(fields[0]) : "",
+        fields[1] ? blobmsg_get_string(fields[1]) : "", request);
+    free(raw);
+    if (request) json_object_put(request);
+    int rc = cloud_send_json(ctx, req, response);
+    if (response) json_object_put(response);
+    return rc;
+}
+
 static const struct ubus_method cloud_methods[] = {
+    UBUS_METHOD("web_access", cloud_handle_browser, browser_policy),
     UBUS_METHOD_NOARG("status", cloud_handle_status),
     UBUS_METHOD_NOARG("identity", cloud_handle_identity),
     UBUS_METHOD("enroll", cloud_handle_enroll, cloud_enroll_policy),
+    UBUS_METHOD("cert_obtain", cloud_handle_cert_obtain, cloud_cert_policy),
+    UBUS_METHOD_NOARG("cert_status", cloud_handle_cert_status),
+    UBUS_METHOD("bind_code", cloud_handle_bind_code, cloud_bind_policy),
+    UBUS_METHOD_NOARG("bind_status", cloud_handle_bind_status),
 };
 
 static struct ubus_object_type cloud_object_type =

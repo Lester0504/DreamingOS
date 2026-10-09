@@ -1,0 +1,121 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="robots" content="noindex,nofollow">
+    <meta name="theme-color" content="#101114">
+    <title>Dreaming OS 桌面</title>
+    <link rel="icon" href="/static/images/logo-64.png">
+    <link rel="stylesheet" href="/static/ui-kit/dwrt-ui-kit.css?v=20260905-sidebar-tabs-01">
+    <link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
+    <link rel="stylesheet" href="/static/css/theme-families.css?v=20261008-desktop-material-01">
+    <link rel="stylesheet" href="/static/desktop/dwrt-desktop.css?v=20261008-desktop-material-01">
+    <link rel="stylesheet" href="/static/desktop/dwrt-rail.css?v=20261008-desktop-material-01">
+    <link rel="stylesheet" href="/static/desktop/community/community-host.css?v=20261004-community-01">
+</head>
+  <body>
+    <main class="dwrt-desktop" id="desktopRoot" data-launcher-mode="dock" data-open-gesture="single" data-window-style="dwrt" aria-label="Dreaming OS 桌面">
+      <div class="desktop-wallpaper" aria-hidden="true">
+        <img src="/static/background/dwrt-default-bg.jpg" alt="">
+      </div>
+      <section class="desktop-canvas" id="desktopCanvas" aria-label="应用"></section>
+      <section class="desktop-windows" id="desktopWindows" aria-label="应用窗口"></section>
+      <div class="desktop-snap-preview" id="desktopSnapPreview" aria-hidden="true" hidden></div>
+      <nav class="desktop-dock" id="desktopDock" aria-label="应用切换"></nav>
+      <nav class="desktop-sidebar" id="desktopSidebar" aria-label="应用切换"></nav>
+      <aside class="desktop-widget" id="desktopWidget" data-expanded="false" aria-label="系统状态监控">
+        <div class="widget-shell">
+          <div class="widget-bar" id="desktopWidgetBar"></div>
+          <div class="widget-body"><div class="widget-body-inner" id="desktopWidgetBody"></div></div>
+        </div>
+      </aside>
+      <div class="desktop-launchpad" id="desktopLaunchpad" role="dialog" aria-modal="true" aria-label="所有应用" hidden>
+        <div class="launchpad-brand" aria-hidden="true"><img src="/static/images/logo-wide.png?v=20260919-brand-01" alt="DreamingOS"></div>
+        <div class="launchpad-search">
+          <input type="search" id="desktopLaunchpadSearch" placeholder="搜索" aria-label="搜索应用" autocomplete="off" spellcheck="false">
+        </div>
+        <button class="launchpad-nav launchpad-prev" type="button" data-launchpad-action="prev" aria-label="上一页" hidden>‹</button>
+        <button class="launchpad-nav launchpad-next" type="button" data-launchpad-action="next" aria-label="下一页" hidden>›</button>
+        <div class="launchpad-viewport">
+          <div class="desktop-launchpad-grid" id="desktopLaunchpadGrid"></div>
+          <p class="launchpad-empty" id="desktopLaunchpadEmpty" hidden>未找到应用</p>
+        </div>
+        <div class="launchpad-pages" id="desktopLaunchpadPages" aria-hidden="true"></div>
+      </div>
+      <div class="desktop-context" id="desktopContext" role="menu" hidden>
+        <button type="button" data-context-action="open" role="menuitem">打开</button>
+        <button type="button" data-context-action="pin" role="menuitem" hidden>固定到程序坞</button>
+        <button type="button" data-context-action="arrange" role="menuitem">整理图标</button>
+        <button type="button" data-context-action="refresh" role="menuitem">刷新桌面</button>
+        <button type="button" data-context-action="show-desktop" role="menuitem">显示桌面</button>
+        <button type="button" data-context-action="settings" role="menuitem">桌面设置</button>
+      </div>
+      <div class="desktop-account-popover" id="desktopAccount" role="dialog" aria-label="账户" hidden></div>
+      <aside class="desktop-drawer" id="desktopDrawer" role="dialog" aria-label="抽屉" hidden></aside>
+      <iframe class="desktop-registry" id="desktopRegistry" title="桌面应用注册表" tabindex="-1" aria-hidden="true"></iframe>
+      <aside class="desktop-session" id="desktopSession" role="alert" hidden>
+        <span>会话已过期</span><a id="desktopLogin" href="/login/">重新登录</a>
+      </aside>
+      <dialog id="desktopConfirm" aria-labelledby="desktopConfirmTitle">
+        <h2 id="desktopConfirmTitle">放弃未保存的更改？</h2>
+        <p>尚未保存的内容将丢失。</p>
+        <form method="dialog">
+          <button value="cancel" autofocus>继续编辑</button>
+          <button value="discard">放弃更改</button>
+        </form>
+      </dialog>
+      <dialog class="desktop-settings" id="desktopSettings" aria-labelledby="desktopSettingsTitle">
+        <form method="dialog">
+          <header>
+            <div>
+              <h2 id="desktopSettingsTitle">桌面设置</h2>
+              <p>这些偏好保存在当前浏览器。</p>
+            </div>
+            <button class="desktop-settings-close" value="close" aria-label="关闭桌面设置" title="关闭">×</button>
+          </header>
+          <fieldset>
+            <legend>界面材质</legend>
+            <div class="desktop-segmented desktop-segmented-tri">
+              <label><input type="radio" name="themeFamily" value="liquid-glass" data-desktop-theme-family><span>液态玻璃</span></label>
+              <label><input type="radio" name="themeFamily" value="frosted-glass" data-desktop-theme-family><span>毛玻璃</span></label>
+              <label><input type="radio" name="themeFamily" value="traditional" data-desktop-theme-family><span>传统</span></label>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>应用栏位置</legend>
+            <div class="desktop-segmented">
+              <label><input type="radio" name="launcher" value="dock" data-desktop-preference="launcher"><span>底部 Dock</span></label>
+              <label><input type="radio" name="launcher" value="sidebar" data-desktop-preference="launcher"><span>左侧栏</span></label>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>桌面图标</legend>
+            <div class="desktop-segmented">
+              <label><input type="radio" name="openGesture" value="single" data-desktop-preference="openGesture"><span>单击打开</span></label>
+              <label><input type="radio" name="openGesture" value="double" data-desktop-preference="openGesture"><span>双击打开</span></label>
+            </div>
+          </fieldset>
+          <fieldset>
+            <legend>窗口样式</legend>
+            <div class="desktop-segmented">
+              <label><input type="radio" name="windowStyle" value="dwrt" data-desktop-preference="windowStyle"><span>默认</span></label>
+              <label><input type="radio" name="windowStyle" value="macos" data-desktop-preference="windowStyle"><span>macOS</span></label>
+            </div>
+          </fieldset>
+        </form>
+      </dialog>
+    </main>
+    <link rel="stylesheet" href="/static/css/notifications.css?v=20260712-10">
+    <link rel="stylesheet" href="/static/css/cloud-announcements.css?v=20260928-3">
+    <script src="/static/js/dwrt-session-gate.js?v=20260808-region-ink-uses-painted-density-01" defer></script>
+    <script src="/static/js/menu-icons.js?v=20260918-desktop-mode-01" defer></script>
+    <script src="/static/js/notifications.js?v=20260704-1" defer></script>
+    <script src="/static/js/cloud-announcements-state.js?v=20260928-1" defer></script>
+    <script src="/static/js/cloud-announcements.js?v=20260928-3" defer></script>
+    <script src="/static/ui-kit/dwrt-ui-kit.js?v=20260905-sidebar-tabs-01" defer></script>
+    <script src="/static/ui-kit/lucide.min.js" defer></script>
+    <script src="/static/desktop/dwrt-desktop.js?v=20261008-desktop-material-01" defer></script>
+    <script src="/static/desktop/glass-foreground.js?v=20261008-desktop-material-01" defer></script>
+  </body>
+</html>

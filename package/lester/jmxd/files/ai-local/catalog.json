@@ -1,0 +1,14 @@
+{
+  "schema_version": 1,
+  "profiles": [
+    {
+      "id": "rk3588-rkllm-1.3.1",
+      "compatible": "rockchip,rk3588",
+      "runtime": "rkllm-1.3.1",
+      "validated": false,
+      "driver_version": null,
+      "library_sha256": null
+    }
+  ],
+  "models": []
+}

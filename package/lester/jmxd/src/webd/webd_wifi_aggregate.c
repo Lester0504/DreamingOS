@@ -7,6 +7,12 @@
 #include <strings.h>
 #include <time.h>
 
+struct json_object *webd_wifi_channel_ai_plan(struct json_object *data,
+                                              int64_t now_s)
+{
+    return wifi_channel_ai_plan_json(data, now_s);
+}
+
 enum webd_wifi_resource_kind {
     WEBD_WIFI_RADIO,
     WEBD_WIFI_SSID,
@@ -268,6 +274,33 @@ static const char *wifi_survey_absence_reason(struct json_object *survey,
         return missing_survey;
     reason = wifi_string(survey, "reason", "");
     return reason[0] ? reason : missing_field;
+}
+
+/*
+ * Why an `air_stats` block that exists carries no numbers.
+ *
+ * The vendor collector (`apstats`) fills in source/available/reason itself, so
+ * on QCA hardware this is just a passthrough. The mac80211/nl80211 backend is
+ * the case that needed fixing: apd_mac80211_attach_retry() creates `air_stats`
+ * purely to hang the `iw station dump` retry totals on, and never writes
+ * source, available or reason. The aggregate then published reason as the empty
+ * string, and the wireless page had nothing to say beyond a bare dash -- the
+ * user-visible symptom being OBSS interference, MIMO and the Wi-Fi standard
+ * reading as unexplained blanks on 31.250/31.251, where `apstats` and
+ * `wlanconfig` are simply not installed.
+ *
+ * An empty string is not a reason. Name the two states apart instead: nothing
+ * was collected at all, versus a collector that ran and came back short.
+ */
+static const char *wifi_air_stats_absence_reason(struct json_object *air)
+{
+    const char *reason = wifi_string(air, "reason", "");
+
+    if (reason[0] || wifi_bool(air, "available", 0))
+        return reason;
+    return wifi_string(air, "source", "")[0] ?
+        "vendor_airtime_counters_incomplete" :
+        "vendor_airtime_counters_not_collected";
 }
 
 static void wifi_namespace_reference(struct json_object *resource,
@@ -861,12 +894,35 @@ static void wifi_desired_ssid_bands(struct json_object *desired_ssids,
         return;
     for (i = 0; i < json_object_array_length(desired_ssids); i++) {
         struct json_object *ssid = json_object_array_get_idx(desired_ssids, i);
+        struct json_object *radio_ids;
         const char *radio_id;
 
         if (!ssid || !json_object_is_type(ssid, json_type_object))
             continue;
         if (wifi_child(ssid, "band"))
             continue;
+        radio_ids = wifi_child_array(ssid, "radio_ids");
+        if (radio_ids && json_object_array_length(radio_ids) > 1) {
+            struct json_object *bands = json_object_new_array();
+            size_t link;
+
+            for (link = 0; link < json_object_array_length(radio_ids); link++) {
+                const char *id = json_object_get_string(
+                    json_object_array_get_idx(radio_ids, link));
+                for (j = 0; id && j < json_object_array_length(desired_radios); j++) {
+                    struct json_object *radio = json_object_array_get_idx(desired_radios, j);
+                    const char *band = wifi_string(radio, "band", "");
+
+                    if (!strcmp(id, wifi_string(radio, "id", "")) &&
+                        band[0] && !wifi_array_has_band(bands, band))
+                        json_object_array_add(bands, json_object_new_string(band));
+                }
+            }
+            json_object_object_add(ssid, "bands", bands);
+            json_object_object_add(ssid, "band_source",
+                json_object_new_string("inherited_from_radio_ids"));
+            continue;
+        }
         radio_id = wifi_string(ssid, "radio_id", "");
         if (!radio_id[0]) {
             json_object_object_add(ssid, "band_reason",
@@ -919,11 +975,114 @@ static struct json_object *wifi_ap_summary(struct json_object *ap,
                                            const char *model,
                                            const char *image_url,
                                            const char *image_model_match,
-                                           int online, int stale)
+                                           int online, int stale,
+                                           int fresh,
+                                           int station_inventory,
+                                           int station_metrics,
+                                           const char *station_inventory_reason,
+                                           const char *station_metrics_reason)
 {
     struct json_object *summary = json_object_new_object();
+    struct json_object *roaming = json_object_new_object();
+    struct json_object *reasons = json_object_new_object();
+    struct json_object *sources = wifi_child_object(snapshot, "sources");
+    struct json_object *hostapd = wifi_child_object(sources, "hostapd");
+    struct json_object *bss = wifi_child_array(hostapd, "bss");
+    const char *runtime_reason = stale ? "telemetry_stale" :
+        (!online ? "managed_ap_offline" : "hostapd_command_unsupported");
+    const char *ft_reason = runtime_reason;
+    const char *neighbor_reason = runtime_reason;
+    const char *transition_reason = runtime_reason;
+    const char *deauth_reason = runtime_reason;
+    int station_ownership = 0;
+    int ft_configured = 0;
+    int ft_supported = 0;
+    int ft_over_ds = 0;
+    int neighbor_report = 0;
+    int bss_transition = 0;
+    int client_deauth = 0;
+    size_t i;
+
+    if (fresh) {
+        for (i = 0; bss && i < json_object_array_length(bss); i++) {
+            struct json_object *item = json_object_array_get_idx(bss, i);
+
+            if (!item || !json_object_is_type(item, json_type_object) ||
+                !wifi_bool(item, "hostapd_ctrl_reachable", 0))
+                continue;
+            station_ownership |= wifi_string(item, "bssid", "")[0] != '\0';
+            ft_configured |= wifi_bool(item, "ft_configured", 0);
+            ft_supported |= wifi_bool(item, "ft_supported", 0);
+            ft_over_ds |= wifi_bool(item, "ft_over_ds", 0);
+            neighbor_report |= wifi_bool(item, "neighbor_report_80211k", 0);
+            bss_transition |= wifi_bool(item, "bss_transition_80211v", 0);
+            client_deauth |= wifi_bool(item, "client_deauth", 0);
+            ft_reason = wifi_string(item, "ft_reason", ft_reason);
+            neighbor_reason = wifi_string(item, "neighbor_report_reason",
+                                          neighbor_reason);
+            transition_reason = wifi_string(item, "bss_transition_reason",
+                                            transition_reason);
+            deauth_reason = wifi_string(item, "client_deauth_reason",
+                                        deauth_reason);
+        }
+    }
 
     json_object_object_add(summary, "ap_id", json_object_new_string(ap_id));
+
+    /* Phase 0 is deliberately read-only and fail-closed. Only station facts
+     * already proven by the fresh AP snapshot may be true. Action and domain
+     * configuration capabilities remain false until APD reports an explicit
+     * probe result for the current session. */
+    json_object_object_add(roaming, "station_inventory",
+                           json_object_new_boolean(fresh && station_inventory));
+    json_object_object_add(roaming, "station_signal",
+                           json_object_new_boolean(fresh && station_metrics));
+    json_object_object_add(roaming, "station_bssid_ownership",
+                            json_object_new_boolean(fresh && station_ownership));
+    json_object_object_add(roaming, "ft_80211r",
+                           json_object_new_boolean(fresh && ft_configured));
+    json_object_object_add(roaming, "ft_configured",
+                           json_object_new_boolean(fresh && ft_configured));
+    json_object_object_add(roaming, "ft_supported",
+                           json_object_new_boolean(fresh && ft_supported));
+    json_object_object_add(roaming, "ft_over_ds",
+                           json_object_new_boolean(fresh && ft_over_ds));
+    json_object_object_add(roaming, "neighbor_report_80211k",
+                            json_object_new_boolean(fresh && neighbor_report));
+    json_object_object_add(roaming, "bss_transition_80211v",
+                            json_object_new_boolean(fresh && bss_transition));
+    json_object_object_add(roaming, "client_deauth",
+                           json_object_new_boolean(fresh && client_deauth));
+    json_object_object_add(roaming, "roaming_domain_apply",
+                           json_object_new_boolean(0));
+    json_object_object_add(roaming, "roaming_domain_readback",
+                           json_object_new_boolean(0));
+    json_object_object_add(roaming, "source",
+                           json_object_new_string("apd_runtime_snapshot"));
+    json_object_object_add(reasons, "station_inventory", json_object_new_string(
+        fresh && station_inventory ? "available" :
+        (fresh ? station_inventory_reason : runtime_reason)));
+    json_object_object_add(reasons, "station_signal", json_object_new_string(
+        fresh && station_metrics ? "available" :
+        (fresh ? station_metrics_reason : runtime_reason)));
+    json_object_object_add(reasons, "station_bssid_ownership",
+                            json_object_new_string(fresh && station_ownership ?
+                                "available" : (fresh ?
+                                "station_ownership_unavailable" : runtime_reason)));
+    json_object_object_add(reasons, "ft_80211r",
+                            json_object_new_string(fresh ? ft_reason : runtime_reason));
+    json_object_object_add(reasons, "neighbor_report_80211k",
+                            json_object_new_string(fresh ? neighbor_reason : runtime_reason));
+    json_object_object_add(reasons, "bss_transition_80211v",
+                            json_object_new_string(fresh ? transition_reason : runtime_reason));
+    json_object_object_add(reasons, "client_deauth",
+                            json_object_new_string(fresh ? deauth_reason : runtime_reason));
+    json_object_object_add(reasons, "roaming_domain_apply",
+                           json_object_new_string("managed_ap_transaction_pending"));
+    json_object_object_add(reasons, "roaming_domain_readback",
+                           json_object_new_string("managed_ap_transaction_pending"));
+    json_object_object_add(roaming, "reasons", reasons);
+    json_object_object_add(summary, "roaming_capabilities", roaming);
     json_object_object_add(summary, "name", json_object_new_string(ap_name));
     json_object_object_add(summary, "display_name", json_object_new_string(ap_name));
     json_object_object_add(summary, "configured_name", json_object_new_string(
@@ -1318,13 +1477,27 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
             wifi_replace_null(radio, "tx_power_dbm");
             wifi_replace_string(radio, "tx_power_reason", "not_reported_by_driver");
         }
-        wifi_replace_null(radio, "tx_power_mode");
-        /* `iw dev` reports an effective dBm only; neither it nor the UCI
-         * wifi-device sections carry an auto/manual selector, and the desired
-         * radio ids (wifi0..n) cannot be mapped onto runtime phys, so there is
-         * no honest source for a mode. */
-        wifi_replace_string(radio, "tx_power_mode_reason",
-                            "tx_power_mode_not_exposed_by_driver_or_uci");
+        /*
+         * Transmit power mode now arrives from the AP when its backend can read
+         * it: netifd's UCI `txpower` option is the selector (absent = auto,
+         * set = fixed), and apd reports it as tx_power_mode. Overwriting that
+         * with null unconditionally is what made the射频 page print
+         * "当前 AP 未上报发射功率模式" beside a real dBm reading.
+         */
+        {
+            const char *mode = wifi_string(radio, "tx_power_mode", "");
+
+            if (mode[0]) {
+                wifi_replace_string(radio, "tx_power_mode_source",
+                    wifi_string(radio, "tx_power_mode_source",
+                                "ap_reported"));
+                json_object_object_del(radio, "tx_power_mode_reason");
+            } else {
+                wifi_replace_null(radio, "tx_power_mode");
+                wifi_replace_string(radio, "tx_power_mode_reason",
+                                    "tx_power_mode_not_exposed_by_driver_or_uci");
+            }
+        }
         wifi_replace_null(radio, "history_24h");
         wifi_replace_string(radio, "history_24h_reason", "radio_history_not_collected");
         {
@@ -1426,7 +1599,7 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
                     wifi_replace_string(published, "interface",
                                         wifi_string(air, "interface", ""));
                     wifi_replace_string(published, "reason",
-                                        wifi_string(air, "reason", ""));
+                                        wifi_air_stats_absence_reason(air));
                     /*
                      * Radio-level `apstats` prints no Retries line, so `retries`
                      * is null here. tx_failures is deliberately NOT copied into
@@ -1518,6 +1691,18 @@ static void wifi_decorate_radio_metrics(struct json_object *radios,
             wifi_replace_string(radio, "mimo", mimo);
             wifi_replace_string(radio, "mimo_source",
                                 matched_source ? matched_source : "station_nss");
+            json_object_object_del(radio, "mimo_reason");
+        } else if (wifi_string(radio, "mimo", "")[0]) {
+            /*
+             * The AP reported the radio's own stream capability (iw phy HE
+             * RX/TX NSS rows). Station rows are the better answer when they
+             * exist -- they describe what is actually negotiated -- but
+             * mac80211's `iw station dump` has no NSS column at all, so
+             * clearing this was reporting "not reported" about hardware that
+             * plainly advertises 4x4.
+             */
+            wifi_replace_string(radio, "mimo_source",
+                wifi_string(radio, "mimo_source", "ap_reported"));
             json_object_object_del(radio, "mimo_reason");
         } else {
             wifi_replace_null(radio, "mimo");
@@ -1919,6 +2104,7 @@ void webd_wifi_merge_environment_scan(struct json_object *data,
         wifi_bool(ac_cap, "scan_job_control_plane", 0);
     int complete = 1;
     int samples_available;
+    int64_t latest_sample_time = 0;
     size_t i;
 
     if (!data || !samples)
@@ -1960,6 +2146,8 @@ void webd_wifi_merge_environment_scan(struct json_object *data,
             json_object_put(sample);
             continue;
         }
+        if (sample_time > latest_sample_time)
+            latest_sample_time = sample_time;
         wifi_replace_string(sample, "local_radio_id", local_radio_id);
         wifi_replace_string(sample, "radio_id", aggregate_id);
         wifi_replace_string(sample, "source", "dreamingwrt-ac.radio_job");
@@ -1993,6 +2181,9 @@ void webd_wifi_merge_environment_scan(struct json_object *data,
                            json_object_new_int((int)json_object_array_length(samples)));
     json_object_object_add(neighbor, "complete", json_object_new_boolean(
         json_object_array_length(samples) > 0 && complete));
+    json_object_object_add(neighbor, "observed_at", latest_sample_time > 0 ?
+                           json_object_new_int64(latest_sample_time) :
+                           json_object_new_null());
     json_object_object_add(neighbor, "samples", samples);
     json_object_object_add(neighbor, "reason", json_object_new_string(
         !execution_available ? "ap_control_v2_scan_execution_unavailable" :
@@ -2112,24 +2303,21 @@ static struct json_object *wifi_survey_history_output_point(
     return point;
 }
 
-void webd_wifi_merge_survey_history(struct json_object *data,
-                                    struct json_object *response)
+/* Projects the survey buckets onto one radio array.
+ *
+ * Called once per published array: the wireless page reads `runtime_radios`
+ * while the desired view reads `radios`, and merging into only one of them is
+ * what left the radio card saying "信道历史当前不可用" while the very same
+ * series was sitting on the other array in the same response. */
+static void wifi_survey_history_apply(struct json_object *radios,
+                                      struct json_object *points,
+                                      int *any_mapped_point,
+                                      int *history_available)
 {
-    struct json_object *radios;
-    struct json_object *capabilities;
-    struct json_object *root = wifi_response_root(response);
-    struct json_object *points = wifi_child_array(root, "points");
-    const char *response_reason = wifi_string(root, "reason", "");
-    const char *reason = "survey_history_empty";
-    int any_mapped_point = 0;
-    int history_available = 0;
     size_t radio_index;
 
-    if (!data || !json_object_is_type(data, json_type_object))
+    if (!radios)
         return;
-    radios = wifi_ensure_array(data, "radios");
-    capabilities = wifi_ensure_object(data, "capabilities");
-
     for (radio_index = 0; radio_index < json_object_array_length(radios);
          radio_index++) {
         struct json_object *radio = json_object_array_get_idx(radios, radio_index);
@@ -2205,10 +2393,34 @@ void webd_wifi_merge_survey_history(struct json_object *data,
                                   "survey_history_empty");
         }
         if (match_count > 0)
-            any_mapped_point = 1;
+            *any_mapped_point = 1;
         if (complete_numeric_count >= 2)
-            history_available = 1;
+            *history_available = 1;
     }
+}
+
+void webd_wifi_merge_survey_history(struct json_object *data,
+                                    struct json_object *response)
+{
+    struct json_object *runtime;
+    struct json_object *capabilities;
+    struct json_object *root = wifi_response_root(response);
+    struct json_object *points = wifi_child_array(root, "points");
+    const char *response_reason = wifi_string(root, "reason", "");
+    const char *reason = "survey_history_empty";
+    int any_mapped_point = 0;
+    int history_available = 0;
+
+    if (!data || !json_object_is_type(data, json_type_object))
+        return;
+    capabilities = wifi_ensure_object(data, "capabilities");
+    wifi_survey_history_apply(wifi_ensure_array(data, "radios"), points,
+                              &any_mapped_point, &history_available);
+    wifi_survey_history_apply(wifi_child_array(data, "runtime_radios"), points,
+                              &any_mapped_point, &history_available);
+    runtime = wifi_child_object(data, "runtime");
+    wifi_survey_history_apply(wifi_child_array(runtime, "radios"), points,
+                              &any_mapped_point, &history_available);
 
     if (history_available)
         reason = "available";
@@ -2395,13 +2607,25 @@ static void wifi_collect_environment_samples(struct json_object *data,
     size_t i;
     int sample_count = 0;
     int fresh_count = 0;
-    int complete_count = 0;
+    int iw_sample_count = 0;
+    int iw_complete_count = 0;
+    int utilization_count = 0;
+    int noise_count = 0;
+    int saw_iw_source = 0;
+    const char *iw_reason = "iw_survey_sample_unavailable";
+    const char *utilization_reason = "channel_utilization_not_sampled";
+    const char *noise_reason = "noise_floor_not_reported_by_driver";
+    const char *utilization_source = "unavailable";
+    const char *noise_source = "unavailable";
 
     for (i = 0; radios && i < json_object_array_length(radios); i++) {
         struct json_object *radio = json_object_array_get_idx(radios, i);
         struct json_object *survey = wifi_child_object(radio, "survey");
         struct json_object *copy;
         struct json_object *complete;
+        const char *survey_source;
+        const char *survey_reason;
+        double value;
         int fresh;
         int survey_complete;
 
@@ -2410,6 +2634,8 @@ static void wifi_collect_environment_samples(struct json_object *data,
         fresh = wifi_bool(radio, "online", 0) && !wifi_bool(radio, "stale", 1) &&
                 !wifi_bool(survey, "stale", 0);
         survey_complete = wifi_bool(survey, "complete", 0);
+        survey_source = wifi_string(survey, "source", "");
+        survey_reason = wifi_string(survey, "reason", "");
         json_object_object_add(copy, "radio_id",
                                json_object_new_string(wifi_string(radio, "id", "")));
         json_object_object_add(copy, "ap_id",
@@ -2418,9 +2644,39 @@ static void wifi_collect_environment_samples(struct json_object *data,
                                json_object_new_string(wifi_string(radio, "band", "")));
         json_object_object_del(copy, "stale");
         json_object_object_add(copy, "stale", json_object_new_boolean(!fresh));
-        if (json_object_object_get_ex(survey, "complete", &complete) && complete &&
-            survey_complete && fresh)
-            complete_count++;
+        if (!strcmp(survey_source, "iw_survey")) {
+            saw_iw_source = 1;
+            iw_sample_count++;
+            if (survey_reason[0])
+                iw_reason = survey_reason;
+            else if (!fresh)
+                iw_reason = "iw_survey_samples_stale_or_incomplete";
+            if (json_object_object_get_ex(survey, "complete", &complete) && complete &&
+                survey_complete && fresh)
+                iw_complete_count++;
+        } else if (survey_reason[0]) {
+            /* An APD vendor fallback keeps the failed iw reason on its
+             * apstats sample.  That tells the UI why survey is closed without
+             * denying the independent vendor measurements below. */
+            iw_reason = survey_reason;
+        }
+        if (fresh && wifi_number(radio, "channel_utilization", &value) &&
+            value >= 0.0 && value <= 100.0) {
+            utilization_count++;
+            utilization_reason = "available";
+            utilization_source = wifi_string(radio,
+                "channel_utilization_source", survey_source);
+        } else if (wifi_string(radio, "channel_utilization_reason", "")[0]) {
+            utilization_reason = wifi_string(radio,
+                "channel_utilization_reason", utilization_reason);
+        }
+        if (fresh && wifi_number(radio, "noise_dbm", &value)) {
+            noise_count++;
+            noise_reason = "available";
+            noise_source = wifi_string(radio, "noise_source", survey_source);
+        } else if (wifi_string(radio, "noise_reason", "")[0]) {
+            noise_reason = wifi_string(radio, "noise_reason", noise_reason);
+        }
         if (fresh)
             fresh_count++;
         sample_count++;
@@ -2428,7 +2684,7 @@ static void wifi_collect_environment_samples(struct json_object *data,
     }
 
     json_object_object_add(channel, "supported",
-                           json_object_new_boolean(complete_count > 0));
+                           json_object_new_boolean(iw_complete_count > 0));
     json_object_object_add(channel, "source",
                            json_object_new_string("apd.iw_survey"));
     json_object_object_add(channel, "sample_count",
@@ -2436,13 +2692,11 @@ static void wifi_collect_environment_samples(struct json_object *data,
     json_object_object_add(channel, "fresh_sample_count",
                            json_object_new_int(fresh_count));
     json_object_object_add(channel, "complete",
-                           json_object_new_boolean(sample_count > 0 &&
-                                                    complete_count == sample_count));
+                           json_object_new_boolean(saw_iw_source &&
+                                                    iw_complete_count == iw_sample_count));
     json_object_object_add(channel, "samples", surveys);
     json_object_object_add(channel, "reason", json_object_new_string(
-        complete_count > 0 ? "available" :
-        (sample_count > 0 ? "iw_survey_samples_stale_or_incomplete" :
-                            "iw_survey_sample_unavailable")));
+        iw_complete_count > 0 ? "available" : iw_reason));
 
     json_object_object_add(neighbor, "supported", json_object_new_boolean(0));
     json_object_object_add(neighbor, "samples", json_object_new_array());
@@ -2461,15 +2715,35 @@ static void wifi_collect_environment_samples(struct json_object *data,
     json_object_object_add(environment, "spectral_fft", spectral);
     json_object_object_add(environment, "complete", json_object_new_boolean(0));
 
-    wifi_capability_bool(capabilities, "channel_survey", complete_count > 0);
+    /* `channel_survey` predates per-source capabilities.  Keep it as the iw
+     * path for compatibility, and publish the explicit name for new callers. */
+    wifi_capability_bool(capabilities, "channel_survey", iw_complete_count > 0);
+    wifi_capability_bool(capabilities, "channel_survey_iw",
+                         iw_complete_count > 0);
+    wifi_capability_bool(capabilities, "channel_utilization",
+                         utilization_count > 0);
+    wifi_capability_bool(capabilities, "noise_floor", noise_count > 0);
     wifi_capability_bool(capabilities, "survey_history", 0);
     wifi_capability_bool(capabilities, "neighbor_scan", 0);
     wifi_capability_bool(capabilities, "spectral_fft", 0);
     wifi_capability_reason(capabilities, "channel_survey",
-                           complete_count > 0 ? "available" :
-                           (sample_count > 0 ?
-                                               "iw_survey_samples_stale_or_incomplete" :
-                                               "iw_survey_sample_unavailable"));
+                           iw_complete_count > 0 ? "available" : iw_reason);
+    wifi_capability_reason(capabilities, "channel_survey_iw",
+                           iw_complete_count > 0 ? "available" : iw_reason);
+    wifi_capability_reason(capabilities, "channel_utilization",
+                           utilization_count > 0 ? "available" :
+                                                   utilization_reason);
+    wifi_capability_reason(capabilities, "noise_floor",
+                           noise_count > 0 ? "available" : noise_reason);
+    {
+        struct json_object *sources = wifi_ensure_object(capabilities, "sources");
+
+        wifi_replace_string(sources, "channel_survey_iw", "iw_survey");
+        wifi_replace_string(sources, "channel_utilization",
+                            utilization_count > 0 ? utilization_source : "unavailable");
+        wifi_replace_string(sources, "noise_floor",
+                            noise_count > 0 ? noise_source : "unavailable");
+    }
     wifi_capability_reason(capabilities, "survey_history",
                            "channel_survey_history_store_pending");
     wifi_capability_reason(capabilities, "neighbor_scan",
@@ -2804,9 +3078,85 @@ static void wifi_summary_replace_double(struct json_object *summary,
         json_object_new_double(value) : json_object_new_null());
 }
 
+void webd_wifi_refresh_channel_ai(struct json_object *data, int64_t now_s)
+{
+    struct json_object *capabilities;
+    struct json_object *channel_ai;
+    struct json_object *channel_ai_plan;
+    struct json_object *manifest = NULL;
+    const char *channel_ai_status;
+    const char *channel_plan_reason = "channel_ai_plan_unavailable";
+    int channel_ai_available;
+    int channel_plan_available = 0;
+
+    if (!data || !json_object_is_type(data, json_type_object))
+        return;
+    capabilities = wifi_ensure_object(data, "capabilities");
+    channel_ai = webd_wifi_channel_ai_plan(data, now_s);
+    channel_ai_plan = channel_ai ? wifi_child_object(channel_ai, "plan") : NULL;
+    channel_ai_status = channel_ai_plan ? wifi_string(
+        channel_ai_plan, "status", "insufficient_evidence") :
+        "insufficient_evidence";
+    channel_ai_available = channel_ai_plan &&
+        (!strcmp(channel_ai_status, "ready") ||
+         !strcmp(channel_ai_status, "partial_support"));
+
+    json_object_object_del(data, "channel_ai");
+    json_object_object_add(data, "channel_ai", channel_ai ? channel_ai :
+                           json_object_new_object());
+    wifi_capability_bool(capabilities, "channel_ai", channel_ai_available);
+    wifi_capability_reason(capabilities, "channel_ai",
+                           channel_ai_available ? "available" :
+                           channel_ai_status);
+
+    if (channel_ai_available)
+        manifest = wifi_channel_ai_apply_manifest_json(channel_ai_plan);
+    if (manifest && wifi_bool(manifest, "ok", 0)) {
+        const char *scope = wifi_string(manifest, "scope", "");
+        struct json_object *write_scopes = wifi_child_object(
+            capabilities, "write_scopes");
+
+        if (!strcmp(scope, "noop")) {
+            channel_plan_available = 1;
+            channel_plan_reason = "available";
+        } else if (!strcmp(scope, "local")) {
+            struct json_object *local = wifi_child_object(write_scopes,
+                                                          "local");
+
+            channel_plan_available = wifi_bool(local, "supported", 0);
+            channel_plan_reason = channel_plan_available ? "available" :
+                wifi_string(local, "reason",
+                            "local_write_capability_reported_false");
+        } else if (!strcmp(scope, "managed_ap")) {
+            struct json_object *managed = wifi_child_object(write_scopes,
+                                                            "managed_ap");
+            struct json_object *transaction = wifi_child_object(
+                managed, "transaction");
+
+            channel_plan_available = wifi_bool(transaction, "supported", 0);
+            channel_plan_reason = channel_plan_available ? "available" :
+                wifi_string(transaction, "reason",
+                            "managed_ap_transaction_unavailable");
+        } else {
+            channel_plan_reason = "channel_plan_scope_invalid";
+        }
+    } else if (manifest) {
+        channel_plan_reason = wifi_string(manifest, "reason",
+                                          "channel_plan_manifest_failed");
+    } else if (!channel_ai_available) {
+        channel_plan_reason = channel_ai_status;
+    } else {
+        channel_plan_reason = "channel_plan_manifest_allocation_failed";
+    }
+    wifi_capability_bool(capabilities, "channel_plan", channel_plan_available);
+    wifi_capability_reason(capabilities, "channel_plan", channel_plan_reason);
+    json_object_put(manifest);
+}
+
 struct json_object *webd_wifi_aggregate_data_with_resolver(
     struct json_object *local_response, struct json_object *ac_response,
-    int runtime_status, webd_wifi_model_image_resolver_fn image_resolver)
+    int runtime_status, webd_wifi_model_image_resolver_fn image_resolver,
+    struct json_object *ac_capabilities)
 {
     struct json_object *data = wifi_response_data_clone(local_response);
     struct json_object *capabilities = wifi_ensure_object(data, "capabilities");
@@ -2825,6 +3175,21 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
     struct json_object *bands;
     int local_source_available = wifi_response_available(local_response);
     int local_runtime_available = runtime_status && wifi_bool(runtime, "available", 0);
+    /*
+     * Local PHY truth: the local wifi_config/wifi_status response already
+     * determined whether hardware exists (capabilities.wifi and
+     * runtime_dependencies.phy_count).  We must preserve this even when
+     * the aggregated radios[]/ssids[] arrays are empty (e.g. hardware
+     * present but no configured radios, and AC unavailable).  Without
+     * this, the aggregation overwrites capabilities.wifi to false and
+     * the frontend shows "未检测到无线硬件".
+     */
+    struct json_object *cap_runtime_deps = wifi_child_object(capabilities,
+                                                           "runtime_dependencies");
+    int local_phy_count = cap_runtime_deps ?
+        (int)wifi_int64(cap_runtime_deps, "phy_count", 0) : 0;
+    int local_phy_present = wifi_bool(capabilities, "wifi", 0) ||
+        local_phy_count > 0;
     int ac_available = 0;
     int managed_online = 0;
     int remote_snapshots = 0;
@@ -2978,7 +3343,9 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
 
         json_object_array_add(managed_items, wifi_ap_summary(
             ap, ap_runtime, snapshot, ap_id, ap_name, model, image_url,
-            image_model_match, online, stale));
+            image_model_match, online, stale, fresh,
+            ap_station_inventory, ap_station_metrics,
+            ap_station_inventory_reason, ap_station_metrics_reason));
 
         if (!snapshot)
             continue;
@@ -3091,14 +3458,18 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
         !strcmp(station_inventory_reason_scope, "local")) {
         station_inventory_reason = remote_fresh > 0 ?
             "managed_ap_station_source_unavailable" :
-            "no_local_phy_and_no_managed_ap_runtime";
+            (local_phy_present ?
+             "phy_present_no_configured_radios_and_no_managed_ap" :
+             "no_local_phy_and_no_managed_ap_runtime");
         station_inventory_reason_scope = "managed_ap";
     }
     if (!station_metrics && !(local_radio_count || local_ssid_count) &&
         !strcmp(station_metrics_reason_scope, "local")) {
         station_metrics_reason = remote_fresh > 0 ?
             "managed_ap_station_metrics_unavailable" :
-            "no_local_phy_and_no_managed_ap_runtime";
+            (local_phy_present ?
+             "phy_present_no_configured_radios_and_no_managed_ap" :
+             "no_local_phy_and_no_managed_ap_runtime");
         station_metrics_reason_scope = "managed_ap";
     }
 
@@ -3127,9 +3498,16 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
     local_summary = json_object_new_object();
     json_object_object_add(local_summary, "available", json_object_new_boolean(
         runtime_status ? local_runtime_available :
-        (local_radio_count > 0 || local_ssid_count > 0)));
+        (local_radio_count > 0 || local_ssid_count > 0 || local_phy_present)));
     json_object_object_add(local_summary, "source_available",
                            json_object_new_boolean(local_source_available));
+    /* radio_count is the configured-radio count, not the PHY count.  Keep
+     * both facts so a device with a real PHY but zero UCI radios cannot be
+     * rendered as hardware-less by a consumer that prefers local_wifi. */
+    json_object_object_add(local_summary, "phy_count",
+                           json_object_new_int(local_phy_count));
+    json_object_object_add(local_summary, "wireless_present",
+                           json_object_new_boolean(local_phy_present));
     json_object_object_add(local_summary, "radio_count",
                            json_object_new_int((int)local_radio_count));
     json_object_object_add(local_summary, "ssid_count",
@@ -3138,7 +3516,10 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
         json_object_object_add(local_summary, "station_count",
                                json_object_new_int(0));
         json_object_object_add(local_summary, "station_count_reason",
-                               json_object_new_string("no_phy_detected"));
+                               json_object_new_string(
+                                   local_phy_present ?
+                                   "no_configured_radios" :
+                                   "no_phy_detected"));
     } else if (local_station_inventory) {
         json_object_object_add(local_summary, "station_count",
                                json_object_new_int((int)local_station_count));
@@ -3154,7 +3535,9 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
     json_object_object_add(local_summary, "reason", json_object_new_string(
         (runtime_status && wifi_string(runtime, "reason", "")[0]) ?
         wifi_string(runtime, "reason", "") :
-        ((local_radio_count || local_ssid_count) ? "available" : "no_phy_detected")));
+        ((local_radio_count || local_ssid_count) ? "available" :
+         (local_phy_present ? "phy_present_no_configured_radios" :
+          "no_phy_detected"))));
     json_object_object_add(data, "local_wifi", local_summary);
 
     sources = json_object_new_object();
@@ -3166,8 +3549,12 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
     json_object_object_del(capabilities, "bands");
     json_object_object_add(capabilities, "bands", bands);
     wifi_capability_bool(capabilities, "wifi",
-        json_object_array_length(radios) > 0 || json_object_array_length(ssids) > 0);
-    wifi_capability_bool(capabilities, "local_wifi", local_radio_count > 0 || local_ssid_count > 0);
+        json_object_array_length(radios) > 0 ||
+        json_object_array_length(ssids) > 0 ||
+        local_phy_present);
+    wifi_capability_bool(capabilities, "local_wifi",
+        local_radio_count > 0 || local_ssid_count > 0 ||
+        local_phy_present);
     wifi_capability_bool(capabilities, "managed_ap_inventory", ac_available);
     wifi_capability_bool(capabilities, "remote_telemetry", remote_snapshots > 0);
     wifi_capability_bool(capabilities, "remote_runtime_available", remote_fresh > 0);
@@ -3248,36 +3635,17 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
         (runtime_status && local_radio_count > 0 && local_runtime_available) || remote_fresh > 0);
     wifi_capability_bool(capabilities, "read_config",
         local_source_available || desired_available || remote_snapshots > 0);
-    if (ac_items && json_object_array_length(ac_items) > 0) {
-        const char *const writes[] = {
-            "save_config", "apply_config", "ssid_create", "ssid_update",
-            "ssid_delete", "radio_update", "global_update", "scan", NULL
-        };
-        const char *const *write;
-
-        for (write = writes; *write; write++) {
-            wifi_capability_bool(capabilities, *write, 0);
-            wifi_capability_reason(capabilities, *write,
-                                   "managed_ap_transaction_pending");
-        }
-    }
     /*
      * Publish the write capability per scope alongside the flat bits above.
      *
-     * The flat bits are deliberately left exactly as they are: a managed AP
-     * present means every write is refused, because the AP-side transaction
-     * (validate, push, read back, roll back on failure) is not implemented and
-     * opening the entry point would turn "atomic configuration" into "possibly
-     * half applied". Nothing here relaxes that.
-     *
-     * What the flat bits cannot express is *which* target is blocked. Today the
-     * question is moot on 30.1, whose local_wifi reports no_phy_detected, so
-     * there is no local write path to lose. It stops being moot the moment a
-     * controller has its own PHY and also adopts an AP: the loop above would
-     * refuse local writes too, purely because a remote AP cannot do
-     * transactions. That is the trap the acceptance handoff for this asked to
-     * avoid, and recording the scopes now means the eventual fix does not also
-     * have to invent the contract.
+     * When the AC is reachable and reports its write capabilities, those
+     * self-reported values are the source of truth for the managed-AP scope.
+     * The flat bits are updated to match: AC says true means true, AC says
+     * false carries AC's own reason (e.g. transaction_scope_not_supported).
+     * When the AC is unreachable or the ubus call fails, fail closed: all
+     * write capabilities stay false with a reason that is distinguishable
+     * from "the AC said no" (ac_capability_unreachable, not
+     * managed_ap_transaction_pending).
      *
      * `write_scopes.local.supported` follows the local PHY only, so it stays
      * false on this device for the honest reason rather than by inheriting the
@@ -3288,21 +3656,151 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
         struct json_object *local_scope = json_object_new_object();
         struct json_object *managed_scope = json_object_new_object();
         int has_managed = ac_items && json_object_array_length(ac_items) > 0;
-        int local_present = local_radio_count > 0 || local_ssid_count > 0;
+        int local_present = local_radio_count > 0 || local_ssid_count > 0 ||
+                            local_phy_present;
+        int ac_capability_available = 0;
+        const char *managed_unsupported_reason =
+            "ac_capability_unreachable";
+        /* AC's published write surface, forwarded verbatim so the page can act
+         * on the capability instead of describing it. Empty endpoint means the
+         * AC did not publish one and the scope stays read-only. */
+        const char *managed_endpoint = "";
+        const char *managed_method = "";
+        const char *managed_candidate_format = "";
+        int64_t managed_base_revision = -1;
 
         /* The local scope now follows what jmxd actually reports for this box.
          * Secrets survive a save (AEAD vault keyed by secret_id) and apply
          * verifies by readback, so hardcoding false here would understate a
          * path that works.  It still reads false on a unit with no PHY, and it
          * deliberately does not consult the managed-AP state. */
-        int local_write = local_present &&
-                          wifi_capability_true(capabilities, "save_config") &&
+        int local_save = local_present &&
+                         wifi_capability_true(capabilities, "save_config");
+        int local_apply = local_present &&
                           wifi_capability_true(capabilities, "apply_config");
+        int local_set_enabled = local_present &&
+                                wifi_capability_true(capabilities,
+                                                     "ssid_set_enabled");
+        int local_delete = local_present &&
+                           wifi_capability_true(capabilities, "ssid_delete");
+        int local_write = local_save && local_apply;
+        struct json_object *local_source_reasons =
+            wifi_child_object(capabilities, "reasons");
+        char local_set_enabled_reason[96];
+        char local_delete_reason[96];
+
+        snprintf(local_set_enabled_reason, sizeof(local_set_enabled_reason),
+                 "%s", local_set_enabled ? "available" :
+                 wifi_string(local_source_reasons, "ssid_set_enabled",
+                             "local_write_capability_reported_false"));
+        snprintf(local_delete_reason, sizeof(local_delete_reason), "%s",
+                 local_delete ? "available" :
+                 wifi_string(local_source_reasons, "ssid_delete",
+                             "local_write_capability_reported_false"));
+
+        /*
+         * Override the flat write bits from AC self-reported truth. AC is
+         * unreachable means fail-closed with a reason that is distinguishable
+         * from "AC said no".
+         */
+        if (has_managed) {
+            struct json_object *cap_root = ac_capabilities ?
+                wifi_response_root(ac_capabilities) : NULL;
+            struct json_object *ac_cap = cap_root ?
+                wifi_child_object(cap_root, "capabilities") : NULL;
+            struct json_object *ac_reasons = ac_cap ?
+                wifi_child_object(ac_cap, "reasons") : NULL;
+            const char *const ac_writes[] = {
+                "save_config", "apply_config", "ssid_create",
+                "ssid_update", "ssid_delete", "radio_update", NULL
+            };
+            const char *const *w;
+
+            ac_capability_available = ac_cap != NULL;
+            if (ac_reasons)
+                managed_unsupported_reason = wifi_string(
+                    ac_reasons, "radio_update",
+                    "ac_capability_not_reported");
+            else if (ac_capability_available)
+                managed_unsupported_reason = "ac_capability_not_reported";
+            if (ac_cap) {
+                struct json_object *revision =
+                    wifi_child(ac_cap, "wifi_desired_revision");
+
+                managed_endpoint = wifi_string(ac_cap,
+                    "radio_update_endpoint", "");
+                managed_method = wifi_string(ac_cap,
+                    "radio_update_method", "");
+                managed_candidate_format = wifi_string(ac_cap,
+                    "wifi_transaction_candidate_format", "");
+                if (revision &&
+                    (json_object_is_type(revision, json_type_int) ||
+                     json_object_is_type(revision, json_type_double)))
+                    managed_base_revision = json_object_get_int64(revision);
+            }
+
+            for (w = ac_writes; *w; w++) {
+                int val = ac_cap ? wifi_bool(ac_cap, *w, 0) : 0;
+                const char *reason = ac_reasons ?
+                    wifi_string(ac_reasons, *w, "") : "";
+
+                if (!reason[0])
+                    reason = ac_cap ? (val ? NULL : "ac_capability_not_reported") :
+                              "ac_capability_unreachable";
+                wifi_capability_bool(capabilities, *w, val);
+                wifi_capability_reason(capabilities, *w,
+                    reason ? reason : "available");
+            }
+            {
+                const char *secret_reason = ac_reasons ?
+                    wifi_string(ac_reasons, "ssid_secret_apply", "") : "";
+
+                if (!secret_reason[0])
+                    secret_reason = ac_capability_available ?
+                        "ac_capability_not_reported" :
+                        "ac_capability_unreachable";
+                wifi_capability_bool(capabilities, "ssid_secret_apply", 0);
+                wifi_capability_reason(capabilities, "ssid_secret_apply",
+                                       secret_reason);
+            }
+        }
 
         json_object_object_add(local_scope, "present",
                                json_object_new_boolean(local_present));
         json_object_object_add(local_scope, "supported",
                                json_object_new_boolean(local_write));
+        json_object_object_add(local_scope, "rest_exposed",
+                               json_object_new_boolean(1));
+        json_object_object_add(local_scope, "ssid_set_enabled",
+                               json_object_new_boolean(local_set_enabled));
+        json_object_object_add(local_scope, "ssid_delete",
+                               json_object_new_boolean(local_delete));
+        {
+            struct json_object *local_reasons = json_object_new_object();
+            json_object_object_add(local_reasons, "ssid_set_enabled",
+                json_object_new_string(local_set_enabled_reason));
+            json_object_object_add(local_reasons, "ssid_delete",
+                json_object_new_string(local_delete_reason));
+            json_object_object_add(local_scope, "reasons", local_reasons);
+        }
+        {
+            struct json_object *delete_request = json_object_new_object();
+            json_object_object_add(delete_request, "endpoint",
+                                   json_object_new_string(
+                                       "/api/v1/wifi/ssids/delete"));
+            json_object_object_add(delete_request, "method",
+                                   json_object_new_string("POST"));
+            json_object_object_add(delete_request, "request_field",
+                                   json_object_new_string("ssid_ids"));
+            json_object_object_add(delete_request, "atomic_batch",
+                                   json_object_new_boolean(local_delete));
+            json_object_object_add(delete_request, "runtime_apply",
+                                   json_object_new_boolean(local_delete));
+            json_object_object_add(delete_request, "readback_verified",
+                                   json_object_new_boolean(local_delete));
+            json_object_object_add(local_scope, "ssid_delete_request",
+                                   delete_request);
+        }
         json_object_object_add(local_scope, "reason",
             json_object_new_string(!local_present ? "no_local_phy_detected" :
                 local_write ? "available" :
@@ -3310,19 +3808,103 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
 
         json_object_object_add(managed_scope, "present",
                                json_object_new_boolean(has_managed));
-        json_object_object_add(managed_scope, "supported",
+        json_object_object_add(managed_scope, "rest_exposed",
+                               json_object_new_boolean(managed_endpoint[0] &&
+                                                      managed_base_revision >= 0));
+        json_object_object_add(managed_scope, "ssid_set_enabled",
                                json_object_new_boolean(0));
+        json_object_object_add(managed_scope, "ssid_delete",
+                               json_object_new_boolean(0));
+        /* The scope-level reason describes whether the managed write scope is
+         * usable.  SSID REST proxy limitations remain available in the
+         * dedicated fields below and must not mask a supported radio
+         * transaction as unavailable. */
         json_object_object_add(managed_scope, "reason",
-            json_object_new_string(has_managed ?
-                "managed_ap_transaction_pending" :
-                "no_managed_ap_adopted"));
+                               json_object_new_string("managed_ap_write_pending"));
+        {
+            /* managed_ap.supported follows AC truth: if the AC reports any
+             * write capability as true, the scope is supported. */
+            int managed_write = has_managed &&
+                (wifi_capability_true(capabilities, "save_config") ||
+                 wifi_capability_true(capabilities, "apply_config") ||
+                 wifi_capability_true(capabilities, "radio_update"));
+            const char *managed_reason = !has_managed ? "no_managed_ap_adopted" :
+                managed_write ? "available" :
+                managed_unsupported_reason;
+
+            json_object_object_add(managed_scope, "supported",
+                                   json_object_new_boolean(managed_write));
+            json_object_object_add(managed_scope, "write_reason",
+                json_object_new_string(managed_reason));
+            json_object_object_del(managed_scope, "reason");
+            json_object_object_add(managed_scope, "reason",
+                                   json_object_new_string(managed_reason));
+        }
+        /*
+         * The transaction descriptor. Radio writes on a managed AP go through
+         * the AC journal, not the local UCI path, and the page needs the route,
+         * the candidate format and the current revision to build one. Without
+         * these it could only report that a write path existed somewhere.
+         */
+        {
+            struct json_object *transaction = json_object_new_object();
+            int radio_write = has_managed &&
+                wifi_capability_true(capabilities, "radio_update") &&
+                managed_endpoint[0] && managed_base_revision >= 0;
+
+            json_object_object_add(transaction, "supported",
+                                   json_object_new_boolean(radio_write));
+            json_object_object_add(transaction, "endpoint",
+                json_object_new_string(managed_endpoint[0] ? managed_endpoint :
+                                       "/api/v1/wifi/transactions"));
+            json_object_object_add(transaction, "method",
+                json_object_new_string(managed_method[0] ? managed_method :
+                                       "POST"));
+            json_object_object_add(transaction, "candidate_format",
+                json_object_new_string(managed_candidate_format[0] ?
+                                       managed_candidate_format :
+                                       "uci-wireless-candidate.v1"));
+            json_object_object_add(transaction, "digest_algorithm",
+                                   json_object_new_string("sha256"));
+            json_object_object_add(transaction, "digest_prefix",
+                                   json_object_new_string("sha256:"));
+            json_object_object_add(transaction, "status_endpoint",
+                json_object_new_string("/api/v1/wifi/transactions/"));
+            if (managed_base_revision >= 0)
+                json_object_object_add(transaction, "base_revision",
+                    json_object_new_int64(managed_base_revision));
+            else
+                json_object_object_add(transaction, "base_revision",
+                                       json_object_new_null());
+            json_object_object_add(transaction, "reason",
+                json_object_new_string(radio_write ? "available" :
+                    !has_managed ? "no_managed_ap_adopted" :
+                    !managed_endpoint[0] ?
+                        "ac_did_not_publish_transaction_endpoint" :
+                    managed_base_revision < 0 ?
+                        "ac_did_not_publish_desired_revision" :
+                        managed_unsupported_reason));
+            json_object_object_add(managed_scope, "transaction", transaction);
+        }
+        /* Flat mirrors for readers that already look at capabilities.* */
+        if (managed_endpoint[0]) {
+            wifi_replace_string(capabilities, "radio_update_endpoint",
+                                managed_endpoint);
+            wifi_replace_string(capabilities, "radio_update_method",
+                                managed_method[0] ? managed_method : "POST");
+        }
+        if (managed_base_revision >= 0) {
+            json_object_object_del(capabilities, "wifi_desired_revision");
+            json_object_object_add(capabilities, "wifi_desired_revision",
+                json_object_new_int64(managed_base_revision));
+        }
 
         json_object_object_add(scopes, "local", local_scope);
         json_object_object_add(scopes, "managed_ap", managed_scope);
         /*
-         * States plainly that the flat bits above are the AND of both scopes,
-         * so a reader knows they are not scope-aware and must not infer "local
-         * is writable" from anything here.
+         * The flat bits retain their historical scope-agnostic shape. Readers
+         * that need to distinguish local writes from managed-AP writes must
+         * use the two explicit scope objects above.
          */
         json_object_object_add(scopes, "flat_bits_are_scope_agnostic",
                                json_object_new_boolean(1));
@@ -3375,7 +3957,15 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
         struct json_object *local_phys = wifi_child(summary, "phy_count");
         int interface_count = local_interfaces ?
             json_object_get_int(local_interfaces) : 0;
-        int phy_count = local_phys ? json_object_get_int(local_phys) : 0;
+        /* wifi_config has no summary object. Its local hardware count lives
+         * in capabilities.runtime_dependencies, so an empty summary must not
+         * turn a detected PHY into a zero-PHY result. */
+        int phy_count = local_phys ? json_object_get_int(local_phys) :
+            local_phy_count;
+
+        if (!local_phys)
+            json_object_object_add(summary, "phy_count",
+                                   json_object_new_int(phy_count));
 
         json_object_object_del(summary, "local_interface_count");
         json_object_object_add(summary, "local_interface_count",
@@ -3479,6 +4069,8 @@ struct json_object *webd_wifi_aggregate_data_with_resolver(
             json_object_new_int(roll.local_samples + roll.managed_samples));
     }
     wifi_replace_string(summary, "source", "local+dreamingwrt-ac");
+    if (runtime_status)
+        webd_wifi_refresh_channel_ai(data, (int64_t)time(NULL));
     return data;
 }
 
@@ -3487,5 +4079,5 @@ struct json_object *webd_wifi_aggregate_data(struct json_object *local_response,
                                              int runtime_status)
 {
     return webd_wifi_aggregate_data_with_resolver(local_response, ac_response,
-                                                   runtime_status, NULL);
+                                                   runtime_status, NULL, NULL);
 }

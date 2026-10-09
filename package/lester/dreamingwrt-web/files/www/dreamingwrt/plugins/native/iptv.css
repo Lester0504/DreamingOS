@@ -1,0 +1,94 @@
+/* IPTV owns layout only; shared Kit, rail and theme own materials. */
+.iptv-route { min-width:0; height:100%; overflow:hidden; }
+.iptv-shell { display:flex; height:100%; min-height:0; position:relative; color:var(--app-text); }
+.iptv-sidebar { flex-shrink:0; }
+.iptv-main { flex:1; min-width:0; min-height:0; overflow:auto; padding:var(--app-page-gutter); }
+.iptv-heading,.iptv-toolbar,.iptv-actions,.iptv-editor header,.iptv-player header { display:flex; align-items:center; gap:var(--app-page-gap); }
+.iptv-heading { justify-content:space-between; margin-bottom:var(--app-page-gap); }
+.iptv-heading h1 { font-size:18px; font-weight:600; margin:0; }
+.iptv-content { display:grid; gap:var(--app-page-gap); }
+.iptv-toolbar { flex-wrap:wrap; }
+.iptv-toolbar input { flex:1; min-width:130px; max-width:340px; }
+.iptv-summary { display:grid; grid-template-columns:repeat(4,minmax(0,1fr)); border-bottom:1px solid var(--dwrt-glass-edge); padding-bottom:var(--app-page-gap); gap:var(--app-page-gap); }
+.iptv-summary div { display:grid; gap:8px; }
+.iptv-summary span,.iptv-help,.iptv-empty p,.iptv-shell small { color:var(--app-text-secondary); font-size:13px; }
+.iptv-summary strong { font-size:24px; font-variant-numeric:tabular-nums; }
+.iptv-detail h2 { font-size:15px; margin:0 0 16px; }
+.iptv-detail dl { display:grid; grid-template-columns:minmax(100px,1fr) minmax(0,2fr); gap:12px; font-size:14px; }
+.iptv-detail dd { margin:0; overflow-wrap:anywhere; }
+.iptv-empty { padding:var(--app-page-gap) 0; }
+.iptv-empty strong { font-size:15px; font-weight:600; }
+.iptv-empty p { max-width:62ch; line-height:1.7; }
+.iptv-shell .dwrt-kit-table-scroll { overflow:auto; }
+.iptv-shell .dwrt-kit-table { width:100%; min-width:620px; }
+.iptv-shell small { display:block; margin-top:5px; overflow-wrap:anywhere; }
+.iptv-actions { gap:6px; flex-wrap:wrap; }
+.iptv-editor { padding:var(--app-page-gap); border-radius:var(--app-radius-panel); }
+.iptv-editor header { justify-content:space-between; margin-bottom:var(--app-page-gap); }
+.iptv-fields { display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:var(--app-page-gap); }
+.iptv-field { display:flex; flex-direction:column; align-items:flex-start; gap:8px; min-width:0; }
+.iptv-field .dwrt-kit-input { width:100%; min-width:0; box-sizing:border-box; }
+.iptv-help { line-height:1.7; }
+.iptv-notice { padding:12px 0; font-size:14px; overflow-wrap:anywhere; }
+.iptv-player { position:absolute; inset:var(--app-page-gutter); z-index:30; display:flex; flex-direction:column; background:var(--dwrt-glass-surface-raised); border:1px solid var(--dwrt-glass-edge-strong); border-radius:var(--app-radius-panel); padding:var(--app-page-gap); overflow:auto; }
+.iptv-player header { justify-content:space-between; }
+.iptv-player video { display:block; width:100%; min-height:0; flex:1; margin-top:var(--app-page-gap); background:#000; object-fit:contain; }
+.iptv-player p { font-size:14px; }
+@media(max-width:720px) {
+  .iptv-shell { --dwrt-rail-width:64px; }
+  .iptv-sidebar .dwrt-rail-brand,.iptv-sidebar .dwrt-rail-item-text { display:none; }
+  .iptv-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .iptv-fields { grid-template-columns:minmax(0,1fr); }
+  .iptv-heading h1 { font-size:16px; }
+  .iptv-main { padding:var(--app-page-gutter); }
+}
+
+.iptv-shell > [data-layout] { display:flex; flex:1; min-width:0; min-height:0; }
+.iptv-shell > [data-savebar] { position:absolute; inset:auto 12px max(12px,env(safe-area-inset-bottom)) 12px; z-index:54; pointer-events:none; }
+.iptv-shell > [data-savebar] .dwrt-kit-savebar { position:relative; inset:auto; width:max-content; max-width:100%; margin-inline:auto; pointer-events:auto; }
+.iptv-content > *, .iptv-content .dwrt-kit-table-wrap { min-width:0; max-width:100%; }
+.iptv-main { padding-bottom:calc(var(--app-page-gutter) + 80px); }
+.iptv-editor textarea { width:100%; box-sizing:border-box; font:inherit; resize:vertical; }
+.iptv-editor fieldset { border:0; padding:0; margin:0; }
+.iptv-traditional .iptv-shell > [data-layout] { flex-direction:column; }
+.iptv-traditional .iptv-sidebar { width:100%; flex:none; border:0; background:transparent; }
+.iptv-traditional .dwrt-rail-brand { display:none; }
+.iptv-traditional .dwrt-rail-list { flex-direction:row; display:flex; overflow:auto; gap:8px; padding:var(--app-page-gutter); }
+.iptv-traditional .dwrt-rail-item { flex:none; width:auto; }
+.iptv-traditional .dwrt-rail-item-text { display:block; }
+.iptv-traditional .dwrt-rail-item-icon { display:none; }
+.iptv-route { container-type:inline-size; }
+@container (max-width:720px) {
+  .iptv-shell { --dwrt-rail-width:64px; }
+  .iptv-sidebar .dwrt-rail-brand,.iptv-sidebar .dwrt-rail-item-text { display:none; }
+  .iptv-traditional .dwrt-rail-item-text { display:block; }
+  .iptv-summary { grid-template-columns:repeat(2,minmax(0,1fr)); }
+  .iptv-fields { grid-template-columns:minmax(0,1fr); }
+  .iptv-shell > [data-savebar] .dwrt-kit-savebar { width:100%; flex-wrap:wrap; border-radius:var(--app-radius-panel); }
+  .iptv-shell > [data-savebar] .dwrt-kit-savebar > span { flex:1 0 100%; text-align:center; white-space:normal; }
+  .iptv-shell > [data-savebar] .dwrt-kit-savebar-button { flex:1 1 0; min-height:40px; }
+  .iptv-main { padding-bottom:calc(var(--app-page-gutter) + 120px); }
+}
+
+.iptv-search { flex:1; min-width:130px; max-width:340px; margin:0; }
+.iptv-search input { width:100%; }
+
+.iptv-player.dwrt-kit-modal { width:auto; max-height:none; transform:none; }
+
+.iptv-addresses { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; }
+
+/* One bounded page surface in the console; desktop keeps its host material. */
+.console-stage:has(> .iptv-route) { height:var(--app-stage-height); min-height:0; display:flex; flex-direction:column; overflow:hidden; }
+.console-stage:has(> .iptv-route) > .stage-header { display:none; }
+#routePreview.iptv-route { display:flex; flex:1; min-height:0; margin:0; padding:0; }
+#routePreview.iptv-route > .iptv-shell { flex:1; width:100%; min-width:0; }
+.iptv-shell,.iptv-shell * { box-sizing:border-box; }
+@media(max-width:760px) {
+  .console-stage:has(> .iptv-route) { height:calc(100dvh - var(--app-content-inset-top,106px) - var(--app-mobile-nav-bottom-inset,74px)); }
+}
+
+.iptv-snapshot-image { display: block; max-width: 100%; height: auto; border-radius: var(--dwrt-radius-md, 12px); }
+
+/* Confirmation belongs to this application window, including a narrow host. */
+.iptv-shell > [data-confirmation] .dwrt-kit-modal-layer { position:absolute; }
+.iptv-shell > [data-confirmation] .dwrt-kit-modal { width:min(var(--dwrt-kit-modal-width,430px),100%); max-height:100%; }

@@ -5,15 +5,25 @@
 #include <fcntl.h>
 #include <poll.h>
 #include <signal.h>
+#include <spawn.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/wait.h>
+#include <sys/syscall.h>
 #include <time.h>
 #include <unistd.h>
 
 #define JMX_EXEC_KILL_GRACE_MS 200
 #define JMX_EXEC_MAX_OUTPUT JMX_EXEC_OUTPUT_LIMIT_MAX
+
+/* closefrom spawn actions are available in the glibc toolchains used by both
+ * x86 and ARM. Other libc versions retain the existing fork/exec contract. */
+#if defined(__GLIBC__) && defined(__GLIBC_PREREQ)
+#if __GLIBC_PREREQ(2, 34) && !defined(JMX_EXEC_FORCE_FORK)
+#define JMX_EXEC_SPAWN_CLOSEFROM 1
+#endif
+#endif
 
 static int64_t jmx_exec_now_ms(void)
 {
@@ -47,17 +57,60 @@ static int jmx_exec_valid(const char *path, char *const argv[],
     return i > 0;
 }
 
+#ifndef JMX_EXEC_SPAWN_CLOSEFROM
 static void jmx_exec_close_extra_fds(void)
 {
     long maxfd;
     int fd;
 
+#ifdef SYS_close_range
+    if (syscall(SYS_close_range, 3U, ~0U, 0U) == 0)
+        return;
+#endif
     maxfd = sysconf(_SC_OPEN_MAX);
     if (maxfd < 0 || maxfd > 65536)
         maxfd = 65536;
     for (fd = 3; fd < maxfd; fd++)
         close(fd);
 }
+#endif
+
+#ifdef JMX_EXEC_SPAWN_CLOSEFROM
+static int jmx_exec_spawn(pid_t *pid, const char *path, char *const argv[],
+                           char *const env[], int output_fd)
+{
+    posix_spawn_file_actions_t actions;
+    posix_spawnattr_t attr;
+    int rc = posix_spawn_file_actions_init(&actions);
+
+    if (rc != 0)
+        return rc;
+    rc = posix_spawnattr_init(&attr);
+    if (rc != 0) {
+        posix_spawn_file_actions_destroy(&actions);
+        return rc;
+    }
+    rc = posix_spawn_file_actions_addopen(&actions, STDIN_FILENO, "/dev/null",
+                                          O_RDWR | O_NOFOLLOW, 0);
+    if (!rc)
+        rc = posix_spawn_file_actions_adddup2(&actions,
+                    output_fd >= 0 ? output_fd : STDIN_FILENO, STDOUT_FILENO);
+    if (!rc)
+        rc = posix_spawn_file_actions_adddup2(&actions,
+                    output_fd >= 0 ? output_fd : STDIN_FILENO, STDERR_FILENO);
+    if (!rc)
+        rc = posix_spawn_file_actions_addclosefrom_np(&actions, 3);
+    if (!rc)
+        rc = posix_spawnattr_setpgroup(&attr, 0);
+    if (!rc)
+        rc = posix_spawnattr_setflags(&attr, POSIX_SPAWN_SETPGROUP);
+    if (!rc)
+        rc = posix_spawn(pid, path, &actions, &attr, argv, env);
+    posix_spawnattr_destroy(&attr);
+    posix_spawn_file_actions_destroy(&actions);
+    return rc;
+}
+#endif
 
 int jmx_exec_capture(const char *path, char *const argv[], size_t output_limit,
                      int timeout_ms, struct jmx_exec_result *result)
@@ -79,6 +132,19 @@ int jmx_exec_capture(const char *path, char *const argv[], size_t output_limit,
         if (!result->output || pipe2(pipefd, O_CLOEXEC | O_NONBLOCK) != 0)
             goto failed;
     }
+#ifdef JMX_EXEC_SPAWN_CLOSEFROM
+    {
+        int spawn_rc = jmx_exec_spawn(&pid, path, argv, clean_env,
+                                      output_limit ? pipefd[1] : -1);
+        if (spawn_rc != 0) {
+            if (pipefd[0] >= 0) close(pipefd[0]);
+            if (pipefd[1] >= 0) close(pipefd[1]);
+            /* Preserve the old child's exec failure result. */
+            result->exit_code = spawn_rc == ENOENT ? 127 : 126;
+            return 0;
+        }
+    }
+#else
     pid = fork();
     if (pid < 0)
         goto failed;
@@ -106,6 +172,7 @@ int jmx_exec_capture(const char *path, char *const argv[], size_t output_limit,
         _exit(errno == ENOENT ? 127 : 126);
     }
     (void)setpgid(pid, pid);
+#endif
     if (output_limit) {
         close(pipefd[1]);
         pipefd[1] = -1;

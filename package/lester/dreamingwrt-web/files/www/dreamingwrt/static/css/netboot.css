@@ -1,0 +1,2 @@
+/* Traditional shell only accepts /static/css entries; keep one shared skin. */
+@import url('/plugins/native/netboot.css?v=20261002-netboot-04');

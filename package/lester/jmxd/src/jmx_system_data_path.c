@@ -3,6 +3,7 @@
 #include "jmx_path_provider.h"
 
 #include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -10,6 +11,18 @@
 
 #ifndef JMX_SYSTEM_SIGNATURE_HOT_PATH
 #define JMX_SYSTEM_SIGNATURE_HOT_PATH "/tmp/dreamingwrt_signatures.db"
+#endif
+#ifndef JMX_SYSTEM_SIGNATURE_SEALED_HOT_PATH
+#define JMX_SYSTEM_SIGNATURE_SEALED_HOT_PATH "/tmp/dreamingwrt_signatures.dwsig"
+#endif
+#ifndef JMX_SYSTEM_SIGNATURE_SEALED_RUNTIME_PATH
+#define JMX_SYSTEM_SIGNATURE_SEALED_RUNTIME_PATH "/etc/dreamingwrt/dreamingwrt_signatures.dwsig"
+#endif
+#ifndef JMX_SYSTEM_SIGNATURE_SEALED_NEW_PATH
+#define JMX_SYSTEM_SIGNATURE_SEALED_NEW_PATH "/usr/share/dreamingos/system-db/dreamingwrt_signatures.dwsig"
+#endif
+#ifndef JMX_SYSTEM_SIGNATURE_SEALED_LEGACY_PATH
+#define JMX_SYSTEM_SIGNATURE_SEALED_LEGACY_PATH "/usr/share/dreamingwrt/system-db/dreamingwrt_signatures.dwsig"
 #endif
 #ifndef JMX_SYSTEM_SIGNATURE_RUNTIME_PATH
 #define JMX_SYSTEM_SIGNATURE_RUNTIME_PATH "/etc/dreamingwrt/dreamingwrt_signatures.db"
@@ -116,12 +129,21 @@ int jmx_system_db_resolve(enum jmx_system_db_kind kind,
     resolver_error(error, error_len, "");
     memset(&paths, 0, sizeof(paths));
     switch (kind) {
-    case JMX_SYSTEM_DB_SIGNATURE:
+    case JMX_SYSTEM_DB_SIGNATURE: {
+        const struct jmx_system_db_paths sealed = {
+            .hot = JMX_SYSTEM_SIGNATURE_SEALED_HOT_PATH,
+            .runtime = JMX_SYSTEM_SIGNATURE_SEALED_RUNTIME_PATH,
+            .firmware_new = JMX_SYSTEM_SIGNATURE_SEALED_NEW_PATH,
+            .firmware_legacy = JMX_SYSTEM_SIGNATURE_SEALED_LEGACY_PATH,
+        };
         paths.hot = JMX_SYSTEM_SIGNATURE_HOT_PATH;
         paths.runtime = JMX_SYSTEM_SIGNATURE_RUNTIME_PATH;
         paths.firmware_new = JMX_SYSTEM_SIGNATURE_NEW_PATH;
         paths.firmware_legacy = JMX_SYSTEM_SIGNATURE_LEGACY_PATH;
-        break;
+        return jmx_system_signature_resolve_paths(&sealed, &paths, selected_path,
+                                                   selected_path_len, source,
+                                                   error, error_len);
+    }
     case JMX_SYSTEM_DB_FINGERPRINT:
         paths.runtime = JMX_SYSTEM_FINGERPRINT_RUNTIME_PATH;
         paths.firmware_new = JMX_SYSTEM_FINGERPRINT_NEW_PATH;
@@ -190,4 +212,70 @@ int jmx_system_db_resolve_paths(
         return -1;
     }
     return 0;
+}
+
+int jmx_system_signature_resolve_paths(
+    const struct jmx_system_db_paths *sealed,
+    const struct jmx_system_db_paths *plaintext,
+    char *selected_path, size_t selected_path_len,
+    enum jmx_system_db_source *source, char *error, size_t error_len)
+{
+    char sealed_error[96] = "";
+    int rc = jmx_system_db_resolve_paths(sealed, selected_path,
+                                          selected_path_len, source,
+                                          sealed_error, sizeof(sealed_error));
+    /* Stage 1: only absence permits the legacy fallback. A present container
+     * is authoritative; a bad path, signature or key must never downgrade to
+     * plaintext. The corpus loader verifies it after this selection. */
+    if (rc != 0 && !strcmp(sealed_error, "path_not_found"))
+        return jmx_system_db_resolve_paths(plaintext, selected_path,
+                                           selected_path_len, source,
+                                           error, error_len);
+    resolver_error(error, error_len, sealed_error);
+    return rc;
+}
+
+/*
+ * Is a /www static asset servable, as opposed to merely present as plaintext?
+ *
+ * Browser assets under /www/dreamingwrt/static are installed gzip-only:
+ * dreamingos-extra-appicons ships 5004 files, every one of them a .gz, zero
+ * plaintext.  nginx serves that tree through
+ *
+ *     location ^~ /static/ {
+ *             alias /www/dreamingwrt/static/;
+ *             if ($http_accept_encoding !~* gzip) { return 406; }
+ *             gzip_static on;
+ *     }
+ *
+ * so a plaintext URL is served *from the .gz twin*, and a client that cannot
+ * accept gzip is rejected with 406 before any file is opened.  Measured on
+ * 31.251: GET /static/images/logo/09.png with Accept-Encoding: gzip answers 200,
+ * image/png, Content-Encoding: gzip, 4674 B -- exactly the size of 09.png.gz on
+ * disk -- while a name present in neither form answers 404.
+ *
+ * access(<plaintext>, R_OK) therefore asks the wrong question.  It asks whether
+ * these bytes are on disk, where the caller needs to know whether nginx can
+ * serve this URL.  On a gzip-only install the first is permanently false while
+ * the second is true, which is why every resolver that probed the plaintext path
+ * emitted no icon URL at all.  Callers must keep emitting the plaintext URL:
+ * nginx appends the .gz itself and sets Content-Encoding, whereas a URL that
+ * ended in .gz would be served as an opaque application/gzip download instead of
+ * an image.
+ */
+int jmx_static_asset_servable(const char *fs_path)
+{
+    char gz_path[PATH_MAX];
+    struct stat st;
+
+    if (!fs_path || !fs_path[0])
+        return 0;
+    if (stat(fs_path, &st) == 0 && S_ISREG(st.st_mode) &&
+        access(fs_path, R_OK) == 0)
+        return 1;
+    if (snprintf(gz_path, sizeof(gz_path), "%s.gz", fs_path) >=
+        (int)sizeof(gz_path))
+        return 0;
+    return stat(gz_path, &st) == 0 && S_ISREG(st.st_mode) &&
+           access(gz_path, R_OK) == 0;
 }

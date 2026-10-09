@@ -12,7 +12,8 @@ import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
-API = ROOT / "src/webd/jmx_app_api.c"
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text, webd_module_text
 HARNESS = ROOT / "tests/webd_otp_gate_fixture.c"
 
 
@@ -31,7 +32,7 @@ def test_factory_reset_is_gated_and_audited_before_execution() -> None:
     Ordering is the whole point: a factory reset destroys the storage the audit
     row lives on, so a record written afterwards is a record that never existed.
     """
-    source = API.read_text(encoding="utf-8")
+    source = webd_dispatch_text()
 
     for marker in (
         "webd_otp_gate_check",
@@ -68,7 +69,8 @@ def test_factory_reset_is_gated_and_audited_before_execution() -> None:
     )
 
     # A build missing the core method is a contract gap, not a transient 500.
-    helper = source[source.index("static struct json_object *app_ubus_core_route"):]
+    ubus_source = webd_module_text("api_ubus.c")
+    helper = ubus_source[ubus_source.index("struct json_object *app_ubus_core_route"):]
     helper = helper[: helper.index("\n}\n")]
     assert "UBUS_STATUS_METHOD_NOT_FOUND" in helper
     assert '*http_status = 501' in helper

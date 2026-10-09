@@ -92,7 +92,9 @@ static const char *class_for_path(const struct otad_persist_prefixes *prefixes,
         path_has_prefix(path, "/usr/lib/opkg") ||
         path_has_prefix(path, "/etc/apk") ||
         !strcmp(path, "/etc/board.json") ||
-        !strcmp(path, "/etc/dreamingwrt-release.json")) {
+        !strcmp(path, "/etc/dreamingwrt-release.json") ||
+        !strcmp(path, "/etc/dreamingos-release.json") ||
+        !strcmp(path, "/etc/dreamingos-ota-manifest.json")) {
         if (policy)
             *policy = "slot";
         return "system_owned";

@@ -52,6 +52,18 @@ static int apd_child_wait(pid_t child, int *status, int options,
     return -1;
 }
 
+static int apd_vendor_query_disabled(const char *path)
+{
+    const char *policy = getenv("DREAMINGWRT_APD_VENDOR_QUERIES");
+    const char *name = strrchr(path, '/');
+
+    if (!policy || strcmp(policy, "0"))
+        return 0;
+    name = name ? name + 1 : path;
+    return !strcmp(name, "wlanconfig") || !strcmp(name, "apstats") ||
+           !strcmp(name, "wifitool") || !strcmp(name, "iwpriv");
+}
+
 int apd_readonly_command_bounded(const char *path, char *const argv[],
                                  int timeout_ms, size_t output_limit,
                                  struct apd_command_result *result)
@@ -76,6 +88,15 @@ int apd_readonly_command_bounded(const char *path, char *const argv[],
     memset(result, 0, sizeof(*result));
     result->exit_status = -1;
     result->path = path;
+    /* Some vendor ioctls can hang the driver, beyond a child timeout's reach.
+     * Quarantined APs keep standard netlink and hostapd collection available. */
+    if (apd_vendor_query_disabled(path)) {
+        result->exit_status = 126;
+        result->stderr_text = strdup("vendor_queries_disabled_by_policy");
+        if (result->stderr_text)
+            result->stderr_length = strlen(result->stderr_text);
+        return -1;
+    }
     result->text = calloc(1, stdout_capacity);
     result->stderr_text = calloc(1, stderr_capacity);
     if (!result->text || !result->stderr_text || pipe(stdout_pipe) != 0 ||

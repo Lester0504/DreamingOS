@@ -8,4 +8,6 @@ struct json_object *jmx_signature_update_validate(struct json_object *cfg);
 struct json_object *jmx_signature_update_apply(struct json_object *cfg);
 struct json_object *jmx_signature_update_status(struct json_object *cfg);
 
+struct json_object *jmx_signature_host_cache_memory_json(void);
+
 #endif

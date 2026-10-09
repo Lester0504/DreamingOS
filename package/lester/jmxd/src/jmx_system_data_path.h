@@ -36,6 +36,19 @@ int jmx_system_db_resolve(enum jmx_system_db_kind kind,
                           enum jmx_system_db_source *source,
                           char *error, size_t error_len);
 
+/* Transitional signature authority: sealed first, plaintext only if absent. */
+int jmx_system_signature_resolve_paths(
+    const struct jmx_system_db_paths *sealed,
+    const struct jmx_system_db_paths *plaintext,
+    char *selected_path, size_t selected_path_len,
+    enum jmx_system_db_source *source, char *error, size_t error_len);
+
 const char *jmx_system_db_source_name(enum jmx_system_db_source source);
+
+/* Probe a /www asset the way nginx will serve it: the plaintext file when it is
+ * there, otherwise the .gz twin that gzip_static resolves the plaintext URL to.
+ * Returns 1 when the URL is servable.  The URL handed to a client must stay the
+ * plaintext path; nginx appends the .gz and sets Content-Encoding itself. */
+int jmx_static_asset_servable(const char *fs_path);
 
 #endif

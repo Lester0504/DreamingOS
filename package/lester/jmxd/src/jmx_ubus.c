@@ -92,7 +92,11 @@ typedef struct interface_traffic_node {
 
 static LIST_HEAD(interface_traffic_list);
 static int interface_traffic_count = 0;
-static char g_interface_name[16] = {0};  
+/* Sized to match jmx_legacy_settings_t.monitor_device, which the dashboard API
+ * accepts up to 63 characters of. At IFNAMSIZ this silently truncated a longer
+ * configured name, and the truncated prefix could then match a different real
+ * interface -- reporting one link's traffic under another's name. */
+static char g_interface_name[64] = {0};  
 static unsigned long long last_up_bytes = 0;
 static unsigned long long last_down_bytes = 0;
 static u_int32_t last_traffic_time = 0;
@@ -1809,20 +1813,8 @@ static struct json_object *get_dashboard_system_status(void) {
     }
     
 
-    char jmx_version_buf[32] = {0};
-    if (read_file_buf("/etc/jmx_version", jmx_version_buf, sizeof(jmx_version_buf)) > 0) {
-        str_trim(jmx_version_buf);
-        json_object_object_add(system_status, "jmx_version", json_object_new_string(jmx_version_buf));
-    } else {
-
-        if (read_file_buf("/etc/version", jmx_version_buf, sizeof(jmx_version_buf)) > 0) {
-            str_trim(jmx_version_buf);
-            json_object_object_add(system_status, "jmx_version", json_object_new_string(jmx_version_buf));
-        } else {
-            json_object_object_add(system_status, "jmx_version", json_object_new_string("Unknown"));
-        }
-    }
-    
+    /* System and legacy jmx_version fields share the canonical release provider. */
+    jmx_system_add_release_contract(system_status);
 
     memset(buf, 0, sizeof(buf));
     if (read_kernel_release(buf, sizeof(buf)) == 0) {
@@ -2075,7 +2067,7 @@ static const char *lookup_signature_app(unsigned int app_id, char *name, size_t 
 
                 if (snprintf(icon_path, sizeof(icon_path), "%s%s",
                              ICON_BASE_DIR, icon_file) < (int)sizeof(icon_path) &&
-                    access(icon_path, R_OK) == 0)
+                    jmx_static_asset_servable(icon_path))
                     snprintf(entry->icon, sizeof(entry->icon), "%s%s",
                              ICON_BASE_URL, icon_file);
             }
@@ -2423,8 +2415,13 @@ static int read_interface_traffic(const char *ifname, unsigned long long *up_byt
     int found = 0;
     
 
-    fgets(line, sizeof(line), netdev_fp);
-    fgets(line, sizeof(line), netdev_fp);
+    /* /proc/net/dev opens with two header lines; without them there are no
+     * counters to read, so bail instead of parsing the header as data. */
+    if (!fgets(line, sizeof(line), netdev_fp) ||
+        !fgets(line, sizeof(line), netdev_fp)) {
+        fclose(netdev_fp);
+        return -1;
+    }
     
     while (fgets(line, sizeof(line), netdev_fp)) {
         char interface[32] = {0};
@@ -4846,6 +4843,7 @@ struct json_object *jmx_api_route_reload(struct json_object *req_obj);
 struct json_object *jmx_api_route_config_get(struct json_object *req_obj);
 struct json_object *jmx_api_route_config_set(struct json_object *req_obj);
 struct json_object *jmx_api_route_policy_set(struct json_object *req_obj);
+struct json_object *jmx_api_route_sla_apply(struct json_object *req_obj);
 
 
 
@@ -4883,6 +4881,25 @@ struct json_object *jmx_api_get_dpi_stats(struct json_object *req_obj) {
 }
 
 /* ── Phase 6: Rule reload API ── */
+/* Resource promotion must not reapply networking as reload_rules does. */
+static struct json_object *jmx_api_resource_reload(struct json_object *req_obj)
+{
+    struct json_object *v = NULL;
+    const char *family = "";
+    int rc = -1;
+    if (req_obj && json_object_object_get_ex(req_obj, "family", &v))
+        family = json_object_get_string(v);
+    if (family && !strcmp(family, "signatures"))
+        rc = jmx_runtime_reload_signature_db(access("/etc/dreamingwrt/dreamingwrt_signatures.dwsig", R_OK) == 0 ?
+              "/etc/dreamingwrt/dreamingwrt_signatures.dwsig" : "/etc/dreamingwrt/dreamingwrt_signatures.db");
+    else if (family && !strcmp(family, "fingerprint"))
+        rc = db_try_import_fingerprint_catalog();
+    struct json_object *data = json_object_new_object();
+    json_object_object_add(data, "activated", json_object_new_boolean(rc >= 0));
+    json_object_object_add(data, "family", json_object_new_string(family ? family : ""));
+    return jmx_gen_api_response_data(rc >= 0 ? API_CODE_SUCCESS : API_CODE_ERROR, data);
+}
+
 struct json_object *jmx_api_reload_rules(struct json_object *req_obj) {
     struct json_object *data = json_object_new_object();
     struct json_object *apply_req = json_object_new_object();
@@ -5367,6 +5384,13 @@ static struct json_object *jmx_api_dns_direct_write_disabled(struct json_object 
 }
 
 
+static struct json_object *jmx_api_memory_profile_get(struct json_object *req)
+{ (void)req; return jmx_system_memory_profile_get(); }
+static struct json_object *jmx_api_memory_profile_preview(struct json_object *req)
+{ return jmx_system_memory_profile_change(req, 0); }
+static struct json_object *jmx_api_memory_profile_set(struct json_object *req)
+{ return jmx_system_memory_profile_change(req, 1); }
+
 static struct json_object *jmx_api_system_settings_get_wrap(struct json_object *req_obj)
 {
     (void)req_obj;
@@ -5432,17 +5456,14 @@ static struct json_object *jmx_api_work_mode_apply_wrap(struct json_object *req_
 static struct json_object *jmx_api_work_mode_rollback_wrap(struct json_object *req_obj){return dw_work_mode_rollback(req_obj);}
 static struct json_object *jmx_api_dreamingwrt_line_load_wrap(struct json_object *req_obj)
 {
-    dw_refresh_wan_state();
     return jmx_db_api_line_load(req_obj);
 }
 static struct json_object *jmx_api_dreamingwrt_line_health_wrap(struct json_object *req_obj)
 {
-    dw_refresh_wan_state();
     return jmx_db_api_line_health(req_obj);
 }
 static struct json_object *jmx_api_dreamingwrt_system_health_wrap(struct json_object *req_obj)
 {
-    dw_refresh_wan_state();
     return jmx_db_api_system_health(req_obj);
 }
 static struct json_object *jmx_api_dreamingwrt_wifi_config_wrap(struct json_object *req_obj){(void)req_obj;return jmx_wifi_config_get();}
@@ -5513,6 +5534,7 @@ static jmx_api_node_t jmx_api_node_list[] = {
     {"get_hosttype_stats", jmx_api_get_hosttype_stats},
     {"get_dpi_stats", jmx_api_get_dpi_stats},
     {"reload_rules", jmx_api_reload_rules},
+    {"resource_reload", jmx_api_resource_reload},
     {"route_wan_register", jmx_api_route_wan_register},
     {"route_wan_unregister", jmx_api_route_wan_unregister},
     {"route_wan_health", jmx_api_route_wan_health},
@@ -5525,6 +5547,7 @@ static jmx_api_node_t jmx_api_node_list[] = {
     {"route_config_get", jmx_api_route_config_get},
     {"route_config_set", jmx_api_route_config_set},
     {"route_policy_set", jmx_api_route_policy_set},
+    {"route_sla_apply", jmx_api_route_sla_apply},
     {"get_user_records", jmx_api_get_user_records},
     {"get_history_session", jmx_api_get_history_session},
     {"get_feature_info", jmx_api_get_feature_info},
@@ -5590,6 +5613,9 @@ static jmx_api_node_t jmx_api_node_list[] = {
     {"dreamingwrt_hybrid_line_add", jmx_api_hybrid_line_set},
     {"dreamingwrt_hybrid_line_delete", jmx_api_hybrid_line_delete},
     {"dreamingwrt_hybrid_line_enable", jmx_api_hybrid_line_enable},
+    {"dreamingwrt_system_memory_profile_get", jmx_api_memory_profile_get},
+    {"dreamingwrt_system_memory_profile_preview", jmx_api_memory_profile_preview},
+    {"dreamingwrt_system_memory_profile_set", jmx_api_memory_profile_set},
     {"dreamingwrt_system_settings", jmx_api_system_settings_get_wrap},
     {"dreamingwrt_system_settings_get", jmx_api_system_settings_get_wrap},
     {"dreamingwrt_system_settings_set", jmx_api_system_settings_set_wrap},
@@ -5817,6 +5843,10 @@ static struct ubus_object jmx_object = {
 
 static int jmx_add_object(struct ubus_object *obj)
 {
+    /* Object ids are scoped to a ubus connection.  After reconnecting, the
+     * id from the dead socket must not be sent back to ubusd. */
+    if (obj)
+        obj->id = 0;
     int ret = ubus_add_object(ubus_ctx, obj);
     if (ret != 0)
         LOG_ERROR("Failed to publish object '%s': %s\n", obj->name, ubus_strerror(ret));
@@ -5843,6 +5873,7 @@ static int jmx_ubus_register_objects(void)
         return -1;
     if (dreamingwrt_ubus_register(ubus_ctx) != 0) {
         ubus_remove_object(ubus_ctx, &jmx_object);
+        jmx_object.id = 0;
         return -1;
     }
     return 0;
@@ -5855,6 +5886,7 @@ static void jmx_ubus_unregister_objects(void)
     dreamingwrt_ubus_unregister(ubus_ctx);
     if (jmx_object.id)
         ubus_remove_object(ubus_ctx, &jmx_object);
+    jmx_object.id = 0;
 }
 
 static void jmx_ubus_cleanup_at_exit(void)

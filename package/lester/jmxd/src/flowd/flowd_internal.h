@@ -3,6 +3,7 @@
 #define DREAMINGWRT_FLOWD_INTERNAL_H
 
 #include <ctype.h>
+#include "jmx_dataset_path.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <signal.h>
@@ -50,7 +51,7 @@
 #define FLOWD_GEOIP_UPDATE_BACKOFF_MAX_S 86400
 /* Free space required beyond the download itself before a refresh is attempted. */
 #define FLOWD_GEOIP_UPDATE_MIN_FREE_BYTES (16ULL * 1024ULL * 1024ULL)
-#define FLOWD_DEFAULT_FLOW_DB_PATH "/etc/dreamingwrt/flow.db"
+#define FLOWD_DEFAULT_FLOW_DB_PATH jmx_dataset_path("flow")
 
 struct flowd_settings {
     int enabled;
@@ -78,6 +79,8 @@ struct json_object *flowd_json_parse_or_array(const char *s);
 struct json_object *flowd_json_from_blob(struct blob_attr *msg);
 struct json_object *flowd_payload_or_self(struct json_object *body);
 struct json_object *flowd_error(const char *code, const char *message);
+struct json_object *flowd_core_call(const char *method, struct json_object *payload,
+                                    int timeout_ms);
 const char *flowd_sqlite_text(sqlite3_stmt *st, int col, const char *def);
 int flowd_text_ok(const char *s, size_t max_len);
 int flowd_token_ok(const char *s, size_t max_len);
@@ -97,6 +100,7 @@ int flowd_countries_normalize(struct json_object *in, char *out, size_t out_len,
 
 sqlite3_stmt *flowd_config_prepare(const char *sql);
 int flowd_db_init(void);
+int flowd_db_open_worker(void);
 void flowd_db_close(void);
 int flowd_settings_load(struct flowd_settings *out);
 struct json_object *flowd_status_json(void);
@@ -178,7 +182,8 @@ struct json_object *flowd_nft_revision_status(void);
 struct json_object *flowd_nft_revision_apply(struct json_object *body);
 struct json_object *flowd_apply_jobs_json(struct json_object *body);
 struct json_object *flowd_tc_apply(const struct flowd_settings *settings);
-void flowd_tc_runtime_contract_state(struct flowd_runtime_contract_input *input);
+int flowd_tc_runtime_contract_state_v2(struct flowd_runtime_contract_input *input,
+                                       size_t input_size, unsigned int abi_version);
 int flowd_tc_apply_executor_available(void);
 int flowd_tc_runtime_json_add(sqlite3 *db, struct json_object *response,
                               struct json_object *tables, struct json_object *summary,
@@ -187,12 +192,17 @@ int flowd_tc_runtime_json_add(sqlite3 *db, struct json_object *response,
 int flowd_qoe_runtime_init(void);
 int flowd_qoe_runtime_start(void);
 void flowd_qoe_runtime_close(void);
+int flowd_runtime_sampler_command(int argc, char **argv);
+int flowd_runtime_sampler_init(const char *argv0);
+int flowd_runtime_sampler_start(void);
+void flowd_runtime_sampler_stop(void);
 int flowd_terminal_quota_runtime_start(void);
 void flowd_terminal_quota_runtime_stop(void);
 struct json_object *flowd_terminal_quota_runtime_status(void);
 int flowd_qoe_destination_lookup(const char *ip,
                                  struct flowd_qoe_destination *destination);
 struct json_object *flowd_qoe_status_json(void);
+struct json_object *flowd_qoe_reconcile_json(void);
 
 int flowd_ubus_start(void);
 void flowd_ubus_stop(void);

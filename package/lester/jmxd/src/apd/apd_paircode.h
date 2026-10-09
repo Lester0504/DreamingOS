@@ -122,4 +122,46 @@ void apd_paircode_fingerprint_short(const char *key_id, char *out,
 /* Scrubs a controller payload; call once the token has been consumed. */
 void apd_paircode_controller_cleanse(struct apd_paircode_controller *value);
 
+/*
+ * AP binding QR payload (dreamingwrt-ap-binding).
+ *
+ * JSON string for App scanning. Contains AP identity, key fingerprint,
+ * a local nonce for anti-replay, and an expiry timestamp.
+ * The AP generates this locally (no controller connection needed).
+ *
+ * Fields (short keys for QR compactness):
+ *   t  = type ("dreamingwrt-ap-binding")
+ *   v  = version (1)
+ *   bid = bootstrap_id (ap_id UUID)
+ *   kf = key_fingerprint (sha256:hex)
+ *   mac = management MAC
+ *   ep = management endpoint (ip:port, optional)
+ *   tk = ticket nonce (16-char base62)
+ *   te = ticket expiry (unix seconds)
+ *   mod = model string (optional)
+ */
+#define APD_BINDING_QR_MAX 512
+#define APD_BINDING_NONCE_LEN 16
+#define APD_BINDING_TICKET_TTL 300   /* 5 min */
+
+struct apd_binding_qr {
+    char ap_id[APD_PAIRCODE_ID_MAX + 1];
+    char key_id[APD_PAIRCODE_FPR_MAX + 1];
+    char mac[APD_PAIRCODE_MAC_MAX + 1];
+    char model[APD_PAIRCODE_MODEL_MAX + 1];
+    char mgmt_ip[APD_PAIRCODE_HOST_MAX + 1];
+    uint16_t mgmt_port;
+    char nonce[APD_BINDING_NONCE_LEN + 1];
+    int64_t expires_at;
+};
+
+/* Encodes a binding QR payload as a JSON string.
+ * Returns 0 on success, -1 on error. */
+int apd_binding_qr_encode(const struct apd_binding_qr *in,
+                           char *out, size_t out_size);
+
+/* Generates a random base62 nonce of the given length.
+ * Returns 0 on success, -1 on error. */
+int apd_binding_qr_generate_nonce(char *out, size_t len);
+
 #endif

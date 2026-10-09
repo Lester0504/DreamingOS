@@ -78,7 +78,7 @@ void init_app_name_table(void)
 
     free_app_name_table();
     if (config_signature_db_path(signature_path, sizeof(signature_path)) != 0 ||
-        sqlite3_open_v2(signature_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
+        jmx_signature_db_open_path(signature_path, &db) != SQLITE_OK)
         goto failed;
     if (sqlite3_prepare_v2(db, "SELECT COUNT(*) FROM app WHERE enabled=1", -1, &st, NULL) != SQLITE_OK ||
         sqlite3_step(st) != SQLITE_ROW)
@@ -108,7 +108,7 @@ void init_app_name_table(void)
     if (rc != SQLITE_DONE)
         goto failed;
     sqlite3_finalize(st);
-    sqlite3_close(db);
+    jmx_signature_db_close_path(db);
     LOG_WARN("signature app name table loaded: count=%d capacity=%d\n",
              g_app_count, g_app_name_table_capacity);
     return;
@@ -116,7 +116,7 @@ void init_app_name_table(void)
 failed:
     sqlite3_finalize(st);
     if (db)
-        sqlite3_close(db);
+        jmx_signature_db_close_path(db);
     LOG_ERROR("cannot initialize app names from %s\n", signature_path);
     free_app_name_table();
 }
@@ -131,7 +131,7 @@ void init_app_class_name_table(void)
 
     free_app_class_name_table();
     if (config_signature_db_path(signature_path, sizeof(signature_path)) != 0 ||
-        sqlite3_open_v2(signature_path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK)
+        jmx_signature_db_open_path(signature_path, &db) != SQLITE_OK)
         goto failed;
     if (sqlite3_prepare_v2(db,
             "SELECT COALESCE(MAX(category_id),0) FROM app_category WHERE category_id<=?1",
@@ -164,7 +164,7 @@ void init_app_class_name_table(void)
         goto failed;
     g_cur_class_num = max_class_id;
     sqlite3_finalize(st);
-    sqlite3_close(db);
+    jmx_signature_db_close_path(db);
     LOG_WARN("signature class table loaded: max_id=%d capacity=%d\n",
              g_cur_class_num, g_class_name_capacity);
     return;
@@ -172,7 +172,7 @@ void init_app_class_name_table(void)
 failed:
     sqlite3_finalize(st);
     if (db)
-        sqlite3_close(db);
+        jmx_signature_db_close_path(db);
     LOG_ERROR("cannot initialize app categories from %s\n", signature_path);
     free_app_class_name_table();
 }

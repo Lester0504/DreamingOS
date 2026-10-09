@@ -2,6 +2,7 @@
 #ifndef DREAMINGWRT_FLOWD_TC_APPLY_H
 #define DREAMINGWRT_FLOWD_TC_APPLY_H
 
+#include <stddef.h>
 #include <stdint.h>
 
 #include <json-c/json.h>
@@ -28,7 +29,8 @@ struct flowd_tc_runtime_state {
 int flowd_tc_apply_executor_available(void);
 int flowd_runtime_db_probe(int *present, int *openable, int *populated);
 int flowd_tc_runtime_state_read(struct flowd_tc_runtime_state *out);
-void flowd_tc_runtime_contract_state(struct flowd_runtime_contract_input *input);
+int flowd_tc_runtime_contract_state_v2(struct flowd_runtime_contract_input *input,
+                                       size_t input_size, unsigned int abi_version);
 struct json_object *flowd_tc_apply(const struct flowd_settings *settings);
 int flowd_tc_runtime_json_add(sqlite3 *db, struct json_object *response,
                               struct json_object *tables, struct json_object *summary,

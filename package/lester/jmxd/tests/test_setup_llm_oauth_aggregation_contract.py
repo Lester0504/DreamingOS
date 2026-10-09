@@ -5,9 +5,12 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text
 SETUP = (ROOT / "src/jmx_setup.c").read_text(encoding="utf-8")
 OAUTH = (ROOT / "src/webd/ai_oauth.c").read_text(encoding="utf-8")
-API = (ROOT / "src/webd/jmx_app_api.c").read_text(encoding="utf-8")
+API = webd_dispatch_text()
 
 
 def function(source: str, name: str, next_marker: str) -> str:

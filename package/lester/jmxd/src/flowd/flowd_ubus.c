@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "flowd_internal.h"
 #include "wan_sla_tx.h"
+#include "wan_sla_runtime.h"
 
 static int flowd_send_json(struct ubus_context *ctx, struct ubus_request_data *req,
                            struct json_object *obj)
@@ -39,8 +40,8 @@ static void flowd_core_invoke_cb(struct ubus_request *req, int type, struct blob
     free(s);
 }
 
-static struct json_object *flowd_core_call(const char *method, struct json_object *payload,
-                                           int timeout_ms)
+struct json_object *flowd_core_call(const char *method, struct json_object *payload,
+                                    int timeout_ms)
 {
     struct ubus_context *uctx = NULL;
     struct blob_buf b = {};
@@ -93,6 +94,54 @@ static struct json_object *flowd_core_data_or_self(struct json_object *resp)
     return resp;
 }
 
+static int flowd_handle_terminal_policy_compile(struct ubus_context *ctx,
+                                            struct ubus_object *obj,
+                                            struct ubus_request_data *req,
+                                            const char *method,
+                                            struct blob_attr *msg)
+{
+    struct json_object *resp;
+
+    (void)obj; (void)method; (void)msg;
+    resp = flowd_terminal_policy_compile();
+    flowd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
+static int flowd_handle_terminal_policy_apply(struct ubus_context *ctx,
+                                            struct ubus_object *obj,
+                                            struct ubus_request_data *req,
+                                            const char *method,
+                                            struct blob_attr *msg)
+{
+    struct flowd_settings settings;
+    struct json_object *resp;
+    (void)obj; (void)method; (void)msg;
+    if (flowd_settings_load(&settings) != 0) {
+        resp = flowd_error("settings_unavailable", "flowd settings unavailable");
+    } else {
+        resp = flowd_terminal_policy_apply(&settings);
+    }
+    flowd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
+static int flowd_handle_terminal_policy_runtime(struct ubus_context *ctx,
+                                            struct ubus_object *obj,
+                                            struct ubus_request_data *req,
+                                            const char *method,
+                                            struct blob_attr *msg)
+{
+    struct json_object *resp;
+    (void)obj; (void)method; (void)msg;
+    resp = flowd_terminal_policy_runtime();
+    flowd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
 static int flowd_handle_status(struct ubus_context *ctx, struct ubus_object *obj,
                                struct ubus_request_data *req, const char *method,
                                struct blob_attr *msg)
@@ -101,6 +150,21 @@ static int flowd_handle_status(struct ubus_context *ctx, struct ubus_object *obj
     (void)obj; (void)method; (void)msg;
 
     resp = flowd_status_json();
+    flowd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
+static int flowd_handle_smart_path_reconcile(struct ubus_context *ctx,
+                                             struct ubus_object *obj,
+                                             struct ubus_request_data *req,
+                                             const char *method,
+                                             struct blob_attr *msg)
+{
+    struct json_object *resp;
+
+    (void)obj; (void)method; (void)msg;
+    resp = flowd_qoe_reconcile_json();
     flowd_send_json(ctx, req, resp);
     json_object_put(resp);
     return UBUS_STATUS_OK;
@@ -128,6 +192,34 @@ static int flowd_handle_settings_set(struct ubus_context *ctx, struct ubus_objec
     (void)obj; (void)method;
 
     resp = flowd_settings_update(flowd_payload_or_self(body));
+    flowd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    json_object_put(body);
+    return UBUS_STATUS_OK;
+}
+
+static int flowd_handle_export_settings_get(struct ubus_context *ctx, struct ubus_object *obj,
+                                           struct ubus_request_data *req, const char *method,
+                                           struct blob_attr *msg)
+{
+    struct json_object *resp;
+    (void)obj; (void)method; (void)msg;
+
+    resp = flowd_export_settings_json();
+    flowd_send_json(ctx, req, resp);
+    json_object_put(resp);
+    return UBUS_STATUS_OK;
+}
+
+static int flowd_handle_export_settings_set(struct ubus_context *ctx, struct ubus_object *obj,
+                                           struct ubus_request_data *req, const char *method,
+                                           struct blob_attr *msg)
+{
+    struct json_object *body = flowd_json_from_blob(msg);
+    struct json_object *resp;
+    (void)obj; (void)method;
+
+    resp = flowd_export_settings_update(flowd_payload_or_self(body));
     flowd_send_json(ctx, req, resp);
     json_object_put(resp);
     json_object_put(body);
@@ -532,6 +624,22 @@ static int flowd_handle_wan_sla_commit(struct ubus_context *ctx, struct ubus_obj
     struct json_object *body = flowd_json_from_blob(msg);
     struct json_object *resp = flowd_wan_sla_commit(flowd_payload_or_self(body));
     (void)obj; (void)method; flowd_send_json(ctx, req, resp);
+    json_object_put(resp); json_object_put(body); return UBUS_STATUS_OK;
+}
+
+static int flowd_handle_wan_sla_runtime(struct ubus_context *ctx, struct ubus_object *obj,
+                                        struct ubus_request_data *req, const char *method,
+                                        struct blob_attr *msg)
+{
+    struct json_object *body = flowd_json_from_blob(msg);
+    struct json_object *payload = flowd_payload_or_self(body), *resp;
+    (void)obj;
+    if (!strcmp(method, "wan_sla_test")) resp = flowd_wan_sla_test(payload);
+    else if (!strcmp(method, "wan_sla_history") || !strcmp(method, "wan_sla_events")) {
+        json_object_object_add(payload, "events", json_object_new_boolean(!strcmp(method, "wan_sla_events")));
+        resp = flowd_wan_sla_history(payload);
+    } else resp = flowd_wan_sla_runtime_json(payload);
+    flowd_send_json(ctx, req, resp);
     json_object_put(resp); json_object_put(body); return UBUS_STATUS_OK;
 }
 
@@ -1044,9 +1152,16 @@ static const struct blobmsg_policy flowd_any_policy[] = {
 };
 
 static const struct ubus_method flowd_methods[] = {
+    UBUS_METHOD("terminal_policy_compile", flowd_handle_terminal_policy_compile, flowd_any_policy),
+    UBUS_METHOD("terminal_policy_apply", flowd_handle_terminal_policy_apply, flowd_any_policy),
+    UBUS_METHOD("terminal_policy_runtime", flowd_handle_terminal_policy_runtime, flowd_any_policy),
     UBUS_METHOD("status", flowd_handle_status, flowd_any_policy),
+    UBUS_METHOD("smart_path_reconcile", flowd_handle_smart_path_reconcile,
+                flowd_any_policy),
     UBUS_METHOD("settings_get", flowd_handle_settings_get, flowd_any_policy),
     UBUS_METHOD("settings_set", flowd_handle_settings_set, flowd_any_policy),
+    UBUS_METHOD("export_settings_get", flowd_handle_export_settings_get, flowd_any_policy),
+    UBUS_METHOD("export_settings_set", flowd_handle_export_settings_set, flowd_any_policy),
     UBUS_METHOD("geoip_sources_get", flowd_handle_geoip_sources_get, flowd_any_policy),
     UBUS_METHOD("geoip_source_set", flowd_handle_geoip_source_set, flowd_any_policy),
     UBUS_METHOD("geoip_source_delete", flowd_handle_geoip_source_delete, flowd_any_policy),
@@ -1075,6 +1190,10 @@ static const struct ubus_method flowd_methods[] = {
     UBUS_METHOD("wan_sla_list", flowd_handle_wan_sla_list, flowd_any_policy),
     UBUS_METHOD("wan_sla_preview", flowd_handle_wan_sla_preview, flowd_any_policy),
     UBUS_METHOD("wan_sla_commit", flowd_handle_wan_sla_commit, flowd_any_policy),
+    UBUS_METHOD("wan_sla_runtime", flowd_handle_wan_sla_runtime, flowd_any_policy),
+    UBUS_METHOD("wan_sla_test", flowd_handle_wan_sla_runtime, flowd_any_policy),
+    UBUS_METHOD("wan_sla_history", flowd_handle_wan_sla_runtime, flowd_any_policy),
+    UBUS_METHOD("wan_sla_events", flowd_handle_wan_sla_runtime, flowd_any_policy),
     UBUS_METHOD("split_rules_get", flowd_handle_split_rules_get, flowd_any_policy),
     UBUS_METHOD("split_rule_set", flowd_handle_split_rule_set, flowd_any_policy),
     UBUS_METHOD("split_rule_delete", flowd_handle_split_rule_delete, flowd_any_policy),

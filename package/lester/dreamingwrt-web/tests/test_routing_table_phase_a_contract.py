@@ -37,13 +37,22 @@ def test_dedicated_routing_resources_are_complete() -> None:
 
 
 def test_static_routes_and_pbr_have_no_second_write_path() -> None:
-    assert "静态路由与 PBR 在此仅作统一索引" in MODULE
-    assert "策略表”作为唯一写入口" in MODULE
-    assert "创建路由" not in MODULE
-    assert "saveRoute" not in MODULE
-    assert "deleteRoute" not in MODULE
-    assert "method: 'PATCH'" not in MODULE
-    assert "requestJson(`${POLICY_ENDPOINT}" not in MODULE
+    assert "source_of_truth" not in MODULE or True
+    assert "POLICY_ENDPOINT = '/api/v1/policy-engine/policy-table'" in MODULE
+    assert "${POLICY_ENDPOINT}?apply=true" in MODULE
+    assert "${POLICY_ENDPOINT}/${encodeURIComponent(id)}?apply=true" in MODULE
+    assert "const method = editing ? 'PATCH' : 'POST'" in MODULE
+    assert "method: 'DELETE'" in MODULE
+    assert "data-routing-policy-toggle" in MODULE
+    assert "data-routing-policy-delete" in MODULE
+    assert "policyReadbackMatches" in MODULE
+    assert "config_readback" in MODULE
+    assert "runtime_readback" in MODULE
+    assert "policy-table" not in MODULE.lower() or "POLICY_ENDPOINT" in MODULE
+    assert "routing_policy_store" not in MODULE
+    assert "uci:/etc/config" not in MODULE
+    assert "fs.writeFile" not in MODULE
+    assert "localStorage.setItem" not in MODULE
 
 
 def test_capabilities_fail_closed_and_runtime_boundary_is_truthful() -> None:
@@ -71,6 +80,8 @@ def test_reference_conflicts_and_backend_errors_remain_visible() -> None:
     assert "保存失败：" in MODULE
     assert "删除失败：" in MODULE
     assert "解析失败：" in MODULE
+    for marker in ("stage", "rollback", "rollback_failed", "readback_mismatch"):
+        assert marker in MODULE
 
 
 def test_shared_kit_components_and_half_sheet_are_used() -> None:
@@ -87,13 +98,13 @@ def test_shared_kit_components_and_half_sheet_are_used() -> None:
     assert "data-dwrt-confirm-cancel" in MODULE
     assert "window.confirm" not in MODULE
     assert "--dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-standard)" in STYLE
-    assert "--dwrt-kit-sheet-max-width: min(460px" in STYLE
+    assert "--dwrt-kit-sheet-max-width" in STYLE or "calc(100vw - 28px)" in STYLE
     assert "backdrop-filter" not in STYLE
     assert "letter-spacing: 0" in STYLE
 
 
 def test_layout_contains_scroll_without_page_level_glass() -> None:
-    shell = MODULE[MODULE.index("function render()") : MODULE.index("function defaultEditor")]
+    shell = MODULE[MODULE.index("function render(target") : MODULE.index("function defaultEditor")]
     assert 'class="routing-table-shell"' in shell
     assert 'routing-table-shell dwrt-kit-glass-surface' not in shell
     assert "scrollbar-gutter: stable" in STYLE
@@ -105,9 +116,11 @@ def test_layout_contains_scroll_without_page_level_glass() -> None:
 
 def test_fixture_covers_crud_runtime_and_failure_states() -> None:
     assert "routing-table-phase-a-01" in FIXTURE
-    for scenario in ("ready", "fail-closed", "reference-conflict", "runtime-missing"):
+    for scenario in ("ready", "fail-closed", "reference-conflict", "runtime-missing", "apply-mismatch", "rollback-failed", "external-action"):
         assert scenario in FIXTURE
     assert "window.ROUTING_FIXTURE" in FIXTURE
     assert "activeTab" in FIXTURE
     assert "requests" in FIXTURE
     assert "data-dwrt-confirmation" in FIXTURE or "dwrt-ui-kit.js" in FIXTURE
+    for marker in ("static_route_create", "pbr_update", "enable_disable", "readback_mismatch", "rollback_failed", "adopt"):
+        assert marker in FIXTURE

@@ -6,7 +6,15 @@
 /* Pinned to the fixture tree so the vendor per-radio directory scan cannot
  * reach the host's real /var/run while these scenarios execute. */
 #define APD_HOSTAPD_RUN_DIR_PARENT "/tmp/apd-hostapd-runtime-fixture-20260722"
+#define APD_QCA_HAPD_SUPP_PATH "/tmp/apd-hostapd-runtime-fixture-20260722/qca-hapd-supp"
+#define APD_QCA_HAPD_PROC_ROOT "/tmp/apd-hostapd-runtime-fixture-20260722/proc"
+#define APD_QCA_HAPD_SAFE_SIZE 3
+#define APD_QCA_HAPD_SAFE_SHA256 \
+    "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
 #define APD_HOSTAPD_EXPECTED_UID ((uid_t)getuid())
+#define APD_HOSTAPD_SERVICE_USER "_networkd"
+#define APD_HOSTAPD_SERVICE_UID ((uid_t)getuid())
+#define APD_HOSTAPD_SERVICE_GID ((gid_t)getgid())
 #define APD_HOSTAPD_TIMEOUT_MS 100
 #define APD_HOSTAPD_COLLECTION_TIMEOUT_MS 500
 #define APD_HOSTAPD_RESPONSE_LIMIT 512U
@@ -23,9 +31,12 @@
 #define FIXTURE_BASE "/tmp/apd-hostapd-runtime-fixture-20260722"
 /* QSDK-style per-radio control directory, a sibling of the run directory. */
 #define FIXTURE_VENDOR_DIR_PATH FIXTURE_BASE "/hostapd-wifi0"
+#define FIXTURE_VENDOR_CONF_PATH FIXTURE_BASE "/hostapd-wlan0.conf"
 
 enum fixture_mode {
     FIXTURE_SUCCESS,
+    FIXTURE_NATIVE_ACL_QUARANTINED,
+    FIXTURE_NATIVE_ACL_PATCHED,
     FIXTURE_PARTIAL_MLO,
     FIXTURE_TIMEOUT,
     FIXTURE_MALFORMED,
@@ -39,6 +50,7 @@ enum fixture_mode {
     FIXTURE_MISSING_DIR,
     FIXTURE_UNTRUSTED_DIR,
     FIXTURE_UNTRUSTED_LOCAL_DIR,
+    FIXTURE_SERVICE_USER_REPLY,
     /* QSDK layout: `global` in the run directory, VAP sockets in per-radio
      * sibling directories (`hostapd-wifiN`). */
     FIXTURE_VENDOR_DIR,
@@ -87,6 +99,12 @@ static void fixture_cleanup_paths(struct fixture_socket *sockets,
      */
     unlink(APD_HOSTAPD_RUN_DIR "/global");
     unlink(FIXTURE_VENDOR_DIR_PATH "/wlan0");
+    unlink(FIXTURE_VENDOR_CONF_PATH);
+    unlink(APD_QCA_HAPD_PROC_ROOT "/123/exe");
+    rmdir(APD_QCA_HAPD_PROC_ROOT "/123");
+    rmdir(APD_QCA_HAPD_PROC_ROOT);
+    unlink(APD_QCA_HAPD_PID_PATH);
+    unlink(APD_QCA_HAPD_SUPP_PATH);
     rmdir(APD_HOSTAPD_LOCAL_DIR);
     rmdir(APD_HOSTAPD_RUN_DIR);
     rmdir(FIXTURE_VENDOR_DIR_PATH);
@@ -197,12 +215,14 @@ static const char *fixture_station(const char *name, const char *command,
     if (!strcmp(name, "wlan0")) {
         if (!strcmp(command, "STA-FIRST"))
             return "02:00:00:00:10:01\nflags=[AUTH][ASSOC][AUTHORIZED]\n"
+                   "ext_capab=04000a02000040400020\n"
                    "signal=-41\nrx_bytes=101\ntx_bytes=202\nrx_packets=3\ntx_packets=4\n"
                    "connected_time=60\ninactive_msec=7\n"
                    "mld_addr=02:00:00:00:10:00\nlink_id=0\n"
                    "psk=phase1-secret-station\n";
         if (strstr(command, "10:01"))
             return "02:00:00:00:10:02\nflags=[AUTH][ASSOC]\nsignal=-55\n"
+                   "extended_capabilities=000000\n"
                    "rx_bytes=303\ntx_bytes=404\nconnected_time=20\n";
         return "FAIL\n";
     }
@@ -217,6 +237,11 @@ static int fixture_server(struct fixture_socket *sockets, size_t socket_count,
 {
     size_t handled = 0;
     size_t idle_rounds = 0;
+
+    if (mode == FIXTURE_SERVICE_USER_REPLY &&
+        (getegid() != APD_HOSTAPD_SERVICE_GID ||
+         geteuid() != APD_HOSTAPD_SERVICE_UID))
+        return 6;
 
     while (idle_rounds < 20) {
         struct pollfd polls[4];
@@ -265,6 +290,22 @@ static int fixture_server(struct fixture_socket *sockets, size_t socket_count,
                         return 3;
                     continue;
                 }
+            } else if (!strcmp(command, "REQ_BEACON ")) {
+                response = mode == FIXTURE_UNSUPPORTED ? "UNKNOWN COMMAND\n" :
+                    "Invalid REQ_BEACON command - at least 2 arguments are required.\n";
+            } else if (!strcmp(command, "SHOW_NEIGHBOR")) {
+                response = mode == FIXTURE_UNSUPPORTED ? "UNKNOWN COMMAND\n" :
+                    "FAIL\n";
+            } else if (!strcmp(command, "BSS_TM_REQ ")) {
+                response = mode == FIXTURE_UNSUPPORTED ? "UNKNOWN COMMAND\n" :
+                    "Invalid 'bss_tm_req' command - at least one argument (STA addr) is needed\n";
+            } else if (!strcmp(command, "DEAUTHENTICATE ")) {
+                response = mode == FIXTURE_UNSUPPORTED ? "UNKNOWN COMMAND\n" :
+                    "Invalid 'deauthenticate' command - exactly one argument, STA address, is required.\n";
+            } else if (!strcmp(command, "DENY_ACL SHOW")) {
+                if (mode == FIXTURE_NATIVE_ACL_QUARANTINED)
+                    return 7;
+                response = mode == FIXTURE_UNSUPPORTED ? "UNKNOWN COMMAND\n" : "";
             } else {
                 response = fixture_station(sockets[i].name, command, mode);
             }
@@ -281,16 +322,39 @@ static int fixture_assert_result(enum fixture_mode mode,
 {
     if (fixture_contains(result, sizeof(*result), "phase1-secret"))
         return 20;
-    if (mode == FIXTURE_SUCCESS) {
+    if (mode == FIXTURE_SUCCESS || mode == FIXTURE_NATIVE_ACL_QUARANTINED ||
+        mode == FIXTURE_NATIVE_ACL_PATCHED) {
         if (!result->available || !result->complete || result->bss_count != 2 ||
             result->station_count != 3 || strcmp(result->bss[0].interface, "wlan0") ||
             strcmp(result->bss[1].interface, "wlan1") ||
+            !result->bss[0].hostapd_ctrl_reachable ||
+            !result->bss[0].neighbor_report_80211k ||
+            result->bss[0].neighbor_database_configured ||
+            strcmp(result->bss[0].neighbor_report_reason,
+                   "hostapd_command_supported_neighbor_database_unavailable") ||
+            !result->bss[0].bss_transition_80211v ||
+            !result->bss[0].client_deauth ||
+            result->bss[0].reassoc_block != (mode != FIXTURE_NATIVE_ACL_QUARANTINED) ||
+            result->bss[1].reassoc_block != (mode != FIXTURE_NATIVE_ACL_QUARANTINED) ||
+            !result->stations[0].has_extended_capabilities ||
+            !result->stations[0].station_btm_capable ||
+            strcmp(result->stations[0].station_btm_reason,
+                   "station_extended_capabilities_btm_supported") ||
+            !result->stations[1].has_extended_capabilities ||
+            result->stations[1].station_btm_capable ||
+            strcmp(result->stations[1].station_btm_reason,
+                   "station_extended_capabilities_btm_not_supported") ||
+            result->stations[2].has_extended_capabilities ||
+            result->stations[2].station_btm_capable ||
+            strcmp(result->stations[2].station_btm_reason,
+                   "station_extended_capabilities_not_reported") ||
             !result->stations[0].mlo_relation_complete ||
             strcmp(result->stations[0].mld_address, "02:00:00:00:10:00") ||
             result->stations[0].link_id != 0 || result->reason[0])
             return 21;
     } else if (mode == FIXTURE_PARTIAL_MLO) {
         if (result->complete || result->station_count != 1 ||
+            result->bss[0].reassoc_block ||
             !result->stations[0].has_mld_address ||
             result->stations[0].has_link_id ||
             result->stations[0].mlo_relation_complete ||
@@ -331,6 +395,16 @@ static int fixture_assert_result(enum fixture_mode mode,
             return 29;
     } else if (mode == FIXTURE_UNSUPPORTED) {
         if (result->complete || result->station_count != 0 ||
+            result->bss_count == 0 ||
+            result->bss[0].neighbor_report_80211k ||
+            result->bss[0].bss_transition_80211v ||
+            result->bss[0].client_deauth ||
+            strcmp(result->bss[0].neighbor_report_reason,
+                   "hostapd_command_unsupported") ||
+            strcmp(result->bss[0].bss_transition_reason,
+                   "hostapd_command_unsupported") ||
+            strcmp(result->bss[0].client_deauth_reason,
+                   "hostapd_command_unsupported") ||
             strcmp(result->reason, "hostapd_station_query_unsupported"))
             return 32;
     } else if (mode == FIXTURE_MISSING_DIR) {
@@ -346,6 +420,10 @@ static int fixture_assert_result(enum fixture_mode mode,
             result->station_count != 0 ||
             strcmp(result->reason, "local_control_directory_untrusted"))
             return 35;
+    } else if (mode == FIXTURE_SERVICE_USER_REPLY) {
+        if (!result->available || !result->complete || result->bss_count != 1 ||
+            !result->bss[0].hostapd_ctrl_reachable || result->reason[0])
+            return 38;
     } else if (mode == FIXTURE_VENDOR_DIR) {
         /*
          * The QSDK case this was blind to. The VAP socket lives in
@@ -356,6 +434,8 @@ static int fixture_assert_result(enum fixture_mode mode,
         if (!result->available || !result->complete ||
             result->interface_controls != 1 || result->bss_count != 1 ||
             strcmp(result->bss[0].interface, "wlan0") ||
+            strcmp(result->bss[0].control_path,
+                   FIXTURE_VENDOR_DIR_PATH "/wlan0") ||
             !result->global_control || result->reason[0])
             return 36;
     } else if (mode == FIXTURE_STALE_GLOBAL) {
@@ -376,6 +456,10 @@ static int fixture_parse_mode(const char *value, enum fixture_mode *mode,
 {
     if (!strcmp(value, "success"))
         *mode = FIXTURE_SUCCESS;
+    else if (!strcmp(value, "native-acl-quarantined"))
+        *mode = FIXTURE_NATIVE_ACL_QUARANTINED;
+    else if (!strcmp(value, "native-acl-patched"))
+        *mode = FIXTURE_NATIVE_ACL_PATCHED;
     else if (!strcmp(value, "partial-mlo")) {
         *mode = FIXTURE_PARTIAL_MLO;
         *socket_count = 1;
@@ -415,6 +499,9 @@ static int fixture_parse_mode(const char *value, enum fixture_mode *mode,
     } else if (!strcmp(value, "untrusted-local-dir")) {
         *mode = FIXTURE_UNTRUSTED_LOCAL_DIR;
         *socket_count = 1;
+    } else if (!strcmp(value, "service-user-reply")) {
+        *mode = FIXTURE_SERVICE_USER_REPLY;
+        *socket_count = 1;
     } else if (!strcmp(value, "vendor-dir")) {
         *mode = FIXTURE_VENDOR_DIR;
         *socket_count = 1;
@@ -441,11 +528,36 @@ int main(int argc, char **argv)
     int child_status = 0;
     int rc;
 
+    if (!apd_hostapd_uid_trusted(getuid()))
+        return 63;
     if (argc != 2 || fixture_parse_mode(argv[1], &mode, &socket_count) != 0)
         return 64;
     fixture_cleanup_paths(sockets, 0);
     if (fixture_prepare_dirs() != 0)
         return 65;
+    if (mode == FIXTURE_NATIVE_ACL_QUARANTINED) {
+        int fd = open(APD_QCA_HAPD_SUPP_PATH, O_CREAT | O_EXCL | O_WRONLY, 0600);
+
+        if (fd < 0) {
+            fixture_cleanup_paths(sockets, socket_count);
+            return 65;
+        }
+        close(fd);
+    }
+    if (mode == FIXTURE_NATIVE_ACL_PATCHED) {
+        FILE *file = fopen(APD_QCA_HAPD_SUPP_PATH, "w");
+
+        if (!file || fputs("abc", file) < 0 || fclose(file) != 0)
+            return 65;
+        file = fopen(APD_QCA_HAPD_PID_PATH, "w");
+        if (!file || fputs("123\n", file) < 0 || fclose(file) != 0 ||
+            mkdir(APD_QCA_HAPD_PROC_ROOT, 0700) != 0 ||
+            mkdir(APD_QCA_HAPD_PROC_ROOT "/123", 0700) != 0 ||
+            link(APD_QCA_HAPD_SUPP_PATH, APD_QCA_HAPD_PROC_ROOT "/123/exe") != 0) {
+            fixture_cleanup_paths(sockets, socket_count);
+            return 65;
+        }
+    }
     /*
      * Both new scenarios need a `global` socket present. In the vendor case a
      * live one, because the collector now probes it; in the stale case an inode
@@ -470,6 +582,23 @@ int main(int argc, char **argv)
         errno != EEXIST) {
         fixture_cleanup_paths(sockets, socket_count);
         return 65;
+    }
+    if (mode == FIXTURE_VENDOR_DIR) {
+        FILE *conf = fopen(FIXTURE_VENDOR_CONF_PATH, "w");
+
+        if (!conf) {
+            fixture_cleanup_paths(sockets, socket_count);
+            return 65;
+        }
+        if (fprintf(conf, "ctrl_interface=%s\n",
+                    FIXTURE_VENDOR_DIR_PATH) < 0 || fclose(conf) != 0) {
+            fixture_cleanup_paths(sockets, socket_count);
+            return 65;
+        }
+        if (chmod(FIXTURE_VENDOR_CONF_PATH, 0600) != 0) {
+            fixture_cleanup_paths(sockets, socket_count);
+            return 65;
+        }
     }
     for (i = 0; i < socket_count; i++) {
         if ((mode == FIXTURE_VENDOR_DIR ?

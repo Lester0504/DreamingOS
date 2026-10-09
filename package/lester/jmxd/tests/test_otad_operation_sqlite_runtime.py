@@ -383,8 +383,32 @@ int main(void)
         "'ota-11111111111111111111111111111111'", value, sizeof(value)) == 0);
     CHECK(strcmp(value, "apply:writing") == 0);
 
+    {
+        char owned_id[OTAD_OPERATION_ID_LEN + 1], error[160];
+        struct json_object *options = json_object_new_object();
+        struct json_object *request = json_object_new_object();
+        otad_json_add_string(options, "owner_id", "web:alice");
+        CHECK(otad_operation_create("firmware", "preflight",
+            "upl-22222222222222222222222222222222", options,
+            owned_id, error, sizeof(error)) == 0);
+        json_object_put(options);
+        CHECK(otad_operation_update(owned_id, "failed", 100,
+            "fixture", "no firmware was written", NULL) == 0);
+        otad_db_close();
+        CHECK(otad_db_init() == 0);
+        otad_json_add_string(request, "operation_id", owned_id);
+        result = otad_operation_status(request);
+        CHECK(!strcmp(otad_json_str(result, "owner_id", ""), "web:alice"));
+        json_object_put(result);
+        otad_json_add_string(request, "operation_id", legacy_id);
+        result = otad_operation_status(request);
+        CHECK(!otad_json_str(result, "owner_id", "")[0]);
+        json_object_put(result);
+        json_object_put(request);
+    }
+
     otad_db_close();
-    puts("ok: real SQLite migration, atomic preflight binding, and single fail-closed claim");
+    puts("ok: SQLite migration, preflight/claim, and owner binding after database reopen");
     return 0;
 }
 '''

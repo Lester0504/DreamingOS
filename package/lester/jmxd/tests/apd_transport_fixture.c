@@ -3,6 +3,7 @@
 #define APD_TRANSPORT_HEARTBEAT_SECONDS 1
 #define APD_TRANSPORT_BACKOFF_MIN_SECONDS 1
 #define APD_TRANSPORT_BACKOFF_MAX_SECONDS 2
+#include "../src/apd/apd_audit_forward.h"
 #include "../src/apd/apd_transport.c"
 
 static struct apd_enrollment_metadata fixture_metadata;
@@ -20,6 +21,82 @@ static char fixture_radio_job_result[4096];
 static int fixture_radio_job_present;
 static int fixture_neighbor_scan_calls;
 static int fixture_survey_scan_calls;
+static int fixture_pairing_cleared;
+static int fixture_action_testing;
+static int fixture_action_stage;
+static int fixture_action_apply_calls;
+static int fixture_action_validate_fail;
+static int fixture_action_apply_fail;
+static int fixture_action_applying_rc;
+static int fixture_action_applied_rc;
+static int fixture_uci_calls;
+
+int apd_audit_forward_pending(void) { return 0; }
+int apd_audit_forward_take(struct apd_audit_event *event)
+{
+    (void)event;
+    return -1;
+}
+void apd_audit_forward_complete(const char *id, int persisted, const char *reason)
+{
+    (void)id; (void)persisted; (void)reason;
+}
+void apd_audit_forward_fail_active(const char *reason) { (void)reason; }
+
+int apd_secret_executor_available(void) { return 0; }
+int apd_secret_job_committed(const char *id, const char *digest, int64_t version)
+{
+    (void)id; (void)digest; (void)version;
+    abort();
+}
+int apd_secret_job_record_commit(const char *id, const char *digest, int64_t version)
+{
+    (void)id; (void)digest; (void)version;
+    abort();
+}
+int apd_secret_transaction_begin(const char *id, const char *digest,
+    const char *ssid, int64_t version, struct json_object *sections,
+    const unsigned char *secret, size_t length,
+    struct apd_secret_transaction **out, struct json_object **result)
+{
+    (void)id; (void)digest; (void)ssid; (void)version; (void)sections;
+    (void)secret; (void)length; (void)out; (void)result;
+    abort();
+}
+int apd_secret_transaction_commit(struct apd_secret_transaction *transaction)
+{
+    (void)transaction;
+    abort();
+}
+int apd_secret_transaction_rollback(struct apd_secret_transaction *transaction,
+                                   struct json_object **result)
+{
+    (void)transaction; (void)result;
+    abort();
+}
+void apd_secret_transaction_free(struct apd_secret_transaction *transaction)
+{
+    (void)transaction;
+    abort();
+}
+
+int apd_db_pairing_clear(void)
+{
+    fixture_pairing_cleared = 1;
+    return 0;
+}
+
+int apd_credentials_unpair(struct apd_credentials_unpair_report *out)
+{
+    if (!fixture_pairing_cleared)
+        return -1;
+    if (getenv("APD_TEST_UNBIND_FAIL"))
+        return -1;
+    fixture_metadata_present = 0;
+    fixture_bootstrap_present = 0;
+    out->certificate_removed = out->enrollment_removed = out->bootstrap_removed = 1;
+    return 0;
+}
 
 static int fixture_backend_snapshot(struct json_object **out)
 {
@@ -67,15 +144,46 @@ static int fixture_backend_snapshot(struct json_object **out)
     return 0;
 }
 
+static int fixture_backend_validate(struct json_object *candidate,
+                                    struct json_object **out)
+{
+    if (!fixture_action_testing || !candidate)
+        abort();
+    fixture_action_stage = 1;
+    *out = json_tokener_parse(fixture_action_validate_fail ?
+                             "{\"ok\":false}" : "{\"ok\":true}");
+    return fixture_action_validate_fail ? -1 : 0;
+}
+
+static int fixture_backend_apply(struct json_object *candidate,
+                                 struct json_object **out)
+{
+    if (!fixture_action_testing || fixture_action_stage != 2 || !candidate)
+        abort();
+    fixture_action_stage = 3;
+    fixture_action_apply_calls++;
+    *out = json_tokener_parse(fixture_action_apply_fail ?
+        "{\"ok\":false,\"reason\":\"hostapd_action_failed\"}" :
+        "{\"ok\":true,\"match\":true,\"evidence_type\":\"hostapd_command_ack\"}");
+    return fixture_action_apply_fail ? -1 : 0;
+}
+
 static const struct apd_backend_ops fixture_backend = {
     .name = "fixture",
     .snapshot_supported = 1,
     .snapshot = fixture_backend_snapshot,
+    .validate = fixture_backend_validate,
+    .apply = fixture_backend_apply,
 };
 
 const struct apd_backend_ops *apd_backend(void)
 {
     return &fixture_backend;
+}
+
+int apd_config_executor_available_default(void)
+{
+    return 0;
 }
 
 int apd_backend_neighbor_scan(const char *radio_id, struct json_object **out)
@@ -296,9 +404,8 @@ int apd_radio_job_finish_ack(const struct apd_radio_job_assignment *assignment,
     return APD_RADIO_JOB_JOURNAL_OK;
 }
 
-/* W2c config executor/journal symbols.  The config wire step is compiled
- * but apd_config_executor_enabled() is 0 in this build, so none of these
- * are ever called; they exist only so the dormant path links. */
+/* The wire fixture negotiates no config writes. Runtime actions are exercised
+ * directly below, including their durable ordering and UCI bypass. */
 int apd_config_candidate_validate(struct json_object *candidate,
                                   struct json_object **out)
 {
@@ -311,6 +418,7 @@ int apd_config_candidate_validate(struct json_object *candidate,
 int apd_config_stage(const struct apd_config_paths *paths,
                      struct json_object *candidate, struct json_object **out)
 {
+    fixture_uci_calls++;
     (void)paths; (void)candidate;
     if (out)
         *out = NULL;
@@ -321,6 +429,7 @@ int apd_config_readback(const struct apd_config_paths *paths,
                         struct json_object *candidate,
                         struct json_object **out)
 {
+    fixture_uci_calls++;
     (void)paths; (void)candidate;
     if (out)
         *out = NULL;
@@ -331,6 +440,7 @@ int apd_config_capture_previous(const struct apd_config_paths *paths,
                                 struct json_object *candidate,
                                 struct json_object **out)
 {
+    fixture_uci_calls++;
     (void)paths; (void)candidate;
     if (out)
         *out = NULL;
@@ -342,6 +452,7 @@ int apd_config_apply_prepared(const struct apd_config_paths *paths,
                               struct json_object *previous,
                               struct json_object **out)
 {
+    fixture_uci_calls++;
     (void)paths; (void)candidate; (void)previous;
     if (out)
         *out = NULL;
@@ -351,6 +462,7 @@ int apd_config_apply_prepared(const struct apd_config_paths *paths,
 int apd_config_apply(const struct apd_config_paths *paths,
                      struct json_object *candidate, struct json_object **out)
 {
+    fixture_uci_calls++;
     (void)paths; (void)candidate;
     if (out)
         *out = NULL;
@@ -360,6 +472,7 @@ int apd_config_apply(const struct apd_config_paths *paths,
 int apd_config_rollback(const struct apd_config_paths *paths,
                         struct json_object *previous, struct json_object **out)
 {
+    fixture_uci_calls++;
     (void)paths; (void)previous;
     if (out)
         *out = NULL;
@@ -393,16 +506,51 @@ int apd_config_job_mark_applying(
     const char *previous_json, int64_t now,
     struct apd_config_job_journal_entry *out)
 {
-    (void)assignment; (void)previous_json; (void)now; (void)out;
-    return APD_CONFIG_JOB_JOURNAL_ERROR;
+    (void)out;
+    if (!fixture_action_testing)
+        return APD_CONFIG_JOB_JOURNAL_ERROR;
+    if (!assignment || fixture_action_stage != 1 || now <= 0 ||
+        strcmp(previous_json, "[]"))
+        abort();
+    fixture_action_stage = 2;
+    return fixture_action_applying_rc;
 }
 
 int apd_config_job_mark_applied(
     const struct apd_config_job_assignment *assignment, int64_t now,
     struct apd_config_job_journal_entry *out)
 {
-    (void)assignment; (void)now; (void)out;
-    return APD_CONFIG_JOB_JOURNAL_ERROR;
+    (void)out;
+    if (!fixture_action_testing)
+        return APD_CONFIG_JOB_JOURNAL_ERROR;
+    if (!assignment || fixture_action_stage != 3 || now <= 0)
+        abort();
+    fixture_action_stage = 4;
+    return fixture_action_applied_rc;
+}
+
+int apd_config_job_previous_get(
+    const struct apd_config_job_assignment *assignment,
+    char **previous_json_out)
+{
+    (void)assignment;
+    if (!previous_json_out)
+        return APD_CONFIG_JOB_JOURNAL_INVALID;
+    *previous_json_out = strdup("[]");
+    return *previous_json_out ? APD_CONFIG_JOB_JOURNAL_OK :
+           APD_CONFIG_JOB_JOURNAL_ERROR;
+}
+
+int apd_config_rollback_readback(const struct apd_config_paths *paths,
+                                 struct json_object *previous,
+                                 struct json_object **out)
+{
+    (void)paths;
+    (void)previous;
+    *out = json_tokener_parse(
+        "{\"ok\":true,\"operation\":\"rollback_readback\","
+        "\"match\":true,\"mismatches\":[]}");
+    return *out ? 0 : -1;
 }
 
 int apd_config_job_finish_store(const struct apd_config_job_finish *finish,
@@ -419,6 +567,33 @@ int apd_config_job_finish_ack(
     struct apd_config_job_journal_entry *out)
 {
     (void)assignment; (void)finish_id; (void)now; (void)out;
+    return APD_CONFIG_JOB_JOURNAL_ERROR;
+}
+
+int apd_config_job_pending_reconcile_get(
+    const char *ap_id, struct apd_config_job_pending_reconcile *out)
+{
+    (void)ap_id;
+    if (out)
+        memset(out, 0, sizeof(*out));
+    return APD_CONFIG_JOB_JOURNAL_NOT_FOUND;
+}
+
+void apd_config_job_pending_reconcile_free(
+    struct apd_config_job_pending_reconcile *pending)
+{
+    if (!pending)
+        return;
+    free(pending->readback_json);
+    memset(pending, 0, sizeof(*pending));
+}
+
+int apd_config_job_session_rebind(
+    const struct apd_config_job_assignment *assignment,
+    const char *new_session_epoch, int64_t now,
+    struct apd_config_job_journal_entry *out)
+{
+    (void)assignment; (void)new_session_epoch; (void)now; (void)out;
     return APD_CONFIG_JOB_JOURNAL_ERROR;
 }
 
@@ -750,6 +925,114 @@ static int fixture_set_survey_counters(struct json_object *snapshot,
     return 0;
 }
 
+static int fixture_runtime_actions(void)
+{
+    struct apd_config_job_assignment job = {0};
+    struct json_object *candidate = json_tokener_parse(
+        "{\"sections\":[{\"section\":\"ath1\",\"options\":{"
+        "\"hostapd_action_type\":\"btm_request\"}}]}");
+    const char *error;
+    char *readback = NULL;
+    int i, rc = -1;
+    const char *expected[] = {
+        NULL, "hostapd_action_validation_failed", "hostapd_action_already_started",
+        "hostapd_action_failed", "hostapd_action_journal_failed"
+    };
+
+    fixture_action_testing = 1;
+    for (i = 0; i < 5; i++) {
+        fixture_action_stage = fixture_action_apply_calls = 0;
+        fixture_action_validate_fail = i == 1;
+        fixture_action_apply_fail = i == 3;
+        fixture_action_applying_rc = i == 2 ?
+            APD_CONFIG_JOB_JOURNAL_IDEMPOTENT : APD_CONFIG_JOB_JOURNAL_OK;
+        fixture_action_applied_rc = i == 4 ?
+            APD_CONFIG_JOB_JOURNAL_ERROR : APD_CONFIG_JOB_JOURNAL_OK;
+        error = apd_config_execute_runtime_action(&job, candidate, &readback);
+        if ((error == NULL) != (expected[i] == NULL) ||
+            (error && strcmp(error, expected[i])) ||
+            fixture_action_apply_calls != (i == 0 || i >= 3) ||
+            fixture_uci_calls ||
+            (i == 0 && (fixture_action_stage != 4 || !readback ||
+                        !strstr(readback, "hostapd_command_ack"))))
+            goto done;
+        free(readback);
+        readback = NULL;
+    }
+    rc = 0;
+done:
+    if (rc)
+        fprintf(stderr, "FAIL runtime action case %d\n", i);
+    free(readback);
+    json_object_put(candidate);
+    fixture_action_testing = 0;
+    return rc;
+}
+
+static int fixture_roaming_telemetry(void)
+{
+    struct json_object *snapshot = json_tokener_parse(
+        "{\"observed_at\":1,\"sources\":{\"hostapd\":{"
+        "\"beacon_reports\":[],\"probe_observations\":[],"
+        "\"btm_responses\":[]}}}");
+    struct json_object *hostapd = json_object_object_get(
+        json_object_object_get(snapshot, "sources"), "hostapd");
+    struct json_object *report = json_tokener_parse(
+        "{\"station_mac\":\"44:71:47:35:e7:b3\",\"bssid\":\"00:58:28:09:22:ca\","
+        "\"rcpi_dbm\":-34,\"observed_at\":2}");
+    struct json_object *response = json_tokener_parse(
+        "{\"station_mac\":\"44:71:47:35:e7:b3\",\"status_code\":0,\"observed_at\":4}");
+    struct json_object *probe = json_tokener_parse(
+        "{\"station_mac\":\"d2:76:c1:3e:34:6c\",\"bssid\":\"00:58:28:09:22:ba\","
+        "\"rssi_dbm\":-61,\"observed_at\":4}");
+    unsigned char old_digest[SHA256_DIGEST_LENGTH], new_digest[SHA256_DIGEST_LENGTH];
+    int rc = -1;
+
+    if (apd_telemetry_digest(snapshot, old_digest))
+        goto done;
+    json_object_array_add(json_object_object_get(hostapd, "beacon_reports"),
+                          json_object_get(report));
+    if (apd_telemetry_digest(snapshot, new_digest) ||
+        !CRYPTO_memcmp(old_digest, new_digest, sizeof(old_digest)))
+        goto done;
+    memcpy(old_digest, new_digest, sizeof(old_digest));
+    json_object_object_add(report, "observed_at", json_object_new_int64(3));
+    if (apd_telemetry_digest(snapshot, new_digest) ||
+        !CRYPTO_memcmp(old_digest, new_digest, sizeof(old_digest)))
+        goto done;
+    memcpy(old_digest, new_digest, sizeof(old_digest));
+    json_object_array_add(json_object_object_get(hostapd, "probe_observations"),
+                          json_object_get(probe));
+    if (apd_telemetry_digest(snapshot, new_digest) ||
+        !CRYPTO_memcmp(old_digest, new_digest, sizeof(old_digest)))
+        goto done;
+    memcpy(old_digest, new_digest, sizeof(old_digest));
+    json_object_object_add(probe, "rssi_dbm", json_object_new_int(-59));
+    if (apd_telemetry_digest(snapshot, new_digest) ||
+        !CRYPTO_memcmp(old_digest, new_digest, sizeof(old_digest)))
+        goto done;
+    memcpy(old_digest, new_digest, sizeof(old_digest));
+    json_object_array_add(json_object_object_get(hostapd, "btm_responses"),
+                          json_object_get(response));
+    if (apd_telemetry_digest(snapshot, new_digest) ||
+        !CRYPTO_memcmp(old_digest, new_digest, sizeof(old_digest)))
+        goto done;
+    memcpy(old_digest, new_digest, sizeof(old_digest));
+    json_object_object_add(response, "observed_at", json_object_new_int64(5));
+    if (apd_telemetry_digest(snapshot, new_digest) ||
+        !CRYPTO_memcmp(old_digest, new_digest, sizeof(old_digest)))
+        goto done;
+    rc = 0;
+done:
+    if (rc)
+        fprintf(stderr, "FAIL roaming observations suppressed\n");
+    json_object_put(report);
+    json_object_put(probe);
+    json_object_put(response);
+    json_object_put(snapshot);
+    return rc;
+}
+
 int main(int argc, char **argv)
 {
     int connected_seen = 0;
@@ -769,6 +1052,8 @@ int main(int argc, char **argv)
 
     if (argc != 6)
         return 2;
+    if (fixture_runtime_actions() || fixture_roaming_telemetry())
+        return 12;
     memset(&gate, 0, sizeof(gate));
     base = json_tokener_parse(
         "{\"observed_at\":1,\"sources\":{\"iw\":{\"observed_at\":1}},"
@@ -853,6 +1138,47 @@ int main(int argc, char **argv)
     fixture_key = argv[3];
     fixture_csr = argv[4];
     fixture_port = (uint16_t)strtoul(argv[5], NULL, 10);
+    if (getenv("APD_TEST_UNBIND")) {
+        struct apd_credentials_certificate_input input;
+        unsigned char *cert_der = NULL;
+        size_t cert_len = 0;
+        X509 *cert = NULL;
+        BIO *bio = BIO_new_file(getenv("APD_TEST_CLIENT_CERT"), "r");
+        if (!bio || !(cert = PEM_read_bio_X509(bio, NULL, NULL, NULL)))
+            return 11;
+        int der_len = i2d_X509(cert, &cert_der);
+        BIO_free(bio);
+        X509_free(cert);
+        if (der_len <= 0)
+            return 12;
+        cert_len = (size_t)der_len;
+        memset(&input, 0, sizeof(input));
+        snprintf(input.enrollment_id, sizeof(input.enrollment_id),
+                 "%s", "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee");
+        snprintf(input.certificate_id, sizeof(input.certificate_id),
+                 "%s", "dddddddd-dddd-4ddd-8ddd-dddddddddddd");
+        snprintf(input.controller_id, sizeof(input.controller_id),
+                 "%s", "bbbbbbbb-bbbb-5bbb-8bbb-bbbbbbbbbbbb");
+        input.certificate_der = cert_der;
+        input.certificate_der_len = cert_len;
+        if (apd_credentials_certificate_store(&input, &fixture_metadata) != 0)
+            return 13;
+        OPENSSL_free(cert_der);
+        snprintf(fixture_metadata.state, sizeof(fixture_metadata.state), "%s", "adopted");
+        fixture_bootstrap_present = 0;
+        struct apd_enrollment_metadata metadata = fixture_metadata;
+        if (apd_transport_endpoint_set_metadata(&metadata) != 0)
+            return 17;
+        int rc = apd_session_run(&metadata);
+        if (!fixture_pairing_cleared || fixture_snapshot_calls)
+            return 14;
+        if (getenv("APD_TEST_UNBIND_FAIL"))
+            return rc == 1 && fixture_metadata_present ? 0 : 15;
+        if (rc || fixture_metadata_present || fixture_bootstrap_present)
+            return 16;
+        puts("ok: APD cleanup precedes ACK; no telemetry or configuration executed");
+        return 0;
+    }
     if (!fixture_port || apd_transport_start() != 0)
         return 3;
     for (i = 0; i < 200; i++) {

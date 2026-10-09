@@ -2,7 +2,10 @@
 #define DREAMINGWRT_WEBD_WIFI_AGGREGATE_H
 
 #include <stddef.h>
+#include <stdint.h>
 #include <json-c/json.h>
+
+#include "../wifi/wifi_channel_ai.h"
 
 typedef int (*webd_wifi_model_image_resolver_fn)(
     const char *model, char *image_url, size_t image_url_len,
@@ -15,7 +18,8 @@ struct json_object *webd_wifi_aggregate_data(struct json_object *local_response,
 
 struct json_object *webd_wifi_aggregate_data_with_resolver(
     struct json_object *local_response, struct json_object *ac_response,
-    int runtime_status, webd_wifi_model_image_resolver_fn image_resolver);
+    int runtime_status, webd_wifi_model_image_resolver_fn image_resolver,
+    struct json_object *ac_capabilities);
 
 void webd_wifi_merge_environment_scan(struct json_object *data,
                                       struct json_object *ac_results,
@@ -34,6 +38,9 @@ void webd_wifi_merge_survey_history(struct json_object *data,
 void webd_wifi_merge_tx_retry_history(struct json_object *data,
                                       struct json_object *response);
 
+/* Rebuilds Channel AI after every evidence/revision merge is complete. */
+void webd_wifi_refresh_channel_ai(struct json_object *data, int64_t now_s);
+
 /*
  * Joins client identity (display name, fingerprint model, image) onto
  * data.stations[] by MAC, using the /api/v1/clients inventory as the authority.
@@ -46,5 +53,8 @@ void webd_wifi_merge_station_identity(struct json_object *data,
 
 /* True when AC status/list data contains at least one managed AP. */
 int webd_wifi_managed_available(struct json_object *ac_response);
+
+struct json_object *webd_wifi_channel_ai_plan(struct json_object *data,
+                                              int64_t now_s);
 
 #endif

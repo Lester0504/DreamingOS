@@ -43,6 +43,12 @@ uint16_t jmx_domain_match(const char *hostname, int hostname_len);
 /* Get group name by id */
 const char *jmx_domain_group_name(uint16_t group_id);
 
+/* Enumerate loaded groups. Copies at most max_out entries into out and returns
+ * the number written. entry_count is the number of domains carrying that group.
+ * Exists so callers can report the real group list instead of an empty array. */
+uint32_t jmx_domain_group_list(jmx_domain_group_t *out, uint32_t max_out,
+			       uint32_t *entry_counts);
+
 /* Stats */
 uint32_t jmx_domain_count(void);
 uint32_t jmx_domain_group_count(void);

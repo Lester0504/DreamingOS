@@ -16,6 +16,9 @@
 #include <sys/types.h>
 #include <time.h>
 #include <unistd.h>
+#ifdef APD_ROAMING_STANDALONE_TEST
+#include "apd_config_executor.h"
+#endif
 #if defined(APD_SURVEY_STANDALONE_TEST) || \
     defined(APD_NEIGHBOR_SCAN_STANDALONE_TEST)
 #include "apd_readonly_command.h"
@@ -25,9 +28,15 @@
 #include <ctype.h>
 #include <limits.h>
 #include <net/if.h>
+#include <pthread.h>
 #include <stddef.h>
+#include <pwd.h>
+#include <signal.h>
+#include <strings.h>
 #include <sys/socket.h>
 #include <sys/un.h>
+#include <sys/wait.h>
+#include <syslog.h>
 
 /*
  * Parser for the QCA vendor channel listing. Header-only dependency: the
@@ -35,6 +44,7 @@
  * stays testable apart from the collectors in this file.
  */
 #include "apd_vendor_chanlist.h"
+#include "apd_iw_topology.h"
 #include "ap_radio_id.h"
 
 #ifndef IFNAMSIZ
@@ -77,6 +87,9 @@
 #ifndef APD_HOSTAPD_VENDOR_DIR_LIMIT
 #define APD_HOSTAPD_VENDOR_DIR_LIMIT 8
 #endif
+#ifndef APD_HOSTAPD_CONF_PREFIX
+#define APD_HOSTAPD_CONF_PREFIX APD_HOSTAPD_RUN_DIR_PARENT "/hostapd-"
+#endif
 #ifndef APD_IW_PATH
 #define APD_IW_PATH ""
 #endif
@@ -91,6 +104,15 @@
 #endif
 #ifndef APD_HOSTAPD_EXPECTED_UID
 #define APD_HOSTAPD_EXPECTED_UID ((uid_t)0)
+#endif
+#ifndef APD_HOSTAPD_SERVICE_USER
+#define APD_HOSTAPD_SERVICE_USER "network"
+#endif
+#ifndef APD_HOSTAPD_SERVICE_UID
+#define APD_HOSTAPD_SERVICE_UID ((uid_t)-1)
+#endif
+#ifndef APD_HOSTAPD_SERVICE_GID
+#define APD_HOSTAPD_SERVICE_GID ((gid_t)-1)
 #endif
 #ifndef APD_HOSTAPD_TIMEOUT_MS
 #define APD_HOSTAPD_TIMEOUT_MS 750
@@ -212,6 +234,16 @@ struct apd_survey_sample {
     uint64_t busy_time_ms;
     int has_receive_time;
     uint64_t receive_time_ms;
+    /*
+     * `channel BSS receive time` is airtime spent receiving frames of *this*
+     * BSS. mac80211 prints it right after `channel receive time`, so
+     * (busy - bss_receive) is the airtime other networks and non-Wi-Fi energy
+     * occupied -- the only honest OBSS figure available without vendor
+     * counters. Kept separate from receive_time_ms: that one counts every
+     * frame the radio decoded, self-BSS included.
+     */
+    int has_bss_receive_time;
+    uint64_t bss_receive_time_ms;
     int has_transmit_time;
     uint64_t transmit_time_ms;
     int malformed;
@@ -459,6 +491,14 @@ static int apd_survey_parse(const char *text, int target_frequency,
             current.malformed |= parsed < 0;
             continue;
         }
+        parsed = apd_survey_parse_u64_ms(value, "channel BSS receive time:",
+                                         &counter);
+        if (parsed != 0) {
+            current.bss_receive_time_ms = counter;
+            current.has_bss_receive_time = parsed > 0;
+            current.malformed |= parsed < 0;
+            continue;
+        }
         parsed = apd_survey_parse_u64_ms(value, "channel transmit time:",
                                          &counter);
         if (parsed != 0) {
@@ -485,6 +525,38 @@ static int apd_survey_utilization(const struct apd_survey_sample *sample,
         return -1;
     *utilization_pct = (double)sample->busy_time_ms * 100.0 /
                        (double)sample->active_time_ms;
+    return 0;
+}
+
+/*
+ * Airtime split between this BSS and everything else on the channel.
+ *
+ * mac80211 reports `channel BSS receive time` alongside busy/active, so the
+ * OBSS share is (busy - bss_receive) / active: busy airtime that this BSS did
+ * not receive is by definition other networks plus non-Wi-Fi energy. Vendor
+ * `apstats` builds report the same two figures directly; this derivation is
+ * what makes them available on a plain mac80211 AP, where the wireless page
+ * used to print "driver did not report OBSS".
+ *
+ * Fail-closed: no BSS-receive counter, no numbers. Nothing is inferred from
+ * neighbour scans or signal strength.
+ */
+static int apd_survey_bss_split(const struct apd_survey_sample *sample,
+                                double *obss_pct, double *self_pct)
+{
+    uint64_t obss_ms;
+
+    if (!sample || !sample->has_active_time || !sample->has_busy_time ||
+        !sample->has_bss_receive_time || sample->active_time_ms == 0 ||
+        sample->busy_time_ms > sample->active_time_ms ||
+        sample->bss_receive_time_ms > sample->busy_time_ms)
+        return -1;
+    obss_ms = sample->busy_time_ms - sample->bss_receive_time_ms;
+    if (obss_pct)
+        *obss_pct = (double)obss_ms * 100.0 / (double)sample->active_time_ms;
+    if (self_pct)
+        *self_pct = (double)sample->bss_receive_time_ms * 100.0 /
+                    (double)sample->active_time_ms;
     return 0;
 }
 
@@ -737,6 +809,60 @@ static void apd_neighbor_target_consider(struct apd_neighbor_target *best,
     *found = 1;
 }
 
+/* QSDK exposes several type-801 radio netdevs under one wiphy and prints the
+ * radio anchors after the ordinary VAPs in `iw dev`. Resolve wifiN's current
+ * frequency in a first pass so the second pass can select an ordinary VAP on
+ * the same band even though QSDK prints no `Radios:` line. */
+static int apd_neighbor_logical_frequency(const char *text,
+                                          unsigned int wiphy_index,
+                                          unsigned int radio_index,
+                                          int *frequency_out)
+{
+    char expected[IFNAMSIZ];
+    char *copy;
+    char *line;
+    char *saveptr = NULL;
+    unsigned int current_index = UINT_MAX;
+    int matching = 0;
+    int frequency = 0;
+
+    if (!frequency_out ||
+        snprintf(expected, sizeof(expected), "wifi%u", radio_index) >=
+            (int)sizeof(expected))
+        return -1;
+    copy = strdup(text ? text : "");
+    if (!copy)
+        return -1;
+    for (line = strtok_r(copy, "\n", &saveptr); line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        char *value = apd_survey_trim(line);
+
+        if (!strncmp(value, "phy#", 4)) {
+            current_index = (unsigned int)strtoul(value + 4, NULL, 10);
+            matching = 0;
+            continue;
+        }
+        if (current_index != wiphy_index)
+            continue;
+        if (!strncmp(value, "Interface ", 10)) {
+            matching = !strcmp(value + 10, expected);
+            continue;
+        }
+        if (matching && !strncmp(value, "channel ", 8)) {
+            int channel = 0;
+
+            if (sscanf(value, "channel %d (%d MHz)", &channel,
+                       &frequency) == 2 && frequency > 0)
+                break;
+        }
+    }
+    free(copy);
+    if (frequency <= 0)
+        return -1;
+    *frequency_out = frequency;
+    return 0;
+}
+
 static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
                                        struct apd_neighbor_target *target,
                                        char reason[APD_NEIGHBOR_REASON_LEN + 1])
@@ -754,6 +880,8 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
     int type_ap = 0;
     int has_ssid = 0;
     int interface_radio_match = 0;
+    int aggregate_mld = 0;
+    int requested_frequency = 0;
     int found = 0;
 
     memset(target, 0, sizeof(*target));
@@ -765,6 +893,10 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
     target->wiphy_index = requested_index;
     target->radio_index = requested_radio;
     target->has_radio_index = has_requested_radio;
+    if (has_requested_radio)
+        (void)apd_neighbor_logical_frequency(text, requested_index,
+                                             requested_radio,
+                                             &requested_frequency);
     snprintf(target->radio_id, sizeof(target->radio_id), "%s", radio_id);
     if (apd_neighbor_wiphy_name(requested_index, target->wiphy_name,
                                 sizeof(target->wiphy_name)) != 0) {
@@ -786,13 +918,14 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
                                          has_requested_radio,
                                          interface_radio_match,
                                          interface, ifindex, frequency,
-                                         type_ap, has_ssid);
+                                         type_ap && !aggregate_mld, has_ssid);
             interface[0] = '\0';
             ifindex = 0;
             frequency = 0;
             type_ap = 0;
             has_ssid = 0;
             interface_radio_match = 0;
+            aggregate_mld = 0;
             current_index = (unsigned int)strtoul(value + 4, NULL, 10);
             continue;
         }
@@ -803,13 +936,23 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
                                          has_requested_radio,
                                          interface_radio_match,
                                          interface, ifindex, frequency,
-                                         type_ap, has_ssid);
+                                         type_ap && !aggregate_mld, has_ssid);
             snprintf(interface, sizeof(interface), "%s", value + 10);
             ifindex = 0;
             frequency = 0;
             type_ap = 0;
             has_ssid = 0;
-            interface_radio_match = 0;
+            aggregate_mld = 0;
+            if (has_requested_radio) {
+                char expected[IFNAMSIZ];
+
+                interface_radio_match =
+                    snprintf(expected, sizeof(expected), "wifi%u",
+                             requested_radio) < (int)sizeof(expected) &&
+                    !strcmp(interface, expected);
+            } else {
+                interface_radio_match = 0;
+            }
         } else if (!strncmp(value, "ifindex ", 8)) {
             unsigned long parsed = strtoul(value + 8, NULL, 10);
             if (parsed <= UINT_MAX)
@@ -821,9 +964,18 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
         } else if (!strncmp(value, "channel ", 8)) {
             int channel = 0;
             int parsed_frequency = 0;
-            if (sscanf(value, "channel %d (%d MHz)", &channel,
-                       &parsed_frequency) == 2 && parsed_frequency > 0)
+            if (!aggregate_mld &&
+                sscanf(value, "channel %d (%d MHz)", &channel,
+                       &parsed_frequency) == 2 && parsed_frequency > 0) {
                 frequency = parsed_frequency;
+                if (has_requested_radio && requested_frequency > 0 &&
+                    frequency == requested_frequency)
+                    interface_radio_match = 1;
+            }
+        } else if (!strcmp(value, "MLD with links:") ||
+                   (!strncmp(value, "link ", 5) && strchr(value, ':'))) {
+            aggregate_mld = 1;
+            frequency = 0;
         } else if (!strncmp(value, "Radios:", 7)) {
             const char *cursor = value + 7;
 
@@ -849,7 +1001,8 @@ static int apd_neighbor_target_from_iw(const char *text, const char *radio_id,
     apd_neighbor_target_consider(target, &found, requested_index,
                                  has_requested_radio,
                                  interface_radio_match, interface,
-                                 ifindex, frequency, type_ap, has_ssid);
+                                 ifindex, frequency,
+                                 type_ap && !aggregate_mld, has_ssid);
     free(copy);
     if (!found) {
         snprintf(reason, APD_NEIGHBOR_REASON_LEN + 1, "%s",
@@ -957,6 +1110,24 @@ static void apd_neighbor_standard(struct apd_neighbor_item *item, int rank)
         item->standard_rank = rank;
 }
 
+/* iw >= 5.16 prints the scan frequency with a kHz fraction ("freq: 2412.0")
+ * because nl80211 gained NL80211_ATTR_WIPHY_FREQ_OFFSET.  The integer MHz is
+ * the value the channel mapping needs, so accept and drop a well-formed
+ * fraction.  Any other trailing text is unparsed evidence and still marks the
+ * BSS block malformed rather than being silently ignored. */
+static int apd_neighbor_freq_tail_valid(const char *end)
+{
+    if (!end)
+        return 0;
+    if (!*end)
+        return 1;
+    if (*end != '.' || !isdigit((unsigned char)end[1]))
+        return 0;
+    for (end++; isdigit((unsigned char)*end); end++)
+        ;
+    return !*end;
+}
+
 static int apd_neighbor_store(struct apd_neighbor_parse_result *result,
                               const struct apd_neighbor_item *item)
 {
@@ -1013,8 +1184,15 @@ static int apd_neighbor_parse(const char *text,
     for (line = strtok_r(copy, "\n", &saveptr); line;
          line = strtok_r(NULL, "\n", &saveptr)) {
         char *value = apd_survey_trim(line);
+        int indented = line[0] == ' ' || line[0] == '\t';
 
-        if (!strncmp(value, "BSS ", 4)) {
+        /* Only a column-0 "BSS <mac>" line opens a scan entry.  iw indents
+         * information elements, and two of them ("BSS Load:", "BSS Color:")
+         * share that prefix: treating them as headers ended the real entry
+         * early -- losing every HT/VHT/HE/EHT line that follows, hence null
+         * width and standard -- and counted each one as a malformed BSS,
+         * which reported the whole scan as truncated. */
+        if (!indented && !strncmp(value, "BSS ", 4)) {
             char address[32];
             const char *begin = value + 4;
             size_t length = strcspn(begin, " (");
@@ -1042,7 +1220,7 @@ static int apd_neighbor_parse(const char *text,
             const char *number = value + 5;
             while (*number == ' ' || *number == '\t') number++;
             if (apd_survey_parse_signed(number, 1, 100000, &parsed, &end) == 0 &&
-                end && !*end) {
+                apd_neighbor_freq_tail_valid(end)) {
                 current.frequency_mhz = (int)parsed;
                 current.has_frequency = 1;
             } else current.malformed = 1;
@@ -1443,6 +1621,7 @@ static int apd_neighbor_scan_collect(const char *path, const char *radio_id,
     int64_t started_at = (int64_t)time(NULL);
     size_t returned = 0;
     int truncated = 0;
+    int dumped = 0;
     int rc = -1;
 
     if (!out)
@@ -1481,10 +1660,38 @@ static int apd_neighbor_scan_collect(const char *path, const char *radio_id,
                 apd_neighbor_scan_failure_reason(&scan, failure,
                                                  sizeof(failure));
 
-            *out = apd_neighbor_result_new(radio_id, code);
-            apd_neighbor_attach_failure_evidence(*out, &scan);
+            /* EBUSY means the driver refused to leave its operating channel --
+             * a DFS or wide-channel AP cannot go off-channel while beaconing,
+             * so the trigger will keep failing for as long as that radio is up.
+             * The driver still maintains a scan table fed by beacons received
+             * on the operating channel, and `scan dump` returns it without
+             * touching the radio.  Those entries are measured, so read them
+             * instead of reporting the band as having no neighbours at all.
+             * Only EBUSY falls back: every other failure stays a failure. */
+            if (strcmp(code, "iw_neighbor_scan_interface_busy") != 0) {
+                *out = apd_neighbor_result_new(radio_id, code);
+                apd_neighbor_attach_failure_evidence(*out, &scan);
+                apd_neighbor_scan_log_failure(radio_id, code, &scan);
+                goto done;
+            }
             apd_neighbor_scan_log_failure(radio_id, code, &scan);
-            goto done;
+            apd_command_result_free(&scan);
+            memset(&scan, 0, sizeof(scan));
+            {
+                char *const dump_argv[] = {
+                    (char *)path, "dev", target.interface, "scan", "dump", NULL
+                };
+                if (apd_readonly_command_bounded(path, dump_argv,
+                                                 APD_NEIGHBOR_SCAN_TIMEOUT_MS,
+                                                 APD_NEIGHBOR_SCAN_OUTPUT_LIMIT,
+                                                 &scan) != 0 &&
+                    !scan.output_limited) {
+                    *out = apd_neighbor_result_new(radio_id, code);
+                    apd_neighbor_attach_failure_evidence(*out, &scan);
+                    goto done;
+                }
+                dumped = 1;
+            }
         }
     }
     if (apd_neighbor_parse(scan.text, &parsed) != 0) {
@@ -1495,6 +1702,13 @@ static int apd_neighbor_scan_collect(const char *path, const char *radio_id,
     root = apd_neighbor_result_new(radio_id, NULL);
     items = NULL;
     json_object_object_get_ex(root, "items", &items);
+    if (dumped) {
+        /* Name the producer honestly: these rows come from the driver's cached
+         * scan table, not from a scan this call triggered. */
+        json_object_object_del(root, "source");
+        json_object_object_add(root, "source",
+                               json_object_new_string("iw_scan_dump_cache"));
+    }
     json_object_object_add(root, "scanner_wiphy_name",
                            json_object_new_string(target.wiphy_name));
     json_object_object_add(root, "scanner_interface",
@@ -2100,6 +2314,7 @@ enum apd_radio_netdev_status {
     APD_RADIO_NETDEV_NO_NETDEV_FOR_WIPHY,
     APD_RADIO_NETDEV_AGGREGATE_ONLY,
     APD_RADIO_NETDEV_AMBIGUOUS,
+    APD_RADIO_NETDEV_LOGICAL_NOT_FOUND,
 };
 
 static const char *apd_radio_netdev_reason(enum apd_radio_netdev_status status)
@@ -2115,23 +2330,34 @@ static const char *apd_radio_netdev_reason(enum apd_radio_netdev_status status)
         return "mld_pseudo_phy_has_no_radio_netdev";
     case APD_RADIO_NETDEV_AMBIGUOUS:
         return "apstats_multiple_radio_netdevs_for_wiphy";
+    case APD_RADIO_NETDEV_LOGICAL_NOT_FOUND:
+        return "apstats_logical_radio_netdev_missing";
     }
     return "apstats_radio_netdev_unresolved";
 }
 
 static enum apd_radio_netdev_status apd_airtime_radio_netdev(
-        unsigned int wiphy_index, char *out, size_t out_size)
+        unsigned int wiphy_index, unsigned int radio_index,
+        int has_radio_index, char *out, size_t out_size)
 {
     DIR *directory = opendir(APD_NET_CLASS_PATH);
     struct dirent *entry;
+    char expected[IFNAMSIZ] = { 0 };
     int found = 0;
     int owned_netdevs = 0;
+    int radio_netdevs = 0;
 
     if (!directory)
         return APD_RADIO_NETDEV_SYSFS_UNREADABLE;
     if (!out || out_size == 0) {
         closedir(directory);
         return APD_RADIO_NETDEV_SYSFS_UNREADABLE;
+    }
+    if (has_radio_index &&
+        snprintf(expected, sizeof(expected), "wifi%u", radio_index) >=
+            (int)sizeof(expected)) {
+        closedir(directory);
+        return APD_RADIO_NETDEV_LOGICAL_NOT_FOUND;
     }
     while ((entry = readdir(directory)) != NULL) {
         char path[PATH_MAX];
@@ -2156,6 +2382,9 @@ static enum apd_radio_netdev_status apd_airtime_radio_netdev(
             apd_neighbor_read_uint_file(path, &type) != 0 ||
             type != APD_ARPHRD_IEEE80211_RADIO)
             continue;
+        radio_netdevs++;
+        if (has_radio_index && strcmp(entry->d_name, expected))
+            continue;
         if (found) {
             found = -1;
             break;
@@ -2168,6 +2397,8 @@ static enum apd_radio_netdev_status apd_airtime_radio_netdev(
         return APD_RADIO_NETDEV_OK;
     if (found == -1)
         return APD_RADIO_NETDEV_AMBIGUOUS;
+    if (has_radio_index && radio_netdevs > 0)
+        return APD_RADIO_NETDEV_LOGICAL_NOT_FOUND;
     if (owned_netdevs > 0)
         return APD_RADIO_NETDEV_AGGREGATE_ONLY;
     return APD_RADIO_NETDEV_NO_NETDEV_FOR_WIPHY;
@@ -2268,6 +2499,89 @@ struct apd_tx_retry_stats {
     char reason[APD_SURVEY_REASON_LEN + 1];
 };
 
+static int apd_hostapd_uid_trusted(uid_t uid);
+
+/* Maps a QSDK VAP to its owning wifiN using the generated hostapd config.
+ * This is stronger evidence than interface spelling: ath0/ath01/... are not
+ * numerically aligned with their radios, while ctrl_interface is. */
+static int apd_tx_retry_vap_radio_index(const char *vap,
+                                        unsigned int *radio_index)
+{
+    static const char ctrl_prefix[] = "ctrl_interface=";
+    char path[PATH_MAX];
+    char buffer[4096];
+    struct stat st;
+    ssize_t length;
+    char *line;
+    char *saveptr = NULL;
+    int fd;
+
+    if (!radio_index || !apd_survey_safe_interface_name(vap) ||
+        snprintf(path, sizeof(path), "%s%s.conf", APD_HOSTAPD_CONF_PREFIX,
+                 vap) >= (int)sizeof(path))
+        return -1;
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        !apd_hostapd_uid_trusted(st.st_uid) ||
+        (st.st_mode & (S_IWGRP | S_IWOTH))) {
+        close(fd);
+        return -1;
+    }
+    do {
+        length = read(fd, buffer, sizeof(buffer) - 1);
+    } while (length < 0 && errno == EINTR);
+    close(fd);
+    if (length <= 0 || length >= (ssize_t)sizeof(buffer) - 1)
+        return -1;
+    buffer[length] = '\0';
+    for (line = strtok_r(buffer, "\n", &saveptr); line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        const char *value;
+        const char *name;
+        char directory[PATH_MAX];
+        char *end = NULL;
+        unsigned long parsed;
+        size_t value_len;
+
+        while (*line == ' ' || *line == '\t')
+            line++;
+        if (strncmp(line, ctrl_prefix, sizeof(ctrl_prefix) - 1))
+            continue;
+        value = line + sizeof(ctrl_prefix) - 1;
+        value_len = strcspn(value, " \t\r");
+        if (!value_len || value_len >= sizeof(directory))
+            return -1;
+        memcpy(directory, value, value_len);
+        directory[value_len] = '\0';
+        if (lstat(directory, &st) != 0 || !S_ISDIR(st.st_mode) ||
+            !apd_hostapd_uid_trusted(st.st_uid) ||
+            (st.st_mode & (S_IWGRP | S_IWOTH)))
+            return -1;
+        name = strrchr(directory, '/');
+        name = name ? name + 1 : directory;
+        if (strncmp(name, "hostapd-wifi", 12) || !name[12] ||
+            (name[12] == '0' && name[13]))
+            return -1;
+        errno = 0;
+        parsed = strtoul(name + 12, &end, 10);
+        if (errno == ERANGE || !end || end == name + 12 || *end ||
+            parsed > UINT_MAX)
+            return -1;
+        *radio_index = (unsigned int)parsed;
+        return 0;
+    }
+    return -1;
+}
+
+static int apd_tx_retry_aggregate_interface(const char *interface)
+{
+    return interface &&
+           (!strncmp(interface, "MLD", 3) ||
+            !strncmp(interface, "mld-", 4));
+}
+
 /* Reads `Tx Data Packets` and `Retries` for a single VAP. Both must be present:
  * a VAP that reports only one of them cannot contribute a ratio. */
 static int apd_tx_retry_collect_vap(const char *path, const char *vap,
@@ -2331,6 +2645,7 @@ static int apd_tx_retry_collect_vap(const char *path, const char *vap,
 /* Sums the VAP counters for one wiphy. The radio netdev itself (ARPHRD type
  * 801) is skipped: it is not a VAP and `apstats -v` does not apply to it. */
 static int apd_tx_retry_collect(const char *path, unsigned int wiphy_index,
+                                unsigned int radio_index, int has_radio_index,
                                 struct apd_tx_retry_stats *out)
 {
     DIR *directory;
@@ -2379,6 +2694,20 @@ static int apd_tx_retry_collect(const char *path, unsigned int wiphy_index,
         }
         if (type == APD_ARPHRD_IEEE80211_RADIO)
             continue;
+        if (has_radio_index) {
+            unsigned int owner = 0;
+
+            if (apd_tx_retry_vap_radio_index(entry->d_name, &owner) != 0) {
+                if (apd_tx_retry_aggregate_interface(entry->d_name))
+                    continue;
+                closedir(directory);
+                snprintf(out->reason, sizeof(out->reason), "%s",
+                         "apstats_vap_radio_mapping_unavailable");
+                return -1;
+            }
+            if (owner != radio_index)
+                continue;
+        }
         if (counted >= APD_TX_RETRY_MAX_VAPS) {
             closedir(directory);
             snprintf(out->reason, sizeof(out->reason), "%s",
@@ -2407,7 +2736,8 @@ static int apd_tx_retry_collect(const char *path, unsigned int wiphy_index,
     closedir(directory);
     if (counted == 0) {
         snprintf(out->reason, sizeof(out->reason), "%s",
-                 "apstats_no_vap_for_wiphy");
+                 has_radio_index ? "apstats_no_vap_for_logical_radio" :
+                                   "apstats_no_vap_for_wiphy");
         return -1;
     }
     if (retries > total) {
@@ -2660,7 +2990,8 @@ static int apd_survey_scan_collect(const char *path, const char *radio_id,
     airtime_attempted = 1;
     {
         enum apd_radio_netdev_status netdev_status =
-            apd_airtime_radio_netdev(target.wiphy_index, airtime_netdev,
+            apd_airtime_radio_netdev(target.wiphy_index, target.radio_index,
+                                     target.has_radio_index, airtime_netdev,
                                      sizeof(airtime_netdev));
 
         if (netdev_status != APD_RADIO_NETDEV_OK)
@@ -2674,6 +3005,7 @@ static int apd_survey_scan_collect(const char *path, const char *radio_id,
      * `Retries` counter at all, so a working radio sample says nothing about
      * whether retry history is available, and a failed one must not suppress it. */
     (void)apd_tx_retry_collect(apd_find_apstats(), target.wiphy_index,
+                               target.radio_index, target.has_radio_index,
                                &tx_retry);
     if (apd_survey_collect_raw(path, target.interface, target.frequency_mhz,
                                &raw) != 0 || !raw.complete) {
@@ -2711,6 +3043,10 @@ static int apd_survey_scan_collect(const char *path, const char *radio_id,
     json_object_object_add(sample, "channel_receive_time_ms",
         raw.has_receive_time ? json_object_new_int64((int64_t)raw.receive_time_ms) :
                                json_object_new_null());
+    json_object_object_add(sample, "channel_bss_receive_time_ms",
+        raw.has_bss_receive_time ?
+            json_object_new_int64((int64_t)raw.bss_receive_time_ms) :
+            json_object_new_null());
     json_object_object_add(sample, "channel_transmit_time_ms",
         raw.has_transmit_time ? json_object_new_int64((int64_t)raw.transmit_time_ms) :
                                 json_object_new_null());
@@ -2719,6 +3055,39 @@ static int apd_survey_scan_collect(const char *path, const char *radio_id,
                                json_object_new_double(utilization_pct));
     else
         json_object_object_add(sample, "utilization_pct", json_object_new_null());
+    /*
+     * Self-BSS / OBSS split travels on the sample's own air_stats, which is
+     * where the aggregator already looks for the vendor `apstats` figures. A
+     * mac80211 AP has no apstats, so without this the wireless page reported
+     * "driver did not report OBSS interference" while `iw survey dump` was
+     * printing the counters it needs.
+     */
+    {
+        double obss_pct = 0.0;
+        double self_pct = 0.0;
+        int split = apd_survey_bss_split(&raw, &obss_pct, &self_pct) == 0;
+        struct json_object *air = json_object_new_object();
+
+        if (air) {
+            json_object_object_add(air, "source",
+                json_object_new_string("iw_survey"));
+            json_object_object_add(air, "interface",
+                json_object_new_string(target.interface));
+            json_object_object_add(air, "available",
+                                   json_object_new_boolean(split));
+            json_object_object_add(air, "obss_util_pct", split ?
+                json_object_new_double(obss_pct) : json_object_new_null());
+            json_object_object_add(air, "self_bss_util_pct", split ?
+                json_object_new_double(self_pct) : json_object_new_null());
+            json_object_object_add(air, "noise_floor_dbm", raw.has_noise ?
+                json_object_new_int(raw.noise_dbm) : json_object_new_null());
+            json_object_object_add(air, "reason", split ? json_object_new_null() :
+                json_object_new_string(raw.has_bss_receive_time ?
+                    "iw_survey_bss_receive_time_inconsistent" :
+                    "iw_survey_bss_receive_time_missing"));
+            json_object_object_add(sample, "air_stats", air);
+        }
+    }
     json_object_array_add(items, sample);
     sample = NULL;
     complete = 1;
@@ -2954,12 +3323,38 @@ static int apd_collect_uci(struct json_object **radios_out,
             json_object_array_add(radios, item);
         } else {
             const char *disabled = apd_uci_string(ctx, section, "disabled");
+            struct uci_option *devices = uci_lookup_option(ctx, section, "device");
+            struct json_object *radio_ids = json_object_new_array();
+
+            if (devices && devices->type == UCI_TYPE_LIST) {
+                struct uci_element *entry;
+
+                uci_foreach_element(&devices->v.list, entry)
+                    json_object_array_add(radio_ids, json_object_new_string(entry->name));
+            } else if (devices && devices->type == UCI_TYPE_STRING) {
+                json_object_array_add(radio_ids, json_object_new_string(devices->v.string));
+            }
+            if (json_object_array_length(radio_ids))
+                json_object_object_add(item, "radio_id",
+                    json_object_get(json_object_array_get_idx(radio_ids, 0)));
+            json_object_object_add(item, "radio_ids", radio_ids);
             apd_add_desired_string(item, ctx, section, "radio_id", "device");
             apd_add_desired_string(item, ctx, section, "interface", "ifname");
             apd_add_desired_string(item, ctx, section, "broadcast_name", "ssid");
             apd_add_desired_string(item, ctx, section, "mode", "mode");
             apd_add_desired_string(item, ctx, section, "network", "network");
             apd_add_desired_string(item, ctx, section, "security_mode", "encryption");
+            apd_add_desired_string(item, ctx, section, "ieee80211w", "ieee80211w");
+            apd_add_desired_string(item, ctx, section, "dreamingwrt_mlo_members",
+                                   "dreamingwrt_mlo_members");
+            json_object_object_add(item, "mlo", json_object_new_boolean(
+                apd_text_boolean(apd_uci_string(ctx, section, "mlo"), 0)));
+            {
+                const char *key = apd_uci_string(ctx, section, "key");
+
+                json_object_object_add(item, "password_present",
+                    json_object_new_boolean(key && key[0]));
+            }
             json_object_object_add(item, "enabled", json_object_new_boolean(
                                    !apd_text_boolean(disabled, 0)));
             json_object_object_add(item, "hidden", json_object_new_boolean(
@@ -3182,6 +3577,8 @@ done:
 #endif
 
 #ifndef APD_SURVEY_STANDALONE_TEST
+#include <openssl/evp.h>
+
 #define APD_HOSTAPD_IFACE_LEN 63U
 #define APD_HOSTAPD_SSID_LEN 127U
 #define APD_HOSTAPD_STATE_LEN 31U
@@ -3224,6 +3621,9 @@ struct apd_hostapd_station_observation {
     int authenticated;
     int associated;
     int authorized;
+    int has_extended_capabilities;
+    int station_btm_capable;
+    char station_btm_reason[APD_HOSTAPD_REASON_LEN + 1];
     int has_mld_address;
     char mld_address[APD_HOSTAPD_MAC_LEN + 1];
     int has_link_id;
@@ -3231,8 +3631,83 @@ struct apd_hostapd_station_observation {
     int mlo_relation_complete;
 };
 
+#define APD_HOSTAPD_NEIGHBOR_LIMIT 64U
+#ifndef APD_QCA_HAPD_SUPP_PATH
+#define APD_QCA_HAPD_SUPP_PATH "/usr/sbin/qca-hapd-supp"
+#endif
+#ifndef APD_QCA_HAPD_PID_PATH
+#define APD_QCA_HAPD_PID_PATH APD_HOSTAPD_RUN_DIR_PARENT "/hostapd-global.pid"
+#endif
+#ifndef APD_QCA_HAPD_PROC_ROOT
+#define APD_QCA_HAPD_PROC_ROOT "/proc"
+#endif
+#ifndef APD_QCA_HAPD_SAFE_SIZE
+#define APD_QCA_HAPD_SAFE_SIZE 5183011
+#endif
+#ifndef APD_QCA_HAPD_SAFE_SHA256
+#define APD_QCA_HAPD_SAFE_SHA256 \
+    "0efdc9f4670325eaa5807b693665c04420eaf230d17f003952bddfe08601b403"
+#endif
+
+static int apd_hostapd_reassoc_backend_safe(void)
+{
+    struct stat disk, running;
+    FILE *binary, *pid_file;
+    EVP_MD_CTX *context = NULL;
+    unsigned char buffer[4096], digest[EVP_MAX_MD_SIZE];
+    char path[PATH_MAX], hex[65], extra;
+    unsigned int digest_length, i;
+    size_t length;
+    long pid;
+    int safe = 0;
+
+    binary = fopen(APD_QCA_HAPD_SUPP_PATH, "rb");
+    if (!binary)
+        return errno == ENOENT;
+    if (fstat(fileno(binary), &disk) != 0 || !S_ISREG(disk.st_mode) ||
+        disk.st_size != APD_QCA_HAPD_SAFE_SIZE)
+        goto out;
+    pid_file = fopen(APD_QCA_HAPD_PID_PATH, "r");
+    if (!pid_file)
+        goto out;
+    i = fscanf(pid_file, "%ld %c", &pid, &extra) == 1 &&
+        pid > 1 && pid <= INT_MAX;
+    fclose(pid_file);
+    if (!i)
+        goto out;
+    snprintf(path, sizeof(path), APD_QCA_HAPD_PROC_ROOT "/%ld/exe", pid);
+    /* An on-disk patch cannot qualify an old, still-running hostapd. */
+    if (stat(path, &running) != 0 || running.st_dev != disk.st_dev ||
+        running.st_ino != disk.st_ino)
+        goto out;
+    context = EVP_MD_CTX_new();
+    if (!context || EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1)
+        goto out;
+    while ((length = fread(buffer, 1, sizeof(buffer), binary)) > 0)
+        if (EVP_DigestUpdate(context, buffer, length) != 1)
+            goto out;
+    if (ferror(binary) ||
+        EVP_DigestFinal_ex(context, digest, &digest_length) != 1 ||
+        digest_length != 32)
+        goto out;
+    for (i = 0; i < digest_length; i++)
+        snprintf(hex + i * 2, 3, "%02x", digest[i]);
+    safe = !strcmp(hex, APD_QCA_HAPD_SAFE_SHA256);
+out:
+    EVP_MD_CTX_free(context);
+    fclose(binary);
+    return safe;
+}
+
+struct apd_hostapd_neighbor {
+    char bssid[18];
+    char ssid_hex[65];
+    char report[27];
+};
+
 struct apd_hostapd_bss_observation {
     char interface[APD_HOSTAPD_IFACE_LEN + 1];
+    char control_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
     char bssid[APD_HOSTAPD_MAC_LEN + 1];
     char ssid[APD_HOSTAPD_SSID_LEN + 1];
     char state[APD_HOSTAPD_STATE_LEN + 1];
@@ -3251,6 +3726,22 @@ struct apd_hostapd_bss_observation {
     int mlo_relation_complete;
     size_t station_offset;
     size_t station_count;
+    int hostapd_ctrl_reachable;
+    int ft_configured;
+    int ft_supported;
+    int ft_over_ds;
+    int neighbor_report_80211k;
+    int neighbor_database_configured;
+    int neighbors_complete;
+    size_t neighbor_count;
+    struct apd_hostapd_neighbor neighbors[APD_HOSTAPD_NEIGHBOR_LIMIT];
+    int bss_transition_80211v;
+    int client_deauth;
+    int reassoc_block;
+    char ft_reason[APD_HOSTAPD_REASON_LEN + 1];
+    char neighbor_report_reason[APD_HOSTAPD_REASON_LEN + 1];
+    char bss_transition_reason[APD_HOSTAPD_REASON_LEN + 1];
+    char client_deauth_reason[APD_HOSTAPD_REASON_LEN + 1];
     int complete;
     char reason[APD_HOSTAPD_REASON_LEN + 1];
 };
@@ -3260,6 +3751,7 @@ struct apd_hostapd_observation {
     int available;
     int complete;
     int global_control;
+    int reassoc_backend_safe;
     size_t interface_controls;
     size_t bss_count;
     size_t station_count;
@@ -3417,26 +3909,181 @@ static int apd_hostapd_socket_path(const char *directory, const char *name,
     return written < 0 || (size_t)written >= path_len ? -1 : 0;
 }
 
+static int apd_hostapd_uid_trusted(uid_t uid)
+{
+    struct passwd account;
+    struct passwd *result = NULL;
+    char buffer[1024];
+
+    if (uid == APD_HOSTAPD_EXPECTED_UID ||
+        (APD_HOSTAPD_SERVICE_UID != (uid_t)-1 &&
+         uid == APD_HOSTAPD_SERVICE_UID))
+        return 1;
+    return getpwnam_r(APD_HOSTAPD_SERVICE_USER, &account, buffer,
+                      sizeof(buffer), &result) == 0 &&
+           result && result->pw_uid == uid;
+}
+
+static int apd_hostapd_service_gid(gid_t *gid)
+{
+    struct passwd account;
+    struct passwd *result = NULL;
+    char buffer[1024];
+
+    if (!gid)
+        return -1;
+    if (APD_HOSTAPD_SERVICE_GID != (gid_t)-1) {
+        *gid = APD_HOSTAPD_SERVICE_GID;
+        return 0;
+    }
+    if (getpwnam_r(APD_HOSTAPD_SERVICE_USER, &account, buffer,
+                   sizeof(buffer), &result) != 0 || !result)
+        return -1;
+    *gid = result->pw_gid;
+    return 0;
+}
+
 static int apd_hostapd_control_dir_available(void)
 {
     struct stat st;
 
     return lstat(APD_HOSTAPD_RUN_DIR, &st) == 0 && S_ISDIR(st.st_mode) &&
-           st.st_uid == APD_HOSTAPD_EXPECTED_UID &&
+           apd_hostapd_uid_trusted(st.st_uid) &&
            !(st.st_mode & (S_IWGRP | S_IWOTH));
 }
 
-/* A control directory is only trusted when root owns it and it is not
- * group/world writable, matching the check already applied to the main run
- * directory. Applied to vendor directories too so widening the search does not
- * widen who may plant a socket we then talk to. */
+/* Control paths may be owned by root or OpenWrt's named hostapd service user.
+ * Arbitrary UIDs and group/world-writable directories remain rejected. */
 static int apd_hostapd_dir_trusted(const char *path)
 {
     struct stat st;
 
     return path && lstat(path, &st) == 0 && S_ISDIR(st.st_mode) &&
-           st.st_uid == APD_HOSTAPD_EXPECTED_UID &&
+           apd_hostapd_uid_trusted(st.st_uid) &&
            !(st.st_mode & (S_IWGRP | S_IWOTH));
+}
+
+/* Read the per-BSS runtime configuration generated by hostapd/netifd.  The
+ * control directory is configuration evidence, not a guessed QSDK layout.
+ * Only a root-owned, non-writable, regular file and a trusted control
+ * directory are accepted. */
+static int apd_hostapd_conf_control_dir(const char *interface,
+                                        char *out, size_t out_len,
+                                        struct apd_hostapd_bss_observation *bss)
+{
+    char path[PATH_MAX];
+    char buffer[4096];
+    struct stat st;
+    ssize_t length;
+    char *line;
+    char *saveptr = NULL;
+    int fd;
+
+    if (!apd_hostapd_safe_name(interface) || !out || out_len == 0 ||
+        snprintf(path, sizeof(path), "%s%s.conf", APD_HOSTAPD_CONF_PREFIX,
+                 interface) >= (int)sizeof(path))
+        return -1;
+    fd = open(path, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return -1;
+    if (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+        !apd_hostapd_uid_trusted(st.st_uid) ||
+        (st.st_mode & (S_IWGRP | S_IWOTH))) {
+        close(fd);
+        return -1;
+    }
+    length = read(fd, buffer, sizeof(buffer) - 1);
+    close(fd);
+    if (length <= 0 || length >= (ssize_t)sizeof(buffer) - 1)
+        return -1;
+    buffer[length] = '\0';
+    for (line = strtok_r(buffer, "\n", &saveptr); line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        static const char ctrl_prefix[] = "ctrl_interface=";
+        const char *value;
+        size_t value_len;
+
+        while (*line == ' ' || *line == '\t')
+            line++;
+        if (!strncmp(line, "ieee80211r=", 11)) {
+            if (bss && !strcmp(line + 11, "1"))
+                bss->ft_configured = 1;
+            if (bss && !bss->ft_reason[0])
+                snprintf(bss->ft_reason, sizeof(bss->ft_reason),
+                         "hostapd_ft_%s",
+                         bss->ft_configured ? "configured" : "not_configured");
+            continue;
+        }
+        if (!strncmp(line, "ft_over_ds=", 11)) {
+            if (bss && !strcmp(line + 11, "1"))
+                bss->ft_over_ds = 1;
+            if (bss && !bss->ft_reason[0])
+                snprintf(bss->ft_reason, sizeof(bss->ft_reason),
+                         "hostapd_ft_over_ds_%s",
+                         bss->ft_over_ds ? "enabled" : "disabled");
+            continue;
+        }
+        if (!strncmp(line, "ieee80211k=", 11)) {
+            if (bss && !strcmp(line + 11, "1"))
+                bss->neighbor_report_80211k = 1;
+            if (bss && !bss->neighbor_report_reason[0])
+                snprintf(bss->neighbor_report_reason,
+                         sizeof(bss->neighbor_report_reason),
+                         "hostapd_config_%s",
+                         bss->neighbor_report_80211k ?
+                         "enabled" : "disabled");
+            continue;
+        }
+        if (!strncmp(line, "ieee80211v=", 11) ||
+            !strncmp(line, "bss_transition=", 15)) {
+            if (bss && (!strcmp(line + 11, "1") ||
+                        !strcmp(line + 15, "1")))
+                bss->bss_transition_80211v = 1;
+            if (bss && !bss->bss_transition_reason[0])
+                snprintf(bss->bss_transition_reason,
+                         sizeof(bss->bss_transition_reason),
+                         "hostapd_config_%s",
+                         bss->bss_transition_80211v ?
+                         "enabled" : "disabled");
+            continue;
+        }
+        if (!strncmp(line, "rrm_neighbor_report=", 20)) {
+            if (bss && !strcmp(line + 20, "1"))
+                bss->neighbor_database_configured = 1;
+            if (bss && !bss->neighbor_report_reason[0])
+                snprintf(bss->neighbor_report_reason,
+                         sizeof(bss->neighbor_report_reason),
+                         "hostapd_config_%s",
+                         bss->neighbor_database_configured ?
+                         "enabled" : "disabled");
+            continue;
+        }
+        if (!strncmp(line, "mobility_domain=", 16)) {
+            /* mobility_domain is present, FT is configured. */
+            if (bss)
+                bss->ft_configured = 1;
+            if (bss && !bss->ft_reason[0])
+                snprintf(bss->ft_reason, sizeof(bss->ft_reason),
+                         "hostapd_ft_configured_via_mobility_domain");
+            continue;
+        }
+        if (strncmp(line, ctrl_prefix, sizeof(ctrl_prefix) - 1))
+            continue;
+        value = line + sizeof(ctrl_prefix) - 1;
+        value_len = strcspn(value, " \t\r");
+        if (!value_len || value_len >= out_len)
+            return -1;
+        memcpy(out, value, value_len);
+        out[value_len] = '\0';
+        if (!apd_hostapd_dir_trusted(out))
+            return -1;
+    }
+    if (bss) {
+        snprintf(bss->ft_reason, sizeof(bss->ft_reason), "%s",
+                 bss->ft_configured ? "hostapd_ft_configured" :
+                                      "hostapd_ft_not_configured");
+    }
+    return out[0] ? 0 : -1;
 }
 
 /*
@@ -3488,15 +4135,29 @@ static size_t apd_hostapd_vendor_dirs(char (*out)[APD_HOSTAPD_DIR_LEN],
 static int apd_hostapd_local_dir_prepare(void)
 {
     struct stat st;
+    gid_t service_gid;
+
+    if (apd_hostapd_service_gid(&service_gid) != 0)
+        return -1;
 
     if (lstat(APD_HOSTAPD_LOCAL_DIR, &st) != 0) {
-        if (errno != ENOENT || mkdir(APD_HOSTAPD_LOCAL_DIR, 0700) != 0)
+        if (errno != ENOENT || mkdir(APD_HOSTAPD_LOCAL_DIR, 0750) != 0)
             return -1;
         if (lstat(APD_HOSTAPD_LOCAL_DIR, &st) != 0)
             return -1;
     }
+    if (!S_ISDIR(st.st_mode) || st.st_uid != getuid() ||
+        (st.st_mode & S_IRWXO))
+        return -1;
+    if (st.st_gid != service_gid && chown(APD_HOSTAPD_LOCAL_DIR, (uid_t)-1,
+                                          service_gid) != 0)
+        return -1;
+    if ((st.st_mode & 0777) != 0750 && chmod(APD_HOSTAPD_LOCAL_DIR, 0750) != 0)
+        return -1;
+    if (lstat(APD_HOSTAPD_LOCAL_DIR, &st) != 0)
+        return -1;
     return S_ISDIR(st.st_mode) && st.st_uid == getuid() &&
-           !(st.st_mode & (S_IRWXG | S_IRWXO)) ? 0 : -1;
+           st.st_gid == service_gid && (st.st_mode & 0777) == 0750 ? 0 : -1;
 }
 
 static void apd_hostapd_clear(void *data, size_t length)
@@ -3590,6 +4251,7 @@ static int apd_hostapd_request(const char *remote_path, const char *command,
     enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
     int bound = 0;
     int local_verified = 0;
+    gid_t service_gid;
     int written;
     ssize_t received;
     size_t command_len;
@@ -3602,8 +4264,15 @@ static int apd_hostapd_request(const char *remote_path, const char *command,
             *stage_out = APD_HOSTAPD_STAGE_ARGUMENTS;
         return APD_HOSTAPD_REQUEST_FAILED;
     }
+    if (apd_hostapd_service_gid(&service_gid) != 0 ||
+        apd_hostapd_local_dir_prepare() != 0) {
+        if (stage_out)
+            *stage_out = APD_HOSTAPD_STAGE_LOCAL_VERIFY;
+        return APD_HOSTAPD_REQUEST_FAILED;
+    }
     command_len = strlen(command);
-    if (!command_len || command_len > 64U) {
+    if (!command_len || command_len > 512U ||
+        strchr(command, '\n') || strchr(command, '\r')) {
         if (stage_out)
             *stage_out = APD_HOSTAPD_STAGE_ARGUMENTS;
         return APD_HOSTAPD_REQUEST_FAILED;
@@ -3634,7 +4303,11 @@ static int apd_hostapd_request(const char *remote_path, const char *command,
         goto done;
     local_verified = 1;
     stage = APD_HOSTAPD_STAGE_CHMOD;
-    if (chmod(local.sun_path, S_IRUSR | S_IWUSR) != 0)
+    if (chown(local.sun_path, (uid_t)-1, service_gid) != 0 ||
+        chmod(local.sun_path, S_IRUSR | S_IWUSR | S_IRGRP | S_IWGRP) != 0 ||
+        lstat(local.sun_path, &local_st) != 0 || !S_ISSOCK(local_st.st_mode) ||
+        local_st.st_uid != getuid() || local_st.st_gid != service_gid ||
+        (local_st.st_mode & 0777) != 0660)
         goto done;
     stage = APD_HOSTAPD_STAGE_CONNECT;
     if (connect(fd, (struct sockaddr *)&remote, sizeof(remote)) != 0)
@@ -3855,6 +4528,20 @@ static int apd_hostapd_parse_station(char *response,
             station->authenticated = strstr(value, "[AUTH]") != NULL;
             station->associated = strstr(value, "[ASSOC]") != NULL;
             station->authorized = strstr(value, "[AUTHORIZED]") != NULL;
+        } else if (!strcmp(key, "extended_capabilities") ||
+                   !strcmp(key, "ext_capab")) {
+            size_t length = strlen(value);
+
+            station->has_extended_capabilities = 1;
+            station->station_btm_capable = length >= 6 &&
+                isxdigit((unsigned char)value[4]) &&
+                isxdigit((unsigned char)value[5]) &&
+                (strtoul((char[]){ value[4], value[5], '\0' }, NULL, 16) & 0x08);
+            snprintf(station->station_btm_reason,
+                     sizeof(station->station_btm_reason), "%s",
+                     station->station_btm_capable ?
+                         "station_extended_capabilities_btm_supported" :
+                         "station_extended_capabilities_btm_not_supported");
         } else if (!strcmp(key, "signal")) {
             if (apd_hostapd_parse_i64(value, -200, 100, &signed_number) != 0)
                 return -1;
@@ -3903,6 +4590,10 @@ static int apd_hostapd_parse_station(char *response,
     }
     station->mlo_relation_complete = station->has_mld_address &&
                                      station->has_link_id;
+    if (!station->has_extended_capabilities)
+        snprintf(station->station_btm_reason,
+                 sizeof(station->station_btm_reason),
+                 "station_extended_capabilities_not_reported");
     return 0;
 }
 
@@ -3914,6 +4605,34 @@ static int apd_hostapd_is_fail(const char *response)
 static int apd_hostapd_is_unknown_command(const char *response)
 {
     return response && !strncmp(response, "UNKNOWN COMMAND", 15);
+}
+
+static int apd_hostapd_probe_command(const char *remote_path,
+                                     const char *command,
+                                     char *response, size_t response_capacity,
+                                     int64_t collection_deadline,
+                                     const char **reason)
+{
+    size_t response_len = 0;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+    int rc;
+
+    rc = apd_hostapd_request(remote_path, command, response,
+                             response_capacity, &response_len,
+                             collection_deadline, &stage);
+    if (rc != APD_HOSTAPD_REQUEST_OK) {
+        if (reason)
+            *reason = "hostapd_capability_probe_failed";
+        return 0;
+    }
+    if (apd_hostapd_is_unknown_command(response)) {
+        if (reason)
+            *reason = "hostapd_command_unsupported";
+        return 0;
+    }
+    if (reason)
+        *reason = "hostapd_command_supported";
+    return 1;
 }
 
 static const char *apd_hostapd_request_reason(int rc, const char *operation,
@@ -3949,6 +4668,66 @@ static const char *apd_hostapd_request_reason(int rc, const char *operation,
                                            "hostapd_station_query_failed";
 }
 
+/* SHOW_NEIGHBOR may include optional subelements and a trailing "stat".
+ * Keep the fixed report body; a truncated/malformed table is never complete. */
+static int apd_hostapd_neighbors_parse(char *response,
+                                      struct apd_hostapd_bss_observation *bss)
+{
+    char *line, *save = NULL;
+
+    bss->neighbor_count = 0;
+    bss->neighbors_complete = 0;
+    if (apd_hostapd_is_fail(response) || apd_hostapd_is_unknown_command(response))
+        return -1;
+    for (line = strtok_r(response, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        struct apd_hostapd_neighbor item = {0};
+        char mac[18], report[511];
+        size_t i, length;
+        int consumed = 0;
+
+        if (bss->neighbor_count >= APD_HOSTAPD_NEIGHBOR_LIMIT ||
+            sscanf(line, "%17s ssid=%64[0-9a-fA-F] nr=%510[0-9a-fA-F]%n",
+                   mac, item.ssid_hex, report, &consumed) != 3 ||
+            !consumed || (line[consumed] && line[consumed] != ' ') ||
+            apd_hostapd_parse_mac(mac, item.bssid) != 0)
+            return -1;
+        length = strlen(report);
+        if (length < 26 || length % 2 || strlen(item.ssid_hex) % 2)
+            return -1;
+        for (i = 0; i < 12; i++)
+            if (tolower((unsigned char)report[i]) != item.bssid[i + i / 2])
+                return -1;
+        for (i = 0; i < 26; i++)
+            item.report[i] = (char)tolower((unsigned char)report[i]);
+        for (i = 0; item.ssid_hex[i]; i++)
+            item.ssid_hex[i] = (char)tolower((unsigned char)item.ssid_hex[i]);
+        bss->neighbors[bss->neighbor_count++] = item;
+    }
+    bss->neighbors_complete = 1;
+    return 0;
+}
+
+#if !defined(APD_HOSTAPD_STANDALONE_TEST) || defined(APD_ROAMING_STANDALONE_TEST)
+static struct json_object *apd_hostapd_neighbors_json(
+    const struct apd_hostapd_bss_observation *bss)
+{
+    struct json_object *rows = json_object_new_array();
+    size_t i;
+
+    for (i = 0; i < bss->neighbor_count; i++) {
+        const struct apd_hostapd_neighbor *raw = &bss->neighbors[i];
+        struct json_object *row = json_object_new_object();
+
+        json_object_object_add(row, "bssid", json_object_new_string(raw->bssid));
+        json_object_object_add(row, "ssid_hex", json_object_new_string(raw->ssid_hex));
+        json_object_object_add(row, "report", json_object_new_string(raw->report));
+        json_object_array_add(rows, row);
+    }
+    return rows;
+}
+#endif
+
 static int apd_hostapd_collect_bss(const char *remote_path,
                                    struct apd_hostapd_observation *result,
                                    struct apd_hostapd_bss_observation *bss,
@@ -3957,6 +4736,7 @@ static int apd_hostapd_collect_bss(const char *remote_path,
 {
     char command[64];
     char previous_mac[APD_HOSTAPD_MAC_LEN + 1] = { 0 };
+    const char *probe_reason = NULL;
     size_t response_len = 0;
     int rc;
     int partial_mlo = 0;
@@ -3980,6 +4760,49 @@ static int apd_hostapd_collect_bss(const char *remote_path,
         apd_hostapd_set_reason(bss->reason, sizeof(bss->reason),
                                "hostapd_status_malformed");
         return -1;
+    }
+    bss->hostapd_ctrl_reachable = 1;
+    snprintf(bss->control_path, sizeof(bss->control_path), "%s", remote_path);
+
+    bss->neighbor_report_80211k = apd_hostapd_probe_command(
+        remote_path, "REQ_BEACON ", response, response_capacity,
+        collection_deadline, &probe_reason);
+    snprintf(bss->neighbor_report_reason,
+             sizeof(bss->neighbor_report_reason), "%s", probe_reason);
+    if (bss->neighbor_report_80211k && apd_hostapd_probe_command(
+            remote_path, "SHOW_NEIGHBOR", response, response_capacity,
+            collection_deadline, &probe_reason)) {
+        bss->neighbor_database_configured = !apd_hostapd_is_fail(response);
+        if (bss->neighbor_database_configured)
+            apd_hostapd_neighbors_parse(response, bss);
+        snprintf(bss->neighbor_report_reason,
+                 sizeof(bss->neighbor_report_reason), "%s",
+                 bss->neighbor_database_configured ?
+                     "hostapd_neighbor_database_available" :
+                     "hostapd_command_supported_neighbor_database_unavailable");
+    }
+
+    bss->bss_transition_80211v = apd_hostapd_probe_command(
+        remote_path, "BSS_TM_REQ ", response, response_capacity,
+        collection_deadline, &probe_reason);
+    snprintf(bss->bss_transition_reason,
+             sizeof(bss->bss_transition_reason), "%s", probe_reason);
+
+    bss->client_deauth = apd_hostapd_probe_command(
+        remote_path, "DEAUTHENTICATE ", response, response_capacity,
+        collection_deadline, &probe_reason);
+    snprintf(bss->client_deauth_reason,
+             sizeof(bss->client_deauth_reason), "%s", probe_reason);
+    bss->reassoc_block = 0;
+    if (result->reassoc_backend_safe &&
+        !bss->has_mld_address && !bss->has_link_id) {
+        rc = apd_hostapd_request(
+            remote_path, "DENY_ACL SHOW", response, response_capacity, &response_len,
+            collection_deadline, &stage);
+        bss->reassoc_block = (rc == APD_HOSTAPD_REQUEST_OK ||
+                              rc == APD_HOSTAPD_REQUEST_EMPTY) &&
+            !apd_hostapd_is_fail(response) &&
+            !apd_hostapd_is_unknown_command(response);
     }
     if ((bss->has_mld_address || bss->has_link_id) &&
         !bss->mlo_relation_complete) {
@@ -4096,7 +4919,7 @@ static int apd_hostapd_collect_raw(int phy_count,
         return -1;
     }
     if (!S_ISDIR(dir_st.st_mode) ||
-        dir_st.st_uid != APD_HOSTAPD_EXPECTED_UID ||
+        !apd_hostapd_uid_trusted(dir_st.st_uid) ||
         (dir_st.st_mode & (S_IWGRP | S_IWOTH))) {
         apd_hostapd_set_reason(result->reason, sizeof(result->reason),
                                "control_directory_untrusted");
@@ -4107,6 +4930,7 @@ static int apd_hostapd_collect_raw(int phy_count,
                                "local_control_directory_untrusted");
         return -1;
     }
+    result->reassoc_backend_safe = apd_hostapd_reassoc_backend_safe();
     /* Main run directory first, then the vendor per-radio directories. On
      * mainline OpenWrt the vendor scan finds nothing and behavior is unchanged;
      * on QSDK it is where every per-interface socket actually lives. */
@@ -4144,7 +4968,7 @@ static int apd_hostapd_collect_raw(int phy_count,
             if (apd_hostapd_socket_path(scan_dir, entry->d_name,
                                         path, sizeof(path)) != 0 ||
                 lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode) ||
-                st.st_uid != APD_HOSTAPD_EXPECTED_UID)
+                !apd_hostapd_uid_trusted(st.st_uid))
                 continue;
             if (!strcmp(entry->d_name, "global")) {
                 result->global_control = 1;
@@ -4180,7 +5004,8 @@ static int apd_hostapd_collect_raw(int phy_count,
              * fits. Copying rather than formatting keeps the compiler from
              * treating scan_dir as a pointer into the flat scan_dirs array,
              * where the apparent source bound is every remaining row at once. */
-            jmx_strbuf_copy(dirs[name_count], APD_HOSTAPD_DIR_LEN, scan_dir);
+            memcpy(dirs[name_count], scan_dir, APD_HOSTAPD_DIR_LEN);
+            dirs[name_count][APD_HOSTAPD_DIR_LEN - 1] = '\0';
             name_count++;
         }
         closedir(dir);
@@ -4238,6 +5063,8 @@ static int apd_hostapd_collect_raw(int phy_count,
     }
     for (i = 0; i < name_count; i++) {
         char remote_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+        char configured_dir[APD_HOSTAPD_DIR_LEN];
+        const char *control_dir = dirs[i];
         struct apd_hostapd_bss_observation *bss = &result->bss[result->bss_count];
 
         if (apd_hostapd_copy_text(bss->interface, sizeof(bss->interface),
@@ -4247,7 +5074,14 @@ static int apd_hostapd_collect_raw(int phy_count,
             continue;
         }
         result->bss_count++;
-        if (apd_hostapd_socket_path(dirs[i], names[i], remote_path,
+        /* Prefer the runtime hostapd configuration as the authoritative
+         * control location. The directory scan remains a fail-closed fallback
+         * for platforms that do not expose a per-BSS generated conf file. */
+        configured_dir[0] = '\0';
+        if (apd_hostapd_conf_control_dir(names[i], configured_dir,
+                                         sizeof(configured_dir), bss) == 0)
+            control_dir = configured_dir;
+        if (apd_hostapd_socket_path(control_dir, names[i], remote_path,
                                     sizeof(remote_path)) != 0 ||
             apd_hostapd_collect_bss(remote_path, result, bss, response,
                                     APD_HOSTAPD_RESPONSE_LIMIT + 2U,
@@ -4359,6 +5193,1093 @@ static void apd_vendor_station_emit(struct json_object *stations,
  * enriched rather than replaced: hostapd stays the source of the traffic and
  * MLO fields it alone reports, and this only adds what it never had.
  */
+/* ---- Phase 2: 802.11k beacon reports -----------------------------------
+ *
+ * The controller cannot score a roaming candidate without knowing how well the
+ * *station* hears it.  The AP's own view is useless for this: a candidate AP
+ * never sees a client associated elsewhere, and the serving AP's RSSI says
+ * nothing about the target.  802.11k beacon reports are the only source that
+ * answers the actual question, because the station does the measuring.
+ *
+ * Flow: REQ_BEACON asks the station to measure; the answer arrives
+ * asynchronously as a BEACON-RESP-RX event on an ATTACHed control socket. */
+
+#endif
+#if !defined(APD_HOSTAPD_STANDALONE_TEST) || defined(APD_ROAMING_STANDALONE_TEST)
+
+#define APD_BEACON_REPORT_FIXED_LEN 26   /* rrm_measurement_beacon_report */
+#define APD_BEACON_REPORT_HEX_LEN (APD_BEACON_REPORT_FIXED_LEN * 2U)
+#define APD_BEACON_RCPI_UNAVAILABLE 255
+
+struct apd_beacon_report {
+    char bssid[18];
+    int op_class;
+    int channel;
+    int rcpi_dbm;
+    int rsni_db;
+    int have_rcpi;
+    int have_rsni;
+};
+
+static int apd_hex_nibble(char c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+/* Decode the hex body hostapd prints after BEACON-RESP-RX.
+ *
+ * hostapd has already skipped the 3-byte measurement report header, so the
+ * payload starts at struct rrm_measurement_beacon_report:
+ *
+ *   op_class(1) channel(1) start_time(8) duration(2) report_info(1)
+ *   rcpi(1) rsni(1) bssid(6) antenna_id(1) parent_tsf(4)  = 26 bytes
+ *
+ * RCPI is defined in 0.5 dBm steps from -110 dBm (IEEE 802.11 Table 9-176),
+ * so dBm = rcpi/2 - 110.  255 means the station could not measure, which is
+ * NOT the same as a very weak signal and must never be scored as one.
+ *
+ * Returns 0 on success. */
+static int apd_beacon_report_decode(const char *hex,
+                                    struct apd_beacon_report *out)
+{
+    unsigned char raw[APD_BEACON_REPORT_FIXED_LEN];
+    size_t hex_len;
+    size_t i;
+
+    if (!hex || !out)
+        return -1;
+    hex_len = strspn(hex, "0123456789abcdefABCDEF");
+    if (hex_len < APD_BEACON_REPORT_HEX_LEN || (hex_len & 1))
+        return -1;
+    for (i = hex_len; hex[i]; i++) {
+        if (!isspace((unsigned char)hex[i]))
+            return -1;
+    }
+    /* Valid reports may append subelements, including a reported frame body.
+     * Check their boundaries without mistaking them for a malformed body. */
+    for (i = APD_BEACON_REPORT_HEX_LEN; i < hex_len;) {
+        size_t bytes;
+
+        if (hex_len - i < 4)
+            return -1;
+        bytes = (size_t)((apd_hex_nibble(hex[i + 2]) << 4) |
+                         apd_hex_nibble(hex[i + 3]));
+        i += 4 + bytes * 2;
+        if (i > hex_len)
+            return -1;
+    }
+    memset(out, 0, sizeof(*out));
+    for (i = 0; i < APD_BEACON_REPORT_FIXED_LEN; i++) {
+        int hi = apd_hex_nibble(hex[i * 2]);
+        int lo = hi < 0 ? -1 : apd_hex_nibble(hex[i * 2 + 1]);
+
+        if (hi < 0 || lo < 0)
+            return -1;      /* truncated or non-hex: refuse, do not guess */
+        raw[i] = (unsigned char)((hi << 4) | lo);
+    }
+    out->op_class = raw[0];
+    out->channel = raw[1];
+    if (raw[13] <= 220) {
+        out->rcpi_dbm = (int)raw[13] / 2 - 110;
+        out->have_rcpi = 1;
+    }
+    if (raw[14] != APD_BEACON_RCPI_UNAVAILABLE) {
+        /* RSNI is in 0.5 dB steps offset by -10 dB. */
+        out->rsni_db = (int)raw[14] / 2 - 10;
+        out->have_rsni = 1;
+    }
+    snprintf(out->bssid, sizeof(out->bssid),
+             "%02x:%02x:%02x:%02x:%02x:%02x",
+             raw[15], raw[16], raw[17], raw[18], raw[19], raw[20]);
+    /* A report naming no BSS measured nothing useful. */
+    if (!strcmp(out->bssid, "00:00:00:00:00:00"))
+        return -1;
+    return 0;
+}
+
+/* Ask one station to measure one candidate channel.
+ *
+ * The request body is the Beacon Request element:
+ *   op_class(1) channel(1) rand_interval(2 LE) duration(2 LE) mode(1) bssid(6)
+ *
+ * Prefer active scanning, then passive measurement, then the station's
+ * existing scan table. Some clients advertise only table reporting.
+ * hostapd checks the station's RRM capabilities before sending a request.
+ * Only an explicit FAIL permits trying another mode; a timeout is ambiguous.
+ * A wildcard BSSID asks for every BSS on the candidate channel.
+ *
+ * Returns the measurement token (>=0) that later BEACON-RESP-RX events carry,
+ * or -1. */
+static int apd_roaming_monitor_attach(const char *ctrl_path);
+static int apd_phase4_station_associated(const char *ctrl_path,
+                                         const char *sta_mac);
+static void apd_beacon_request_record(const char *ctrl_path,
+    const char *station_mac, int token, int mode);
+static int apd_beacon_request_wait_previous(const char *ctrl_path,
+    const char *station_mac);
+
+static int apd_phase2_request_beacon(const char *ctrl_path, const char *sta_mac,
+                                     int op_class, int channel, int duration_tu,
+                                     const char *bssid, const char *ssid)
+{
+    static const int modes[] = { 1, 0, 2 };
+    char command[256];
+    char normalized[18];
+    char normalized_bssid[18];
+    const char *request_bssid;
+    char bssid_hex[13] = "ffffffffffff";
+    char response[128];
+    size_t response_len = 0;
+    size_t attempt;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+    int rc;
+
+    if (!ctrl_path || apd_hostapd_parse_mac(sta_mac, normalized) != 0)
+        return -1;
+    if (op_class <= 0 || op_class > 255 || channel <= 0 || channel > 255)
+        return -1;
+    if (bssid && bssid[0]) {
+        size_t i;
+
+        if (apd_hostapd_parse_mac(bssid, normalized_bssid) != 0)
+            return -1;
+        for (i = 0; i < 12; i++)
+            bssid_hex[i] = normalized_bssid[i + i / 2];
+        request_bssid = bssid_hex;
+    } else {
+        request_bssid = "ffffffffffff";
+    }
+    if (duration_tu <= 0 || duration_tu > 65535)
+        duration_tu = 50;
+    if (!apd_phase4_station_associated(ctrl_path, normalized) ||
+        apd_roaming_monitor_attach(ctrl_path) != 0)
+        return -1;
+    if (apd_beacon_request_wait_previous(ctrl_path, normalized) != 0)
+        return -1;
+    for (attempt = 0; attempt < sizeof(modes) / sizeof(modes[0]); attempt++) {
+        int64_t token;
+        char *end;
+
+        rc = snprintf(command, sizeof(command),
+                      "REQ_BEACON %s %02x%02x0000%02x%02x%02x"
+                      "%s",
+                      normalized, op_class & 0xff, channel & 0xff,
+                      duration_tu & 0xff, (duration_tu >> 8) & 0xff,
+                      modes[attempt], request_bssid);
+        if (rc < 0 || (size_t)rc >= sizeof(command))
+            return -1;
+        if (ssid && ssid[0]) {
+            size_t i, length = strlen(ssid);
+
+            if (length > 32)
+                return -1;
+            rc += snprintf(command + rc, sizeof(command) - (size_t)rc,
+                           "00%02x", (unsigned)length);
+            for (i = 0; i < length; i++)
+                rc += snprintf(command + rc, sizeof(command) - (size_t)rc,
+                               "%02x", (unsigned char)ssid[i]);
+        }
+        /* Reporting Detail 0 requests the fixed measurement, not a full beacon. */
+        snprintf(command + rc, sizeof(command) - (size_t)rc, "020100");
+        rc = apd_hostapd_request(ctrl_path, command, response, sizeof(response),
+                                 &response_len, 0, &stage);
+        if (rc != APD_HOSTAPD_REQUEST_OK)
+            return -1;
+        end = response + strlen(response);
+        while (end > response && isspace((unsigned char)end[-1]))
+            *--end = '\0';
+        if (!strcmp(response, "FAIL"))
+            continue;
+        if (apd_hostapd_parse_i64(response, 0, 255, &token) != 0)
+            return -1;
+        apd_beacon_request_record(ctrl_path, normalized, (int)token,
+                                  modes[attempt]);
+        return (int)token;
+    }
+    return -1;
+}
+
+/* Beacon reports arrive asynchronously, but this backend is a synchronous
+ * periodic collector with no event loop.  Rather than drag uloop in here, keep
+ * the monitor socket ATTACHed across collections and drain it without blocking
+ * at each pass: hostapd queues events into the socket buffer meanwhile, so
+ * nothing is lost between polls, and the collector keeps its current shape. */
+
+#define APD_BEACON_MONITORS_MAX APD_HOSTAPD_BSS_LIMIT
+#define APD_BEACON_CACHE_MAX 128
+#define APD_BEACON_MEASUREMENT_TTL_S 120
+#define APD_PROBE_OBSERVATION_MAX 256
+#define APD_PROBE_OBSERVATION_TTL_S 120
+/* Cap how many probe observations are serialized into the telemetry snapshot.
+ * The whole snapshot must encode under AP_CONTROL_FRAME_MAX (64 KiB); a busy AP
+ * with many BSSes accumulates up to APD_PROBE_OBSERVATION_MAX entries (~268 B
+ * each), which overflowed the wire frame and made every telemetry push fail at
+ * stage=frame (the AP then went permanently stale on the controller). Keep the
+ * newest entries only -- steering scores from recent probes -- so the frame
+ * always fits. 64 * ~268 B ~= 17 KiB, well under budget beside a ~32 KiB base. */
+#define APD_PROBE_OBSERVATION_EMIT_MAX 64
+#define APD_PROBE_EVENT_PREFIX "RX-PROBE-REQUEST "
+#ifndef APD_BEACON_SERIAL_TIMEOUT_MS
+#define APD_BEACON_SERIAL_TIMEOUT_MS 3000
+#endif
+
+struct apd_beacon_monitor {
+    int fd;
+    char ctrl_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    char local_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    dev_t device;
+    ino_t inode;
+};
+
+struct apd_probe_observation {
+    char station_mac[18];
+    char interface[APD_HOSTAPD_IFACE_LEN + 1];
+    char bssid[18];
+    int rssi_dbm;
+    int mac_randomized;
+    int64_t observed_at;
+};
+
+struct apd_beacon_measurement {
+    char station_mac[18];
+    char bssid[18];
+    int op_class;
+    int channel;
+    int rcpi_dbm;
+    int rsni_db;
+    int have_rsni;
+    int measurement_mode;
+    int64_t observed_at;
+};
+
+static struct apd_beacon_monitor g_apd_beacon_monitors[APD_BEACON_MONITORS_MAX];
+static struct apd_beacon_measurement g_apd_beacon_cache[APD_BEACON_CACHE_MAX];
+static size_t g_apd_beacon_cache_len;
+static struct apd_probe_observation g_apd_probe_observations[APD_PROBE_OBSERVATION_MAX];
+static size_t g_apd_probe_observations_len;
+static pthread_mutex_t g_apd_roaming_lock = PTHREAD_MUTEX_INITIALIZER;
+
+struct apd_beacon_request {
+    char station_mac[18];
+    char interface[APD_HOSTAPD_IFACE_LEN + 1];
+    int token;
+    int mode;
+    int awaiting_response;
+    int64_t deadline_ms;
+};
+
+static struct apd_beacon_request g_apd_beacon_requests[APD_BEACON_CACHE_MAX];
+static size_t g_apd_beacon_requests_next;
+
+static void apd_beacon_request_record(const char *ctrl_path,
+    const char *station_mac, int token, int mode)
+{
+    const char *interface = strrchr(ctrl_path, '/') + 1;
+    struct apd_beacon_request *slot = NULL;
+    size_t i;
+
+    for (i = 0; i < APD_BEACON_CACHE_MAX; i++) {
+        if (!strcmp(g_apd_beacon_requests[i].station_mac, station_mac) &&
+            !strcmp(g_apd_beacon_requests[i].interface, interface) &&
+            g_apd_beacon_requests[i].token == token) {
+            slot = &g_apd_beacon_requests[i];
+            break;
+        }
+    }
+    if (!slot) {
+        slot = &g_apd_beacon_requests[g_apd_beacon_requests_next];
+        g_apd_beacon_requests_next =
+            (g_apd_beacon_requests_next + 1) % APD_BEACON_CACHE_MAX;
+    }
+    snprintf(slot->station_mac, sizeof(slot->station_mac), "%s", station_mac);
+    snprintf(slot->interface, sizeof(slot->interface), "%s", interface);
+    slot->token = token;
+    slot->mode = mode;
+    slot->awaiting_response = 1;
+    slot->deadline_ms = apd_monotonic_ms() + APD_BEACON_SERIAL_TIMEOUT_MS;
+}
+
+static int apd_beacon_request_mode(const char *interface,
+    const char *station_mac, unsigned token)
+{
+    size_t i;
+
+    for (i = 0; i < APD_BEACON_CACHE_MAX; i++)
+        if (!strcmp(g_apd_beacon_requests[i].station_mac, station_mac) &&
+            !strcmp(g_apd_beacon_requests[i].interface, interface) &&
+            g_apd_beacon_requests[i].token == (int)token)
+            return g_apd_beacon_requests[i].mode;
+    return -1;
+}
+
+struct apd_btm_response {
+    char station_mac[18];
+    char interface[APD_HOSTAPD_IFACE_LEN + 1];
+    char target_bssid[18];
+    int status_code;
+    int64_t observed_at;
+};
+
+static struct apd_btm_response g_apd_btm_responses[APD_BEACON_CACHE_MAX];
+static size_t g_apd_btm_responses_len;
+
+static void apd_btm_response_consume(const char *line, const char *interface,
+                                     int64_t now)
+{
+    char mac[18], normalized[18], target[18] = {0};
+    const char *value;
+    struct apd_btm_response *slot = NULL;
+    unsigned status;
+    size_t i, oldest = 0;
+
+    if (sscanf(line, "BSS-TM-RESP %17s", mac) != 1 ||
+        apd_hostapd_parse_mac(mac, normalized) != 0 ||
+        !(value = strstr(line, " status_code=")) ||
+        sscanf(value, " status_code=%u", &status) != 1 || status > 255)
+        return;
+    value = strstr(line, " target_bssid=");
+    if (value && sscanf(value, " target_bssid=%17s", mac) == 1)
+        apd_hostapd_parse_mac(mac, target);
+    for (i = 0; i < g_apd_btm_responses_len; i++) {
+        struct apd_btm_response *entry = &g_apd_btm_responses[i];
+
+        if (!strcmp(entry->station_mac, normalized) &&
+            !strcmp(entry->interface, interface)) {
+            slot = entry;
+            break;
+        }
+        if (entry->observed_at < g_apd_btm_responses[oldest].observed_at)
+            oldest = i;
+    }
+    if (!slot)
+        slot = &g_apd_btm_responses[g_apd_btm_responses_len <
+            APD_BEACON_CACHE_MAX ? g_apd_btm_responses_len++ : oldest];
+    snprintf(slot->station_mac, sizeof(slot->station_mac), "%s", normalized);
+    snprintf(slot->interface, sizeof(slot->interface), "%s", interface);
+    snprintf(slot->target_bssid, sizeof(slot->target_bssid), "%s", target);
+    slot->status_code = (int)status;
+    slot->observed_at = now;
+}
+
+/* ---- Item 6: hostapd auth-failure capture (event stream, not snapshot diff) --
+ *
+ * A station that fails authentication never enters the station dump, so the AC
+ * snapshot-diff producer can never see it.  hostapd emits the failure on the
+ * ATTACHed monitor socket this backend already drains every collection pass:
+ *   AP-STA-POSSIBLE-PSK-MISMATCH <mac>   (WPA2/WPA3-PSK wrong key)
+ *   CTRL-EVENT-EAP-FAILURE ... <mac>     (802.1X/EAP reject)
+ * Both were confirmed present in the shipped wpad on a live AP.  Attribution is
+ * fail-closed: an event with no parseable station MAC is dropped, never guessed. */
+struct apd_auth_failure {
+    char station_mac[18];
+    char interface[APD_HOSTAPD_IFACE_LEN + 1];
+    char reason[24];
+    int count;
+    int64_t observed_at;
+};
+
+static struct apd_auth_failure g_apd_auth_failures[APD_BEACON_CACHE_MAX];
+static size_t g_apd_auth_failures_len;
+
+/* First whitespace-separated token that parses as a MAC.  hostapd puts the STA
+ * address in different positions per event, so scan rather than fix an offset. */
+static int apd_auth_failure_first_mac(const char *rest, char out[18])
+{
+    char tok[64];
+    int consumed = 0;
+
+    if (!rest)
+        return -1;
+    while (sscanf(rest, "%63s%n", tok, &consumed) == 1 && consumed > 0) {
+        if (apd_hostapd_parse_mac(tok, out) == 0)
+            return 0;
+        rest += consumed;
+        consumed = 0;
+    }
+    return -1;
+}
+
+static void apd_auth_failure_consume(const char *rest, const char *interface,
+                                     const char *reason, int64_t now)
+{
+    char normalized[18];
+    struct apd_auth_failure *slot = NULL;
+    size_t i, oldest = 0;
+
+    if (!rest || !interface || !interface[0] || !reason ||
+        apd_auth_failure_first_mac(rest, normalized) != 0)
+        return;
+    for (i = 0; i < g_apd_auth_failures_len; i++) {
+        struct apd_auth_failure *entry = &g_apd_auth_failures[i];
+
+        if (!strcmp(entry->station_mac, normalized) &&
+            !strcmp(entry->interface, interface) &&
+            !strcmp(entry->reason, reason)) {
+            slot = entry;
+            break;
+        }
+        if (entry->observed_at < g_apd_auth_failures[oldest].observed_at)
+            oldest = i;
+    }
+    if (!slot) {
+        slot = &g_apd_auth_failures[g_apd_auth_failures_len <
+            APD_BEACON_CACHE_MAX ? g_apd_auth_failures_len++ : oldest];
+        memset(slot, 0, sizeof(*slot));
+    }
+    snprintf(slot->station_mac, sizeof(slot->station_mac), "%s", normalized);
+    snprintf(slot->interface, sizeof(slot->interface), "%s", interface);
+    snprintf(slot->reason, sizeof(slot->reason), "%s", reason);
+    if (slot->count < 1000000)
+        slot->count++;
+    slot->observed_at = now;
+}
+
+/*
+ * Item 6 (WPA3-SAE coverage): a wrong SAE password fails at SAE confirm during
+ * 802.11 authentication, BEFORE the 4-way handshake, so hostapd emits NO
+ * wpa_ctrl string (unlike PSK, which emits AP-STA-POSSIBLE-PSK-MISMATCH). The
+ * only signal is a ubus notify "key-mismatch" on the per-BSS object
+ * hostapd.<iface>; that same notify also fires for PSK 4-way MIC failures, so
+ * it unifies PSK+SAE. We subscribe to every hostapd.<iface> object and feed
+ * key-mismatch into the same auth-failure cache the wpa_ctrl path uses (reason
+ * "key_mismatch"). The existing PSK/EAP string branch is left untouched, so PSK
+ * detection cannot regress if this subscription ever drops; a PSK failure that
+ * arrives via both paths is deduped downstream (AC ingest keys on
+ * ap_id+event+station_mac+interface+observed_at, reason is not in the key).
+ *
+ * This callback runs on the uloop thread (ubus_add_uloop), the same thread as
+ * the ubus `snapshot` handler that already writes g_apd_auth_failures[] via
+ * apd_openwrt_snapshot()->apd_collect_hostapd()->drain()->consume(); identical
+ * thread-safety profile, and only on real auth failures (never per-frame).
+ */
+#ifdef APD_HAS_UBUS_AUTOSUB
+enum {
+    APD_KEYMISMATCH_ADDRESS,
+    APD_KEYMISMATCH_IFNAME,
+    __APD_KEYMISMATCH_MAX
+};
+
+static const struct blobmsg_policy
+apd_keymismatch_policy[__APD_KEYMISMATCH_MAX] = {
+    [APD_KEYMISMATCH_ADDRESS] = { .name = "address",
+                                  .type = BLOBMSG_TYPE_STRING },
+    [APD_KEYMISMATCH_IFNAME]  = { .name = "ifname",
+                                  .type = BLOBMSG_TYPE_STRING },
+};
+
+static struct ubus_subscriber apd_hostapd_subscriber;
+
+static int apd_hostapd_notify_cb(struct ubus_context *ctx,
+                                 struct ubus_object *obj,
+                                 struct ubus_request_data *req,
+                                 const char *method, struct blob_attr *msg)
+{
+    struct blob_attr *tb[__APD_KEYMISMATCH_MAX];
+    const char *address;
+    const char *ifname;
+
+    (void)ctx;
+    (void)obj;
+    (void)req;
+    if (!method || strcmp(method, "key-mismatch") != 0 || !msg)
+        return 0;
+    blobmsg_parse(apd_keymismatch_policy, __APD_KEYMISMATCH_MAX, tb,
+                  blob_data(msg), blob_len(msg));
+    if (!tb[APD_KEYMISMATCH_ADDRESS] || !tb[APD_KEYMISMATCH_IFNAME])
+        return 0;
+    address = blobmsg_get_string(tb[APD_KEYMISMATCH_ADDRESS]);
+    ifname = blobmsg_get_string(tb[APD_KEYMISMATCH_IFNAME]);
+    if (!address || !ifname || !ifname[0])
+        return 0;
+    apd_auth_failure_consume(address, ifname, "key_mismatch",
+                             (int64_t)time(NULL));
+    return 0;
+}
+
+static bool apd_hostapd_new_obj_cb(struct ubus_context *ctx,
+                                   struct ubus_subscriber *sub,
+                                   const char *path)
+{
+    (void)ctx;
+    (void)sub;
+    /* Per-BSS objects are "hostapd.<iface>" (e.g. hostapd.phy0.0-ap0) and the
+     * MLD object "hostapd.ap-mld0"; the bare "hostapd"/"hostapd-auth" control
+     * objects do not emit key-mismatch, so match only the dotted namespace. */
+    return path && strncmp(path, "hostapd.", 8) == 0;
+}
+
+int apd_hostapd_keymismatch_subscribe_start(struct ubus_context *ctx)
+{
+    if (!ctx)
+        return -1;
+    apd_hostapd_subscriber.cb = apd_hostapd_notify_cb;
+    apd_hostapd_subscriber.new_obj_cb = apd_hostapd_new_obj_cb;
+    /* Setting new_obj_cb makes ubus_register_subscriber() subscribe to all
+     * matching objects that already exist AND auto-subscribe on
+     * ubus.object.add, so a hostapd restart re-arms the subscription with no
+     * extra wiring. */
+    return ubus_register_subscriber(ctx, &apd_hostapd_subscriber);
+}
+#else /* !APD_HAS_UBUS_AUTOSUB */
+int apd_hostapd_keymismatch_subscribe_start(struct ubus_context *ctx)
+{
+    /* This libubus predates ubus_subscriber.new_obj_cb (auto-subscribe to
+     * existing/added objects); the SAE key-mismatch subscriber cannot be
+     * armed here, so it degrades to unavailable (PSK/EAP string path is
+     * unaffected). */
+    (void)ctx;
+    return -1;
+}
+#endif /* APD_HAS_UBUS_AUTOSUB */
+
+static void apd_probe_observation_store(const char *station_mac,
+                                        const char *interface, int rssi_dbm,
+                                        int64_t now)
+{
+    struct apd_probe_observation *slot = NULL;
+    unsigned int first_octet = 0;
+    size_t i, oldest = 0;
+
+    if (!station_mac || !interface || !station_mac[0] || !interface[0] ||
+        rssi_dbm < -200 || rssi_dbm > 100)
+        return;
+    if (sscanf(station_mac, "%2x", &first_octet) != 1 || first_octet > 255)
+        return;
+    for (i = 0; i < g_apd_probe_observations_len; i++) {
+        if (!strcasecmp(g_apd_probe_observations[i].station_mac, station_mac) &&
+            !strcmp(g_apd_probe_observations[i].interface, interface)) {
+            slot = &g_apd_probe_observations[i];
+            break;
+        }
+        if (g_apd_probe_observations[i].observed_at <
+            g_apd_probe_observations[oldest].observed_at)
+            oldest = i;
+    }
+    if (!slot)
+        slot = &g_apd_probe_observations[g_apd_probe_observations_len <
+            APD_PROBE_OBSERVATION_MAX ? g_apd_probe_observations_len++ : oldest];
+    memset(slot, 0, sizeof(*slot));
+    snprintf(slot->station_mac, sizeof(slot->station_mac), "%s", station_mac);
+    snprintf(slot->interface, sizeof(slot->interface), "%s", interface);
+    slot->rssi_dbm = rssi_dbm;
+    slot->mac_randomized = (first_octet & 0x02) != 0;
+    slot->observed_at = now;
+}
+
+static void apd_probe_observation_consume(const char *line,
+                                          const char *interface, int64_t now)
+{
+    char station_mac[18];
+    char normalized[18];
+    const char *sa;
+    const char *signal;
+    char *end;
+    long rssi;
+
+    if (!line || strncmp(line, APD_PROBE_EVENT_PREFIX,
+                         sizeof(APD_PROBE_EVENT_PREFIX) - 1))
+        return;
+    sa = strstr(line, "sa=");
+    signal = strstr(line, " signal=");
+    if (!sa || !signal || sscanf(sa, "sa=%17s", station_mac) != 1 ||
+        apd_hostapd_parse_mac(station_mac, normalized) != 0)
+        return;
+    errno = 0;
+    rssi = strtol(signal + 8, &end, 10);
+    if (errno || end == signal + 8 || (*end && !isspace((unsigned char)*end)) ||
+        rssi < -200 || rssi > 100)
+        return;
+    apd_probe_observation_store(normalized, interface, (int)rssi, now);
+}
+
+/* Newest measurement per (station, BSSID) wins; the cache is small and bounded
+ * because only the most recent reading per pair can inform a decision. */
+static void apd_beacon_cache_store(const char *station_mac,
+                                   const struct apd_beacon_report *report,
+                                   int64_t now, int measurement_mode)
+{
+    struct apd_beacon_measurement *slot = NULL;
+    size_t i;
+
+    if (!station_mac || !report || !report->have_rcpi)
+        return;
+    for (i = 0; i < g_apd_beacon_cache_len; i++) {
+        if (!strcasecmp(g_apd_beacon_cache[i].station_mac, station_mac) &&
+            !strcasecmp(g_apd_beacon_cache[i].bssid, report->bssid)) {
+            slot = &g_apd_beacon_cache[i];
+            break;
+        }
+    }
+    if (!slot) {
+        if (g_apd_beacon_cache_len < APD_BEACON_CACHE_MAX) {
+            slot = &g_apd_beacon_cache[g_apd_beacon_cache_len++];
+        } else {
+            /* Full: evict the oldest rather than dropping the new reading --
+             * a stale entry is worth less than a fresh one. */
+            size_t oldest = 0;
+
+            for (i = 1; i < g_apd_beacon_cache_len; i++)
+                if (g_apd_beacon_cache[i].observed_at <
+                    g_apd_beacon_cache[oldest].observed_at)
+                    oldest = i;
+            slot = &g_apd_beacon_cache[oldest];
+        }
+    }
+    memset(slot, 0, sizeof(*slot));
+    snprintf(slot->station_mac, sizeof(slot->station_mac), "%s", station_mac);
+    snprintf(slot->bssid, sizeof(slot->bssid), "%s", report->bssid);
+    slot->op_class = report->op_class;
+    slot->channel = report->channel;
+    slot->rcpi_dbm = report->rcpi_dbm;
+    slot->rsni_db = report->rsni_db;
+    slot->have_rsni = report->have_rsni;
+    slot->measurement_mode = measurement_mode;
+    slot->observed_at = now;
+}
+
+/* Parse one control-interface event line.
+ *
+ * Format (src/ap/rrm.c):  <prio>BEACON-RESP-RX <mac> <token> <rep_mode> <hex>
+ * The priority prefix is optional depending on hostapd version, so skip it
+ * only when present rather than assuming a fixed offset. */
+static void apd_beacon_monitor_consume(const char *line, const char *interface,
+                                       int64_t now)
+{
+    struct apd_beacon_report report;
+    char station_mac[18];
+    char normalized_station_mac[18];
+    const char *pos = line;
+    const char *hex;
+    unsigned token, rep_mode;
+    int consumed = 0;
+    size_t i;
+
+    if (!line)
+        return;
+    if (*pos == '<') {
+        pos = strchr(pos, '>');
+        if (!pos)
+            return;
+        pos++;
+    }
+    if (!strncmp(pos, "AP-STA-POSSIBLE-PSK-MISMATCH ", 29)) {
+        apd_auth_failure_consume(pos + 29, interface, "psk_mismatch", now);
+        return;
+    }
+    if (!strncmp(pos, "CTRL-EVENT-EAP-FAILURE", 22)) {
+        apd_auth_failure_consume(pos + 22, interface, "eap_failure", now);
+        return;
+    }
+    if (!strncmp(pos, "BSS-TM-RESP ", 12)) {
+        apd_btm_response_consume(pos, interface, now);
+        return;
+    }
+    if (!strncmp(pos, APD_PROBE_EVENT_PREFIX,
+                 sizeof(APD_PROBE_EVENT_PREFIX) - 1)) {
+        apd_probe_observation_consume(pos, interface, now);
+        return;
+    }
+    if (strncmp(pos, "BEACON-RESP-RX ", 15))
+        return;
+    pos += 15;
+    if (sscanf(pos, "%17s %u %2x %n", station_mac, &token, &rep_mode,
+               &consumed) < 3 || consumed <= 0)
+        return;
+    if (token > 255 ||
+        apd_hostapd_parse_mac(station_mac, normalized_station_mac) != 0)
+        return;
+    for (i = 0; i < APD_BEACON_CACHE_MAX; i++) {
+        struct apd_beacon_request *request = &g_apd_beacon_requests[i];
+
+        if (request->token == (int)token &&
+            !strcmp(request->interface, interface) &&
+            !strcmp(request->station_mac, normalized_station_mac))
+            request->awaiting_response = 0;
+    }
+    /* rep_mode is a bitmask of refusal/incapable/late bits; any non-zero value
+     * means the station did not actually perform the measurement, so the body
+     * that follows is not a usable reading. */
+    if (rep_mode != 0)
+        return;
+    hex = pos + consumed;
+    if (apd_beacon_report_decode(hex, &report) != 0)
+        return;
+    apd_beacon_cache_store(normalized_station_mac, &report, now,
+        apd_beacon_request_mode(interface, normalized_station_mac, token));
+}
+
+/* Find or create an ATTACHed monitor for one control socket. Probe request
+ * delivery is opt-in on hostapd, while BTM and beacon responses continue to
+ * use the same monitor connection. */
+static struct apd_beacon_monitor *apd_beacon_monitor_get(const char *ctrl_path)
+{
+    struct sockaddr_un local = { .sun_family = AF_UNIX };
+    struct sockaddr_un remote = { .sun_family = AF_UNIX };
+    struct apd_beacon_monitor *mon = NULL;
+    struct stat st;
+    struct stat remote_st;
+    gid_t service_gid;
+    char response[32];
+    ssize_t received;
+    struct pollfd pfd;
+    size_t i;
+    int fd = -1;
+    int written;
+
+    if (!ctrl_path || strlen(ctrl_path) >= sizeof(remote.sun_path) ||
+        apd_hostapd_local_dir_prepare() != 0 ||
+        apd_hostapd_service_gid(&service_gid) != 0 ||
+        lstat(ctrl_path, &remote_st) != 0 || !S_ISSOCK(remote_st.st_mode))
+        return NULL;
+    for (i = 0; i < APD_BEACON_MONITORS_MAX; i++) {
+        struct apd_beacon_monitor *entry = &g_apd_beacon_monitors[i];
+
+        if (entry->ctrl_path[0] && !strcmp(entry->ctrl_path, ctrl_path)) {
+            if (entry->device == remote_st.st_dev &&
+                entry->inode == remote_st.st_ino)
+                return entry;
+            close(entry->fd);
+            unlink(entry->local_path);
+            memset(entry, 0, sizeof(*entry));
+        }
+        if (!mon && !entry->ctrl_path[0])
+            mon = entry;
+    }
+    if (!mon)
+        return NULL;
+
+    fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+    if (fd < 0)
+        return NULL;
+    if (fcntl(fd, F_SETFD, FD_CLOEXEC) != 0 ||
+        fcntl(fd, F_SETFL, O_NONBLOCK) != 0)
+        goto fail;
+    written = snprintf(local.sun_path, sizeof(local.sun_path),
+                       "%s/dreamingwrt-apd-mon-%ld-%d", APD_HOSTAPD_LOCAL_DIR,
+                       (long)getpid(), fd);
+    if (written < 0 || (size_t)written >= sizeof(local.sun_path))
+        goto fail;
+    unlink(local.sun_path);
+    if (bind(fd, (struct sockaddr *)&local, sizeof(local)) != 0)
+        goto fail;
+    if (lstat(local.sun_path, &st) != 0 || !S_ISSOCK(st.st_mode) ||
+        st.st_uid != getuid() ||
+        chown(local.sun_path, (uid_t)-1, service_gid) != 0 ||
+        chmod(local.sun_path, 0660) != 0 ||
+        lstat(local.sun_path, &st) != 0 || st.st_gid != service_gid ||
+        (st.st_mode & 0777) != 0660)
+        goto fail_unlink;
+    memcpy(remote.sun_path, ctrl_path, strlen(ctrl_path) + 1);
+    if (connect(fd, (struct sockaddr *)&remote, sizeof(remote)) != 0)
+        goto fail_unlink;
+    if (send(fd, "ATTACH probe_rx_events=1", 24, MSG_NOSIGNAL) != 24)
+        goto fail_unlink;
+    pfd.fd = fd;
+    pfd.events = POLLIN;
+    if (poll(&pfd, 1, APD_HOSTAPD_TIMEOUT_MS) != 1)
+        goto fail_unlink;
+    received = recv(fd, response, sizeof(response) - 1, 0);
+    if (received <= 0)
+        goto fail_unlink;
+    response[received] = '\0';
+    if (strncmp(response, "OK", 2))
+        goto fail_unlink;
+    mon->fd = fd;
+    snprintf(mon->ctrl_path, sizeof(mon->ctrl_path), "%s", ctrl_path);
+    snprintf(mon->local_path, sizeof(mon->local_path), "%s", local.sun_path);
+    mon->device = remote_st.st_dev;
+    mon->inode = remote_st.st_ino;
+    return mon;
+
+fail_unlink:
+    unlink(local.sun_path);
+fail:
+    close(fd);
+    return NULL;
+}
+
+static int apd_roaming_monitor_attach(const char *ctrl_path)
+{
+    return apd_beacon_monitor_get(ctrl_path) ? 0 : -1;
+}
+
+/* Drain whatever the monitor has queued.  Bounded so a flood cannot stall a
+ * collection pass; anything left over is read on the next one. */
+static void apd_beacon_monitor_drain(struct apd_beacon_monitor *mon,
+                                     int64_t now)
+{
+    char buf[1024];
+    int i;
+
+    if (!mon || !mon->ctrl_path[0])
+        return;
+    for (i = 0; i < 64; i++) {
+        ssize_t received = recv(mon->fd, buf, sizeof(buf) - 1, MSG_DONTWAIT);
+
+        if (received <= 0)
+            break;
+        buf[received] = '\0';
+        apd_beacon_monitor_consume(buf, strrchr(mon->ctrl_path, '/') + 1, now);
+    }
+}
+
+/* A station may accept only one measurement at a time. Wait on its matching
+ * response, not the hostapd command ACK; refused/empty replies also finish it. */
+static int apd_beacon_request_wait_previous(const char *ctrl_path,
+    const char *station_mac)
+{
+    struct apd_beacon_monitor *mon = apd_beacon_monitor_get(ctrl_path);
+    const char *interface = strrchr(ctrl_path, '/') + 1;
+    size_t i;
+
+    if (!mon)
+        return -1;
+    apd_beacon_monitor_drain(mon, (int64_t)time(NULL));
+    for (i = 0; i < APD_BEACON_CACHE_MAX; i++) {
+        struct apd_beacon_request *request = &g_apd_beacon_requests[i];
+
+        if (!request->awaiting_response ||
+            strcmp(request->interface, interface) ||
+            strcmp(request->station_mac, station_mac))
+            continue;
+        if (request->deadline_ms <= apd_monotonic_ms()) {
+            request->awaiting_response = 0;
+            continue;
+        }
+        while (request->awaiting_response) {
+            struct pollfd pfd = { .fd = mon->fd, .events = POLLIN };
+            int64_t remaining = request->deadline_ms - apd_monotonic_ms();
+            int ready;
+
+            if (remaining <= 0) {
+                request->awaiting_response = 0;
+                return -1;
+            }
+            ready = poll(&pfd, 1, (int)remaining);
+            if (ready < 0 && errno == EINTR)
+                continue;
+            if (ready <= 0 || !(pfd.revents & POLLIN)) {
+                request->awaiting_response = 0;
+                return -1;
+            }
+            apd_beacon_monitor_drain(mon, (int64_t)time(NULL));
+        }
+    }
+    return 0;
+}
+
+/* Expire reports by reception time. A table report is explicitly cached:
+ * receiving it now does not establish when the station measured that BSS. */
+static struct json_object *apd_beacon_reports_json(int64_t now)
+{
+    struct json_object *arr = json_object_new_array();
+    size_t i;
+
+    for (i = 0; i < g_apd_beacon_cache_len; i++) {
+        const struct apd_beacon_measurement *m = &g_apd_beacon_cache[i];
+        struct json_object *item;
+
+        if (!m->station_mac[0] ||
+            m->observed_at < now - APD_BEACON_MEASUREMENT_TTL_S)
+            continue;
+        item = json_object_new_object();
+        json_object_object_add(item, "station_mac",
+                               json_object_new_string(m->station_mac));
+        json_object_object_add(item, "bssid",
+                               json_object_new_string(m->bssid));
+        json_object_object_add(item, "op_class",
+                               json_object_new_int(m->op_class));
+        json_object_object_add(item, "channel",
+                               json_object_new_int(m->channel));
+        json_object_object_add(item, "rcpi_dbm",
+                               json_object_new_int(m->rcpi_dbm));
+        if (m->have_rsni)
+            json_object_object_add(item, "rsni_db",
+                                   json_object_new_int(m->rsni_db));
+        json_object_object_add(item, "observed_at",
+                               json_object_new_int64(m->observed_at));
+        json_object_object_add(item, "measurement_mode",
+                               json_object_new_string(
+                                   m->measurement_mode == 0 ? "passive" :
+                                   m->measurement_mode == 1 ? "active" :
+                                   m->measurement_mode == 2 ? "table" : "unknown"));
+        json_object_object_add(item, "cached",
+                               json_object_new_boolean(m->measurement_mode == 2));
+        json_object_object_add(item, "source",
+                               json_object_new_string(m->measurement_mode == 2 ?
+                                   "ieee80211k_beacon_table" : "ieee80211k_beacon_report"));
+        json_object_array_add(arr, item);
+    }
+    return arr;
+}
+
+static struct json_object *apd_btm_responses_json(int64_t now)
+{
+    struct json_object *array = json_object_new_array();
+    size_t i;
+
+    for (i = 0; i < g_apd_btm_responses_len; i++) {
+        const struct apd_btm_response *entry = &g_apd_btm_responses[i];
+        struct json_object *item;
+
+        if (entry->observed_at < now - 300)
+            continue;
+        item = json_object_new_object();
+        json_object_object_add(item, "station_mac",
+                               json_object_new_string(entry->station_mac));
+        json_object_object_add(item, "interface",
+                               json_object_new_string(entry->interface));
+        json_object_object_add(item, "target_bssid",
+                               json_object_new_string(entry->target_bssid));
+        json_object_object_add(item, "status_code",
+                               json_object_new_int(entry->status_code));
+        json_object_object_add(item, "observed_at",
+                               json_object_new_int64(entry->observed_at));
+        json_object_array_add(array, item);
+    }
+    return array;
+}
+
+/* Item 6: recent auth failures, same TTL/shape as btm_responses. */
+static struct json_object *apd_auth_failures_json(int64_t now)
+{
+    struct json_object *array = json_object_new_array();
+    size_t i;
+
+    for (i = 0; i < g_apd_auth_failures_len; i++) {
+        const struct apd_auth_failure *entry = &g_apd_auth_failures[i];
+        struct json_object *item;
+
+        if (entry->observed_at < now - 300)
+            continue;
+        item = json_object_new_object();
+        json_object_object_add(item, "station_mac",
+                               json_object_new_string(entry->station_mac));
+        json_object_object_add(item, "interface",
+                               json_object_new_string(entry->interface));
+        json_object_object_add(item, "reason",
+                               json_object_new_string(entry->reason));
+        json_object_object_add(item, "count",
+                               json_object_new_int(entry->count));
+        json_object_object_add(item, "observed_at",
+                               json_object_new_int64(entry->observed_at));
+        json_object_object_add(item, "source",
+                               json_object_new_string("hostapd_control_event"));
+        json_object_array_add(array, item);
+    }
+    return array;
+}
+
+static struct json_object *apd_probe_observations_json(
+    int64_t now, const struct apd_hostapd_observation *observation)
+{
+    struct json_object *array = json_object_new_array();
+    struct {
+        struct apd_probe_observation *entry;
+        const struct apd_hostapd_bss_observation *source_bss;
+    } eligible[APD_PROBE_OBSERVATION_MAX];
+    size_t eligible_len = 0;
+    size_t i;
+    size_t emit;
+
+    /* First pass: keep only fresh, BSS-attributable observations. */
+    for (i = 0; i < g_apd_probe_observations_len; i++) {
+        struct apd_probe_observation *entry = &g_apd_probe_observations[i];
+        const struct apd_hostapd_bss_observation *source_bss = NULL;
+        size_t bss_index;
+
+        if (!entry->station_mac[0] ||
+            entry->observed_at < now - APD_PROBE_OBSERVATION_TTL_S)
+            continue;
+        for (bss_index = 0; observation &&
+             bss_index < observation->bss_count; bss_index++) {
+            const struct apd_hostapd_bss_observation *bss =
+                &observation->bss[bss_index];
+
+            if (!strcmp(bss->interface, entry->interface) && bss->has_bssid) {
+                source_bss = bss;
+                break;
+            }
+        }
+        if (!source_bss ||
+            (entry->bssid[0] && strcasecmp(entry->bssid, source_bss->bssid)))
+            continue;
+        if (!entry->bssid[0])
+            snprintf(entry->bssid, sizeof(entry->bssid), "%s",
+                     source_bss->bssid);
+        eligible[eligible_len].entry = entry;
+        eligible[eligible_len].source_bss = source_bss;
+        eligible_len++;
+    }
+
+    /* Newest first, then cap: the telemetry frame must fit AP_CONTROL_FRAME_MAX,
+     * and steering only needs recent probes. Selection sort keeps it simple and
+     * bounded (eligible_len <= APD_PROBE_OBSERVATION_MAX). */
+    for (i = 0; i < eligible_len; i++) {
+        size_t best = i, j;
+
+        for (j = i + 1; j < eligible_len; j++)
+            if (eligible[j].entry->observed_at >
+                eligible[best].entry->observed_at)
+                best = j;
+        if (best != i) {
+            struct apd_probe_observation *swap_entry = eligible[i].entry;
+            const struct apd_hostapd_bss_observation *swap_bss =
+                eligible[i].source_bss;
+
+            eligible[i] = eligible[best];
+            eligible[best].entry = swap_entry;
+            eligible[best].source_bss = swap_bss;
+        }
+    }
+
+    emit = eligible_len < APD_PROBE_OBSERVATION_EMIT_MAX ?
+        eligible_len : APD_PROBE_OBSERVATION_EMIT_MAX;
+    for (i = 0; i < emit; i++) {
+        struct apd_probe_observation *entry = eligible[i].entry;
+        const struct apd_hostapd_bss_observation *source_bss =
+            eligible[i].source_bss;
+        struct json_object *item;
+
+        item = json_object_new_object();
+        json_object_object_add(item, "station_mac",
+                               json_object_new_string(entry->station_mac));
+        json_object_object_add(item, "interface",
+                               json_object_new_string(entry->interface));
+        json_object_object_add(item, "bssid",
+            json_object_new_string(entry->bssid));
+        if (source_bss->has_frequency)
+            json_object_object_add(item, "frequency_mhz",
+                json_object_new_int(source_bss->frequency_mhz));
+        if (source_bss->has_channel)
+            json_object_object_add(item, "channel",
+                json_object_new_int(source_bss->channel));
+        json_object_object_add(item, "rssi_dbm",
+                               json_object_new_int(entry->rssi_dbm));
+        json_object_object_add(item, "mac_randomized",
+                               json_object_new_boolean(entry->mac_randomized));
+        json_object_object_add(item, "observed_at",
+                               json_object_new_int64(entry->observed_at));
+        json_object_object_add(item, "frame_type",
+                               json_object_new_string("probe_request"));
+        json_object_object_add(item, "source",
+                               json_object_new_string("hostapd_control_event"));
+        json_object_object_add(item, "direction",
+                               json_object_new_string("uplink"));
+        json_object_array_add(array, item);
+    }
+    return array;
+}
+
+#endif
+#ifndef APD_HOSTAPD_STANDALONE_TEST
+
 static void apd_vendor_station_attach_nss(struct json_object *item,
                                           const struct apd_vendor_station_set *set,
                                           const char *mac)
@@ -4440,6 +6361,58 @@ static struct json_object *apd_collect_hostapd(int phy_count,
                                    json_object_new_int(raw->frequency_mhz));
         if (raw->has_channel)
             json_object_object_add(item, "channel", json_object_new_int(raw->channel));
+        json_object_object_add(item, "hostapd_ctrl_reachable",
+                               json_object_new_boolean(raw->hostapd_ctrl_reachable));
+        apd_json_nullable_string(item, "hostapd_ctrl_source",
+                                 raw->control_path[0] ? raw->control_path : NULL);
+        /* Reuse the action-time monitor and collect delayed station replies. */
+        if (raw->hostapd_ctrl_reachable && raw->control_path[0]) {
+            struct apd_beacon_monitor *mon;
+
+            pthread_mutex_lock(&g_apd_roaming_lock);
+            mon = apd_beacon_monitor_get(raw->control_path);
+            if (mon)
+                apd_beacon_monitor_drain(mon, (int64_t)time(NULL));
+            pthread_mutex_unlock(&g_apd_roaming_lock);
+        }
+        json_object_object_add(item, "ft_configured",
+                               json_object_new_boolean(raw->ft_configured));
+        json_object_object_add(item, "ft_supported",
+                               json_object_new_boolean(raw->ft_supported));
+        json_object_object_add(item, "ft_over_ds",
+                               json_object_new_boolean(raw->ft_over_ds));
+        apd_json_nullable_string(item, "ft_reason",
+                                 raw->ft_reason[0] ? raw->ft_reason :
+                                     "hostapd_ft_configuration_unavailable");
+        json_object_object_add(item, "neighbor_report_80211k",
+                               json_object_new_boolean(raw->neighbor_report_80211k));
+        json_object_object_add(item, "neighbor_database_configured",
+                               json_object_new_boolean(raw->neighbor_database_configured));
+        json_object_object_add(item, "neighbors_complete",
+                               json_object_new_boolean(raw->neighbors_complete));
+        json_object_object_add(item, "neighbors", apd_hostapd_neighbors_json(raw));
+        apd_json_nullable_string(item, "neighbor_report_reason",
+                                 raw->neighbor_report_reason[0] ?
+                                     raw->neighbor_report_reason :
+                                     "hostapd_capability_probe_failed");
+        json_object_object_add(item, "bss_transition_80211v",
+                               json_object_new_boolean(raw->bss_transition_80211v));
+        apd_json_nullable_string(item, "bss_transition_reason",
+                                 raw->bss_transition_reason[0] ?
+                                     raw->bss_transition_reason :
+                                     "hostapd_capability_probe_failed");
+        json_object_object_add(item, "client_deauth",
+                               json_object_new_boolean(raw->client_deauth));
+        json_object_object_add(item, "reassoc_block",
+                               json_object_new_boolean(raw->reassoc_block));
+        json_object_object_add(item, "reassoc_block_reason", json_object_new_string(
+            !observation->reassoc_backend_safe ? "native_acl_backend_quarantined" :
+            raw->has_mld_address || raw->has_link_id ? "mlo_reassociation_block_unsupported" :
+            raw->reassoc_block ? "hostapd_acl_available" : "hostapd_acl_unavailable"));
+        apd_json_nullable_string(item, "client_deauth_reason",
+                                 raw->client_deauth_reason[0] ?
+                                     raw->client_deauth_reason :
+                                     "hostapd_capability_probe_failed");
         if (raw->has_reported_station_count)
             json_object_object_add(item, "reported_station_count",
                                    json_object_new_int(raw->reported_station_count));
@@ -4523,6 +6496,11 @@ static struct json_object *apd_collect_hostapd(int phy_count,
             json_object_object_add(item, "authorized",
                                    json_object_new_boolean(raw->authorized));
         }
+        json_object_object_add(item, "station_btm_capable",
+                               json_object_new_boolean(
+                                   raw->station_btm_capable));
+        apd_json_nullable_string(item, "station_btm_reason",
+                                 raw->station_btm_reason);
         json_object_object_add(item, "mlo_evidence",
             json_object_new_boolean(raw->has_mld_address || raw->has_link_id));
         json_object_object_add(item, "mlo_relation_complete",
@@ -4615,6 +6593,21 @@ static struct json_object *apd_collect_hostapd(int phy_count,
         json_object_object_add(state, "station_detail_truncated",
                                json_object_new_boolean(1));
     json_object_object_add(state, "bss", bss_array);
+    /* Per-candidate signal as measured by the station itself -- the one thing
+     * neither the serving AP nor the candidate AP can observe on its own. */
+    pthread_mutex_lock(&g_apd_roaming_lock);
+    json_object_object_add(state, "beacon_reports",
+                           apd_beacon_reports_json((int64_t)time(NULL)));
+    json_object_object_add(state, "probe_observations",
+                           apd_probe_observations_json((int64_t)time(NULL),
+                                                       observation));
+    json_object_object_add(state, "btm_responses",
+                           apd_btm_responses_json((int64_t)time(NULL)));
+    json_object_object_add(state, "auth_failures",
+                           apd_auth_failures_json((int64_t)time(NULL)));
+    pthread_mutex_unlock(&g_apd_roaming_lock);
+    json_object_object_add(state, "runtime_actions",
+                           json_object_new_boolean(1));
     json_object_object_add(state, "limits", json_object_new_object());
     {
         struct json_object *limits;
@@ -4640,193 +6633,10 @@ static struct json_object *apd_collect_hostapd(int phy_count,
     return state;
 }
 
-static char *apd_trim(char *line)
-{
-    char *end;
-
-    while (*line == ' ' || *line == '\t')
-        line++;
-    end = line + strlen(line);
-    while (end > line && (end[-1] == ' ' || end[-1] == '\t' || end[-1] == '\r'))
-        *--end = '\0';
-    return line;
-}
-
-static const char *apd_band_from_frequency(int frequency)
-{
-    if (frequency >= 2400 && frequency < 2500)
-        return "2.4GHz";
-    if (frequency >= 4900 && frequency < 5925)
-        return "5GHz";
-    if (frequency >= 5925 && frequency < 7125)
-        return "6GHz";
-    return "unknown";
-}
-
-static struct json_object *apd_runtime_meta(int complete, const char *reason,
-                                            int64_t observed_at)
-{
-    return apd_source_state("iw_dev", "runtime", 1, complete, reason,
-                            observed_at);
-}
-
-static void apd_radio_copy_channel(struct json_object *radio,
-                                   struct json_object *interface)
-{
-    struct json_object *existing;
-    struct json_object *value;
-
-    if (json_object_object_get_ex(radio, "channel", &existing))
-        return;
-    if (json_object_object_get_ex(interface, "channel", &value))
-        json_object_object_add(radio, "channel", json_object_get(value));
-    if (json_object_object_get_ex(interface, "frequency_mhz", &value))
-        json_object_object_add(radio, "frequency_mhz", json_object_get(value));
-    if (json_object_object_get_ex(interface, "width_mhz", &value))
-        json_object_object_add(radio, "width_mhz", json_object_get(value));
-    if (json_object_object_get_ex(interface, "band", &value))
-        json_object_object_add(radio, "band", json_object_get(value));
-}
-
-static void apd_build_ssids(struct json_object *radios,
-                            struct json_object *ssids,
-                            int64_t observed_at)
-{
-    size_t i;
-
-    for (i = 0; i < json_object_array_length(radios); i++) {
-        struct json_object *radio = json_object_array_get_idx(radios, i);
-        struct json_object *interfaces;
-        struct json_object *radio_id;
-        size_t j;
-
-        if (!json_object_object_get_ex(radio, "interfaces", &interfaces) ||
-            !json_object_object_get_ex(radio, "id", &radio_id))
-            continue;
-        for (j = 0; j < json_object_array_length(interfaces); j++) {
-            struct json_object *interface = json_object_array_get_idx(interfaces, j);
-            struct json_object *type;
-            struct json_object *name;
-            struct json_object *ssid_name;
-            struct json_object *item;
-            struct json_object *value;
-
-            if (!json_object_object_get_ex(interface, "type", &type) ||
-                strcmp(json_object_get_string(type), "AP") ||
-                !json_object_object_get_ex(interface, "broadcast_name", &ssid_name) ||
-                !json_object_get_string(ssid_name)[0] ||
-                !json_object_object_get_ex(interface, "interface", &name))
-                continue;
-            item = json_object_new_object();
-            json_object_object_add(item, "id", json_object_get(name));
-            json_object_object_add(item, "radio_id", json_object_get(radio_id));
-            json_object_object_add(item, "interface", json_object_get(name));
-            json_object_object_add(item, "broadcast_name", json_object_get(ssid_name));
-            json_object_object_add(item, "mode", json_object_new_string("ap"));
-            for (const char *const *key = (const char *const[]){
-                     "bssid", "channel", "frequency_mhz", "width_mhz", "band", NULL
-                 }; *key; key++) {
-                if (json_object_object_get_ex(interface, *key, &value))
-                    json_object_object_add(item, *key, json_object_get(value));
-            }
-            json_object_object_add(item, "runtime",
-                                   apd_runtime_meta(1, NULL, observed_at));
-            json_object_array_add(ssids, item);
-        }
-    }
-}
-
 static int apd_parse_iw_dev(const char *text, struct json_object *radios,
                             struct json_object *ssids, int64_t observed_at)
 {
-    char *copy = strdup(text ? text : "");
-    char *line;
-    char *saveptr = NULL;
-    struct json_object *radio = NULL;
-    struct json_object *interfaces = NULL;
-    struct json_object *interface = NULL;
-
-    if (!copy)
-        return -1;
-    for (line = strtok_r(copy, "\n", &saveptr); line;
-         line = strtok_r(NULL, "\n", &saveptr)) {
-        char *value = apd_trim(line);
-
-        if (!strncmp(value, "phy#", 4)) {
-            char id[64];
-            const char *number = value + 4;
-
-            if (!number[0])
-                continue;
-            snprintf(id, sizeof(id), "phy%s", number);
-            radio = json_object_new_object();
-            interfaces = json_object_new_array();
-            interface = NULL;
-            json_object_object_add(radio, "id", json_object_new_string(id));
-            json_object_object_add(radio, "phy", json_object_new_string(id));
-            json_object_object_add(radio, "interfaces", interfaces);
-            json_object_object_add(radio, "runtime",
-                                   apd_runtime_meta(1, NULL, observed_at));
-            json_object_array_add(radios, radio);
-            continue;
-        }
-        if (!radio)
-            continue;
-        if (!strncmp(value, "Interface ", 10)) {
-            const char *name = value + 10;
-
-            if (!name[0])
-                continue;
-            interface = json_object_new_object();
-            json_object_object_add(interface, "interface",
-                                   json_object_new_string(name));
-            json_object_array_add(interfaces, interface);
-            continue;
-        }
-        if (!interface)
-            continue;
-        if (!strncmp(value, "addr ", 5))
-            json_object_object_add(interface, "bssid",
-                                   json_object_new_string(value + 5));
-        else if (!strncmp(value, "type ", 5))
-            json_object_object_add(interface, "type",
-                                   json_object_new_string(value + 5));
-        else if (!strncmp(value, "ssid ", 5))
-            json_object_object_add(interface, "broadcast_name",
-                                   json_object_new_string(value + 5));
-        else if (!strncmp(value, "wdev ", 5))
-            json_object_object_add(interface, "wdev",
-                                   json_object_new_string(value + 5));
-        else if (!strncmp(value, "ifindex ", 8))
-            json_object_object_add(interface, "ifindex",
-                                   json_object_new_int(atoi(value + 8)));
-        else if (!strncmp(value, "channel ", 8)) {
-            int channel = 0;
-            int frequency = 0;
-            int width = 0;
-
-            if (sscanf(value, "channel %d (%d MHz), width: %d MHz",
-                       &channel, &frequency, &width) >= 2) {
-                json_object_object_add(interface, "channel",
-                                       json_object_new_int(channel));
-                json_object_object_add(interface, "frequency_mhz",
-                                       json_object_new_int(frequency));
-                json_object_object_add(interface, "band",
-                    json_object_new_string(apd_band_from_frequency(frequency)));
-                if (width > 0)
-                    json_object_object_add(interface, "width_mhz",
-                                           json_object_new_int(width));
-                apd_radio_copy_channel(radio, interface);
-            }
-        } else if (!strncmp(value, "txpower ", 8)) {
-            double txpower = strtod(value + 8, NULL);
-            json_object_object_add(interface, "txpower_dbm",
-                                   json_object_new_double(txpower));
-        }
-    }
-    apd_build_ssids(radios, ssids, observed_at);
-    free(copy);
-    return 0;
+    return apd_iw_topology_parse(text, radios, ssids, observed_at);
 }
 
 static void apd_survey_json_nullable_int(struct json_object *object,
@@ -4850,7 +6660,9 @@ static struct json_object *apd_survey_json(const char *path,
                                            int target_frequency,
                                            int64_t sample_time,
                                            unsigned int wiphy_index,
-                                           int have_wiphy_index)
+                                           int have_wiphy_index,
+                                           unsigned int radio_index,
+                                           int has_radio_index)
 {
     struct apd_survey_sample sample;
     struct json_object *survey = json_object_new_object();
@@ -4911,7 +6723,8 @@ static struct json_object *apd_survey_json(const char *path,
         memset(&stats, 0, sizeof(stats));
         {
             enum apd_radio_netdev_status netdev_status =
-                apd_airtime_radio_netdev(wiphy_index, radio_netdev,
+                apd_airtime_radio_netdev(wiphy_index, radio_index,
+                                         has_radio_index, radio_netdev,
                                          sizeof(radio_netdev));
 
             if (netdev_status != APD_RADIO_NETDEV_OK)
@@ -4923,7 +6736,8 @@ static struct json_object *apd_survey_json(const char *path,
         }
         /* This is the block the controller differences into retry history, so
          * the VAP sum is attached here regardless of the radio-level outcome. */
-        (void)apd_tx_retry_collect(apd_find_apstats(), wiphy_index, &tx_retry);
+        (void)apd_tx_retry_collect(apd_find_apstats(), wiphy_index,
+                                   radio_index, has_radio_index, &tx_retry);
         {
             struct json_object *air = apd_airtime_json(&stats, available,
                                                        radio_netdev);
@@ -4991,7 +6805,8 @@ static void apd_collect_radio_surveys(const char *path,
             !json_object_object_get_ex(radio, "frequency_mhz", &frequency) ||
             !json_object_is_type(frequency, json_type_int)) {
             survey = apd_survey_json(path, NULL, 0, sample_time, wiphy_index,
-                                     have_wiphy_index);
+                                     have_wiphy_index, radio_index,
+                                     has_radio_index);
             json_object_object_add(radio, "survey", survey);
             survey_count++;
             continue;
@@ -5017,11 +6832,13 @@ static void apd_collect_radio_surveys(const char *path,
         if (!interface_name) {
             survey = apd_survey_json(path, invalid_interface_name,
                                      target_frequency, sample_time,
-                                     wiphy_index, have_wiphy_index);
+                                     wiphy_index, have_wiphy_index,
+                                     radio_index, has_radio_index);
         } else {
             survey = apd_survey_json(path, interface_name, target_frequency,
                                      sample_time, wiphy_index,
-                                     have_wiphy_index);
+                                     have_wiphy_index, radio_index,
+                                     has_radio_index);
         }
         if (!survey)
             continue;
@@ -5143,7 +6960,13 @@ static void apd_channel_width_scan(const char *value,
     } else if (!strncmp(value, "Supported Channel Width:", 24)) {
         if (!strstr(value, "neither") && strstr(value, "160"))
             width->w160 = 1;
-    } else if (strstr(value, "320 MHz in 6 GHz Support")) {
+    } else if (strstr(value, "320 MHz in 6 GHz Support") ||
+               /* mt7996/iw 6.x prints the EHT marker unspaced
+                * ("320MHz in 6GHz Supported"). Matching only the spaced
+                * spelling dropped 320 MHz from every BE10000-class 6 GHz
+                * radio, so an EHT320 radio could not be validated at the
+                * width it was already running. */
+               strstr(value, "320MHz in 6GHz Support")) {
         width->w320 = 1;
     } else {
         if (strstr(value, "HE40"))
@@ -5237,6 +7060,67 @@ static void apd_channel_catalog_finalize(
     }
 }
 
+/* One line of `iw phy` output, applied to the catalogue being built.
+ *
+ * Shared by the per-wiphy parser below and the band-scoped collector used by
+ * the mac80211 backend, so both read channel flags, DFS state and width
+ * markers from exactly the same evidence. A second copy of this logic is how
+ * the two paths would drift into disagreeing about what a radio supports.
+ */
+static void apd_channel_catalog_scan_line(
+    char *value, struct json_object *channels,
+    struct json_object **channel,
+    struct apd_channel_width_evidence *width)
+{
+    if (value[0] == '*' && strstr(value, " MHz [")) {
+        double frequency_mhz = 0.0;
+        int frequency = 0;
+        int number = 0;
+        double txpower = 0.0;
+        int has_txpower = 0;
+        const char *close_bracket;
+        struct json_object *entry;
+
+        /* iw 6.x prints a fractional frequency ("* 2412.0 MHz [1]").
+         * Scanning it as %d stopped at the '.', the match count came back as
+         * 1, and every channel line was discarded -- which is why a
+         * BE10000-class AP reported no channel catalogue at all and the
+         * controller refused every radio write with channel_catalog_missing. */
+        if (sscanf(value, "* %lf MHz [%d]", &frequency_mhz, &number) != 2 ||
+            (close_bracket = strchr(value, ']')) == NULL) {
+            *channel = NULL;
+            return;
+        }
+        frequency = (int)(frequency_mhz + 0.5);
+        has_txpower = sscanf(close_bracket + 1, " (%lf dBm", &txpower) == 1;
+        entry = json_object_new_object();
+        json_object_object_add(entry, "channel", json_object_new_int(number));
+        json_object_object_add(entry, "frequency_mhz",
+                               json_object_new_int(frequency));
+        if (has_txpower)
+            json_object_object_add(entry, "max_txpower_dbm",
+                                   json_object_new_double(txpower));
+        json_object_object_add(entry, "disabled",
+            json_object_new_boolean(strstr(value, "(disabled)") != NULL));
+        json_object_object_add(entry, "no_ir",
+            json_object_new_boolean(strstr(value, "no IR") != NULL));
+        json_object_object_add(entry, "radar_detection",
+            json_object_new_boolean(strstr(value, "radar detection") != NULL));
+        json_object_array_add(channels, entry);
+        *channel = entry;
+        return;
+    }
+    if (*channel && !strncmp(value, "DFS state: ", 11)) {
+        char state[32] = { 0 };
+
+        if (sscanf(value + 11, "%31s", state) == 1)
+            json_object_object_add(*channel, "dfs_state",
+                                   json_object_new_string(state));
+        return;
+    }
+    apd_channel_width_scan(value, width);
+}
+
 static void apd_channel_catalog_parse(const char *text,
                                       struct json_object *radios,
                                       const char *regdomain,
@@ -5285,47 +7169,7 @@ static void apd_channel_catalog_parse(const char *text,
         }
         if (!catalog || !channels)
             continue;
-        if (value[0] == '*' && strstr(value, " MHz [")) {
-            int frequency = 0;
-            int number = 0;
-            double txpower = 0.0;
-            int has_txpower = 0;
-            const char *close_bracket;
-
-            if (sscanf(value, "* %d MHz [%d]", &frequency, &number) != 2 ||
-                (close_bracket = strchr(value, ']')) == NULL) {
-                channel = NULL;
-                continue;
-            }
-            has_txpower = sscanf(close_bracket + 1, " (%lf dBm",
-                                 &txpower) == 1;
-            channel = json_object_new_object();
-            json_object_object_add(channel, "channel",
-                                   json_object_new_int(number));
-            json_object_object_add(channel, "frequency_mhz",
-                                   json_object_new_int(frequency));
-            if (has_txpower)
-                json_object_object_add(channel, "max_txpower_dbm",
-                                       json_object_new_double(txpower));
-            json_object_object_add(channel, "disabled",
-                json_object_new_boolean(strstr(value, "(disabled)") != NULL));
-            json_object_object_add(channel, "no_ir",
-                json_object_new_boolean(strstr(value, "no IR") != NULL));
-            json_object_object_add(channel, "radar_detection",
-                json_object_new_boolean(
-                    strstr(value, "radar detection") != NULL));
-            json_object_array_add(channels, channel);
-            continue;
-        }
-        if (channel && !strncmp(value, "DFS state: ", 11)) {
-            char state[32] = { 0 };
-
-            if (sscanf(value + 11, "%31s", state) == 1)
-                json_object_object_add(channel, "dfs_state",
-                                       json_object_new_string(state));
-            continue;
-        }
-        apd_channel_width_scan(value, &width);
+        apd_channel_catalog_scan_line(value, channels, &channel, &width);
     }
     apd_channel_catalog_finalize(catalog, channels, &width);
     free(copy);
@@ -5541,6 +7385,276 @@ static void apd_collect_channel_catalogs(const char *path,
     apd_command_result_free(&result);
 }
 
+/* ── Band-scoped catalogs for single-wiphy multi-radio hardware ───────────
+ *
+ * mac80211 radios on a BE10000-class board all live on one wiphy: phy0r0,
+ * phy0r1 and phy0r2 report phy=phy0 and `iw phy` prints a single "Wiphy phy0"
+ * with Band 1/2/4 underneath. The per-wiphy parser above matches the Wiphy
+ * name against radio.id, which no such radio ever equals, so every radio came
+ * back with channel_catalog absent -- and the AC's fail-closed evidence check
+ * (ac_wifi_validate_evidence) then refused every channel/width/tx-power write
+ * with channel_catalog_missing. That is the whole reason the射频 sheet was
+ * read-only on a managed AP.
+ *
+ * Each band block becomes its own catalog and is attached to the radio(s)
+ * whose band it is, so a 2.4 GHz radio is never told it may use channel 165.
+ * Band membership comes from the frequencies the driver actually printed, not
+ * from a country table.
+ */
+#define APD_CHANNEL_CATALOG_BANDS_MAX 8U
+
+struct apd_channel_band_catalog {
+    struct json_object *catalog;
+    struct json_object *channels;
+    struct apd_channel_width_evidence width;
+    const char *band;
+    /* Highest spatial-stream count the driver claims for this band, read from
+     * the HE RX/TX "N streams:" rows. Station rows cannot supply this on
+     * mac80211 (no per-station NSS in `iw station dump`), which is why the
+     * wireless page reported MIMO as "not reported" on hardware that plainly
+     * advertises 4x4. */
+    int rx_nss;
+    int tx_nss;
+    int nss_direction;   /* 0 unknown, 1 RX block, 2 TX block */
+};
+
+/* "4 streams: MCS 0-11" -> 4; "5 streams: not supported" -> 0. */
+static int apd_channel_stream_row(const char *value)
+{
+    int streams = 0;
+    const char *tail;
+
+    if (sscanf(value, "%d streams:", &streams) != 1 || streams <= 0 ||
+        streams > 16)
+        return 0;
+    tail = strchr(value, ':');
+    if (!tail || strstr(tail, "not supported"))
+        return 0;
+    return streams;
+}
+
+static void apd_channel_band_scan_nss(struct apd_channel_band_catalog *band,
+                                      const char *value)
+{
+    int streams;
+
+    if (strstr(value, "RX MCS and NSS set") || strstr(value, "RX MCS Set"))
+        band->nss_direction = 1;
+    else if (strstr(value, "TX MCS and NSS set") ||
+             strstr(value, "TX MCS Set"))
+        band->nss_direction = 2;
+    streams = apd_channel_stream_row(value);
+    if (!streams)
+        return;
+    if (band->nss_direction == 2) {
+        if (streams > band->tx_nss)
+            band->tx_nss = streams;
+    } else if (band->nss_direction == 1) {
+        if (streams > band->rx_nss)
+            band->rx_nss = streams;
+    }
+}
+
+static const char *apd_channel_band_code(int frequency_mhz)
+{
+    if (frequency_mhz >= 2400 && frequency_mhz < 2500)
+        return "2g";
+    if (frequency_mhz >= 4900 && frequency_mhz < 5925)
+        return "5g";
+    if (frequency_mhz >= 5925 && frequency_mhz < 7125)
+        return "6g";
+    return NULL;
+}
+
+static const char *apd_channel_band_of_catalog(struct json_object *channels)
+{
+    size_t i;
+
+    for (i = 0; channels && i < json_object_array_length(channels); i++) {
+        struct json_object *entry = json_object_array_get_idx(channels, i);
+        struct json_object *field = NULL;
+        const char *band;
+
+        if (!entry ||
+            !json_object_object_get_ex(entry, "frequency_mhz", &field) || !field)
+            continue;
+        band = apd_channel_band_code(json_object_get_int(field));
+        if (band)
+            return band;
+    }
+    return NULL;
+}
+
+/* Normalizes the band spellings that reach a radio object: UCI writes
+ * `2g`/`5g`/`6g`, the openwrt backend's own inventory writes `2.4GHz`. */
+static const char *apd_channel_band_normalize(const char *raw)
+{
+    if (!raw || !raw[0])
+        return NULL;
+    if (!strcmp(raw, "2g") || !strcmp(raw, "2.4GHz") || !strcmp(raw, "2.4g"))
+        return "2g";
+    if (!strcmp(raw, "5g") || !strcmp(raw, "5GHz"))
+        return "5g";
+    if (!strcmp(raw, "6g") || !strcmp(raw, "6GHz"))
+        return "6g";
+    return NULL;
+}
+
+static const char *apd_channel_radio_band(struct json_object *radio)
+{
+    struct json_object *field = NULL;
+    const char *band = NULL;
+
+    if (json_object_object_get_ex(radio, "band", &field) && field &&
+        json_object_is_type(field, json_type_string))
+        band = apd_channel_band_normalize(json_object_get_string(field));
+    if (band)
+        return band;
+    if (json_object_object_get_ex(radio, "frequency_mhz", &field) && field)
+        return apd_channel_band_code(json_object_get_int(field));
+    return NULL;
+}
+
+void apd_collect_channel_catalogs_by_band(struct json_object *radios,
+                                          int64_t observed_at)
+{
+    const char *path = apd_find_iw();
+    struct apd_command_result result = { 0 };
+    struct apd_channel_band_catalog bands[APD_CHANNEL_CATALOG_BANDS_MAX];
+    char regdomain[8] = { 0 };
+    const char *failure = NULL;
+    char *copy = NULL;
+    char *line;
+    char *saveptr = NULL;
+    size_t band_count = 0;
+    size_t i;
+
+    if (!radios)
+        return;
+    memset(bands, 0, sizeof(bands));
+    if (!path) {
+        failure = "iw_binary_unavailable";
+        goto attach;
+    }
+    apd_reg_domain(path, regdomain, sizeof(regdomain));
+    {
+        char *const argv[] = { (char *)path, "phy", NULL };
+
+        if (apd_readonly_command(path, argv, &result) != 0) {
+            failure = result.timed_out ? "iw_phy_timeout" :
+                      result.output_limited ? "iw_phy_output_limited" :
+                                              "iw_phy_failed";
+            goto attach;
+        }
+    }
+    copy = strdup(result.text ? result.text : "");
+    if (!copy) {
+        failure = "iw_phy_allocation_failed";
+        goto attach;
+    }
+    for (line = strtok_r(copy, "\n", &saveptr); line;
+         line = strtok_r(NULL, "\n", &saveptr)) {
+        char *value = apd_channel_line_trim(line);
+        struct apd_channel_band_catalog *current;
+        struct json_object *channel = NULL;
+
+        if (!strncmp(value, "Band ", 5) && strchr(value, ':')) {
+            if (band_count >= APD_CHANNEL_CATALOG_BANDS_MAX)
+                break;
+            current = &bands[band_count++];
+            current->catalog = apd_channel_catalog_new(NULL, observed_at);
+            if (!current->catalog) {
+                band_count--;
+                continue;
+            }
+            if (regdomain[0])
+                json_object_object_add(current->catalog, "regdomain",
+                                       json_object_new_string(regdomain));
+            json_object_object_get_ex(current->catalog, "channels",
+                                      &current->channels);
+            continue;
+        }
+        if (!band_count)
+            continue;
+        current = &bands[band_count - 1];
+        if (!current->channels)
+            continue;
+        /* The per-channel object is re-resolved from the array rather than
+         * carried across lines, because a "DFS state:" line always follows the
+         * frequency line it belongs to. */
+        if (json_object_array_length(current->channels))
+            channel = json_object_array_get_idx(current->channels,
+                json_object_array_length(current->channels) - 1);
+        apd_channel_band_scan_nss(current, value);
+        apd_channel_catalog_scan_line(value, current->channels, &channel,
+                                      &current->width);
+    }
+    for (i = 0; i < band_count; i++) {
+        apd_channel_catalog_finalize(bands[i].catalog, bands[i].channels,
+                                     &bands[i].width);
+        bands[i].band = apd_channel_band_of_catalog(bands[i].channels);
+        if (bands[i].band)
+            json_object_object_add(bands[i].catalog, "band",
+                                   json_object_new_string(bands[i].band));
+        if (bands[i].rx_nss > 0 && bands[i].tx_nss > 0) {
+            char mimo[24];
+
+            snprintf(mimo, sizeof(mimo), "%dx%d", bands[i].rx_nss,
+                     bands[i].tx_nss);
+            json_object_object_add(bands[i].catalog, "spatial_streams_rx",
+                                   json_object_new_int(bands[i].rx_nss));
+            json_object_object_add(bands[i].catalog, "spatial_streams_tx",
+                                   json_object_new_int(bands[i].tx_nss));
+            json_object_object_add(bands[i].catalog, "mimo",
+                                   json_object_new_string(mimo));
+        }
+    }
+attach:
+    for (i = 0; i < json_object_array_length(radios); i++) {
+        struct json_object *radio = json_object_array_get_idx(radios, i);
+        struct json_object *existing = NULL;
+        const char *radio_band = apd_channel_radio_band(radio);
+        size_t j;
+        int attached = 0;
+
+        if (!radio || json_object_object_get_ex(radio, "channel_catalog",
+                                                &existing))
+            continue;
+        for (j = 0; radio_band && j < band_count; j++) {
+            struct json_object *mimo = NULL;
+
+            if (!bands[j].band || !bands[j].catalog ||
+                strcmp(bands[j].band, radio_band))
+                continue;
+            /* Radios share a band catalogue by reference count, not by copy:
+             * two 5 GHz radios on one wiphy see identical driver evidence. */
+            json_object_object_add(radio, "channel_catalog",
+                                   json_object_get(bands[j].catalog));
+            /* Republished on the radio itself because the aggregator reads
+             * MIMO at radio level; the catalogue keeps the same value with its
+             * stream counts for anything that wants the detail. */
+            if (json_object_object_get_ex(bands[j].catalog, "mimo", &mimo) &&
+                mimo && !json_object_object_get_ex(radio, "mimo", NULL)) {
+                json_object_object_add(radio, "mimo", json_object_get(mimo));
+                json_object_object_add(radio, "mimo_source",
+                                       json_object_new_string("iw_phy_he_nss"));
+            }
+            attached = 1;
+            break;
+        }
+        if (attached)
+            continue;
+        json_object_object_add(radio, "channel_catalog",
+            apd_channel_catalog_new(failure ? failure :
+                radio_band ? "iw_phy_band_not_reported" :
+                             "radio_band_unknown", observed_at));
+    }
+    for (i = 0; i < band_count; i++)
+        json_object_put(bands[i].catalog);
+    free(copy);
+    apd_command_result_free(&result);
+}
+
 #endif /* channel catalog visibility */
 
 #ifndef APD_HOSTAPD_STANDALONE_TEST
@@ -5593,7 +7707,26 @@ static struct json_object *apd_collect_iw(int phy_count,
     }
     apd_collect_radio_surveys(path, radios, observed_at, &survey_count,
                               &survey_complete_count);
-    apd_collect_channel_catalogs(path, radios, observed_at);
+    {
+        int logical_radios = 0;
+        size_t i;
+
+        for (i = 0; i < json_object_array_length(radios); i++) {
+            struct json_object *radio =
+                json_object_array_get_idx(radios, i);
+            struct json_object *index = NULL;
+
+            if (radio && json_object_object_get_ex(radio, "radio_index",
+                                                   &index)) {
+                logical_radios = 1;
+                break;
+            }
+        }
+        if (logical_radios)
+            apd_collect_channel_catalogs_by_band(radios, observed_at);
+        else
+            apd_collect_channel_catalogs(path, radios, observed_at);
+    }
     complete = json_object_array_length(radios) > 0;
     if (!json_object_array_length(radios))
         reason = "empty_runtime_inventory";
@@ -5991,6 +8124,8 @@ static int apd_openwrt_snapshot(struct json_object **out)
 static int apd_openwrt_validate(struct json_object *candidate,
                                 struct json_object **out)
 {
+    if (apd_config_candidate_has_actions(candidate))
+        return apd_config_hostapd_actions_validate(candidate, out);
     return apd_config_candidate_validate(candidate, out);
 }
 
@@ -6003,14 +8138,1316 @@ static int apd_openwrt_stage(struct json_object *candidate,
     return apd_config_stage(&paths, candidate, out);
 }
 
+
+#endif
+#if !defined(APD_HOSTAPD_STANDALONE_TEST) || defined(APD_ROAMING_STANDALONE_TEST)
+
+/* ---- Phase 3: hostapd action helpers for 11k neighbor and 11v BTM ---- */
+
+/* Resolve the hostapd control socket path for a given BSS interface name.
+ * Reads the per-BSS runtime conf to find ctrl_interface=, then builds the
+ * full socket path "<ctrl_dir>/<bss_interface>".  Returns 0 on success. */
+static int apd_phase3_ctrl_path(const char *identifier,
+                                 char *out, size_t out_len)
+{
+    char ctrl_dir[APD_HOSTAPD_DIR_LEN];
+
+    if (!identifier || !out || out_len == 0)
+        return -1;
+    /* Fast path: identifier is the BSS interface name. */
+    if (apd_hostapd_conf_control_dir(identifier, ctrl_dir,
+                                      sizeof(ctrl_dir), NULL) == 0)
+        return apd_hostapd_socket_path(ctrl_dir, identifier, out, out_len);
+    /* Slow path: identifier might be a BSSID.  Scan hostapd sockets
+     * and match by sending STATUS.  Only runs when conf lookup fails. */
+    {
+        char scan_dirs[1 + APD_HOSTAPD_VENDOR_DIR_LIMIT][APD_HOSTAPD_DIR_LEN];
+        const char *dirs[1 + APD_HOSTAPD_VENDOR_DIR_LIMIT];
+        size_t dir_count = 0;
+        DIR *d;
+        struct dirent *entry;
+        size_t si;
+
+        snprintf(scan_dirs[0], APD_HOSTAPD_DIR_LEN, "%s", APD_HOSTAPD_RUN_DIR);
+        dirs[0] = scan_dirs[0];
+        dir_count = 1;
+        {
+            size_t vcount = apd_hostapd_vendor_dirs(&scan_dirs[dir_count],
+                                                    APD_HOSTAPD_VENDOR_DIR_LIMIT);
+            size_t vi;
+            for (vi = 0; vi < vcount; vi++) {
+                dirs[dir_count] = scan_dirs[dir_count];
+                dir_count++;
+            }
+        }
+        for (si = 0; si < dir_count; si++) {
+            d = opendir(dirs[si]);
+            if (!d)
+                continue;
+            while ((entry = readdir(d)) != NULL) {
+                char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+                char response[1024];
+                size_t response_len = 0;
+                enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+                char *bssid_line;
+                struct stat st;
+
+                if (entry->d_name[0] == '.')
+                    continue;
+                if (!strcmp(entry->d_name, "global"))
+                    continue;
+                if (apd_hostapd_socket_path(dirs[si], entry->d_name,
+                                            path, sizeof(path)) != 0 ||
+                    lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode))
+                    continue;
+                if (!strcmp(entry->d_name, identifier)) {
+                    closedir(d);
+                    snprintf(out, out_len, "%s", path);
+                    return 0;
+                }
+                if (apd_hostapd_request(path, "STATUS", response,
+                                        sizeof(response), &response_len,
+                                        0, &stage) != APD_HOSTAPD_REQUEST_OK)
+                    continue;
+                response[sizeof(response) - 1] = '\0';
+                bssid_line = strstr(response, "bssid=");
+                if (!bssid_line) {
+                    bssid_line = strstr(response, "bssid[0]=");
+                    if (bssid_line)
+                        bssid_line += 3;
+                }
+                if (!bssid_line)
+                    continue;
+                bssid_line += 6;
+                if (!strncasecmp(bssid_line, identifier, 17) &&
+                    (bssid_line[17] == '\n' || bssid_line[17] == '\0' ||
+                     bssid_line[17] == ' ')) {
+                    closedir(d);
+                    return apd_hostapd_socket_path(dirs[si], entry->d_name,
+                                                   out, out_len);
+                }
+            }
+            closedir(d);
+        }
+    }
+    return -1;
+}
+
+/* ---- Phase 3 hostapd wire formats ------------------------------------------
+ *
+ * Both commands below previously used an invented syntax that hostapd does not
+ * accept, and in the BTM case did so while still reporting success:
+ *
+ *   SET_NEIGHBOR <bssid> oc=<n> ch=<n>
+ *       hostapd_ctrl_iface_set_neighbor() requires "ssid=" and "nr="; with
+ *       neither it bails at "Bad or missing SSID" and show_neighbor stays FAIL.
+ *
+ *   BSS_TM_REQ <sta> <target_bssid> validity=<n>
+ *       hostapd only reads space-prefixed key=value tokens after the STA
+ *       address.  The bare BSSID was ignored, "validity=" is not the token
+ *       (it is " valid_int="), and ieee802_11_parse_candidate_list() returns 0
+ *       rather than an error when it finds no " neighbor=" -- so hostapd
+ *       answered OK to a transition request carrying no candidates at all.
+ */
+
+/* Neighbor Report element body: BSSID(6) || BSSID Information(4, little
+ * endian) || Operating Class(1) || Channel(1) || PHY Type(1). */
+#define APD_NR_ELEMENT_BYTES 13
+#define APD_NR_HEX_LEN (APD_NR_ELEMENT_BYTES * 2)
+/* An SSID is at most 32 octets, so 64 hex characters. */
+#define APD_HOSTAPD_SSID_HEX_MAX 64
+
+static int apd_parse_mac(const char *text, unsigned char out[6])
+{
+    unsigned int octet[6];
+    int i;
+
+    if (!text || sscanf(text, "%2x:%2x:%2x:%2x:%2x:%2x",
+                        &octet[0], &octet[1], &octet[2],
+                        &octet[3], &octet[4], &octet[5]) != 6)
+        return -1;
+    for (i = 0; i < 6; i++) {
+        if (octet[i] > 0xff)
+            return -1;
+        out[i] = (unsigned char)octet[i];
+    }
+    return 0;
+}
+
+/* BSSID Information, IEEE 802.11 Table 9-176.  Only bits we can assert from
+ * what the controller told us are set; speculative capability bits are left
+ * clear because a station that trusts them and finds otherwise will fall back
+ * to a full scan, which is the outcome 11k exists to avoid. */
+static uint32_t apd_nr_bssid_info(int phy_type, int ft_capable)
+{
+    uint32_t info = 0;
+
+    info |= 3u;         /* AP Reachability: reachable */
+    info |= 1u << 2;    /* Security: same as current AP */
+    info |= 1u << 3;    /* Key Scope: same authenticator */
+    info |= 1u << 5;    /* QoS */
+    info |= 1u << 6;    /* APSD */
+    info |= 1u << 7;    /* Radio Measurement */
+    if (ft_capable)
+        info |= 1u << 10;   /* Mobility Domain */
+    info |= 1u << 11;       /* High Throughput */
+    if (phy_type >= 9)      /* PHY_TYPE_VHT and newer */
+        info |= 1u << 12;
+    return info;
+}
+
+static int apd_nr_element_hex(const char *bssid, int op_class, int channel,
+                              int phy_type, int ft_capable,
+                              char out[APD_NR_HEX_LEN + 1])
+{
+    static const char hex[] = "0123456789abcdef";
+    unsigned char body[APD_NR_ELEMENT_BYTES];
+    uint32_t info;
+    int i;
+
+    if (op_class <= 0 || op_class > 255 || channel <= 0 || channel > 255 ||
+        phy_type <= 0 || phy_type > 255 || apd_parse_mac(bssid, body) != 0)
+        return -1;
+    info = apd_nr_bssid_info(phy_type, ft_capable);
+    body[6] = (unsigned char)(info & 0xff);
+    body[7] = (unsigned char)((info >> 8) & 0xff);
+    body[8] = (unsigned char)((info >> 16) & 0xff);
+    body[9] = (unsigned char)((info >> 24) & 0xff);
+    body[10] = (unsigned char)op_class;
+    body[11] = (unsigned char)channel;
+    body[12] = (unsigned char)phy_type;
+    for (i = 0; i < APD_NR_ELEMENT_BYTES; i++) {
+        out[i * 2] = hex[body[i] >> 4];
+        out[i * 2 + 1] = hex[body[i] & 0x0f];
+    }
+    out[APD_NR_HEX_LEN] = '\0';
+    return 0;
+}
+
+static int apd_phase3_neighbor_readback(const char *ctrl_path,
+    const char *bssid, const char *ssid_hex, const char *report)
+{
+    struct apd_hostapd_bss_observation *table = calloc(1, sizeof(*table));
+    char *response = calloc(1, APD_HOSTAPD_RESPONSE_LIMIT + 2U);
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+    size_t length = 0, i;
+    int rc = -1;
+
+    if (!table || !response)
+        goto done;
+    if (apd_hostapd_request(ctrl_path, "SHOW_NEIGHBOR", response,
+            APD_HOSTAPD_RESPONSE_LIMIT + 2U, &length, 0, &stage) !=
+                APD_HOSTAPD_REQUEST_OK ||
+        apd_hostapd_neighbors_parse(response, table) != 0)
+        goto done;
+    for (i = 0; i < table->neighbor_count; i++) {
+        const struct apd_hostapd_neighbor *row = &table->neighbors[i];
+
+        if (!strcasecmp(row->bssid, bssid) && !strcmp(row->ssid_hex, ssid_hex) &&
+            !strcmp(row->report, report)) {
+            rc = 0;
+            break;
+        }
+    }
+done:
+    free(table);
+    free(response);
+    return rc;
+}
+
+/* A replay must still own the same BSS when the queued job reaches the AP. */
+static int apd_phase3_neighbor_owner(const char *ctrl_path,
+                                     struct json_object *options)
+{
+    const char *bssid = json_object_get_string(
+        json_object_object_get(options, "source_bssid"));
+    const char *ssid = json_object_get_string(
+        json_object_object_get(options, "source_ssid"));
+    const char *peer = json_object_get_string(
+        json_object_object_get(options, "neighbor_bssid"));
+    const char *peer_ssid = json_object_get_string(
+        json_object_object_get(options, "neighbor_ssid"));
+    struct apd_hostapd_bss_observation *status;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+    char response[4096];
+    size_t length = 0;
+    int ok = 0;
+
+    if (!bssid && !ssid)
+        return 1;
+    if (!bssid || !ssid || !peer || !peer_ssid ||
+        !strcasecmp(bssid, peer) || strcmp(ssid, peer_ssid))
+        return 0;
+    status = calloc(1, sizeof(*status));
+    if (!status)
+        return 0;
+    if (apd_hostapd_request(ctrl_path, "STATUS", response, sizeof(response),
+            &length, 0, &stage) == APD_HOSTAPD_REQUEST_OK &&
+        apd_hostapd_parse_status(response, status) == 0 &&
+        status->has_bssid && status->has_ssid &&
+        !strcmp(status->state, "ENABLED") &&
+        !strcasecmp(status->bssid, bssid) && !strcmp(status->ssid, ssid))
+        ok = 1;
+    free(status);
+    return ok;
+}
+
+/* Success requires both an explicit ACK and the fixed report body in readback. */
+static int apd_phase3_set_neighbor(const char *ctrl_path,
+                                    const char *bssid,
+                                    const char *ssid,
+                                    int op_class,
+                                    int channel,
+                                    int phy_type,
+                                    int ft_capable)
+{
+    static const char hex[] = "0123456789abcdef";
+    char ssid_hex[APD_HOSTAPD_SSID_HEX_MAX + 1];
+    char nr_hex[APD_NR_HEX_LEN + 1];
+    char command[320];
+    char response[256];
+    size_t response_len = 0;
+    size_t ssid_len;
+    size_t i;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+    int rc;
+
+    if (!ctrl_path || !bssid || !ssid || !ssid[0])
+        return -1;
+    ssid_len = strlen(ssid);
+    if (ssid_len > APD_HOSTAPD_SSID_HEX_MAX / 2)
+        return -1;
+    /* Hex rather than the quoted form: hostapd's ssid_parse() terminates a
+     * quoted SSID at the closing quote and an unquoted one at the next space,
+     * so a hex SSID cannot be broken by spaces or quotes in the name. */
+    for (i = 0; i < ssid_len; i++) {
+        ssid_hex[i * 2] = hex[(unsigned char)ssid[i] >> 4];
+        ssid_hex[i * 2 + 1] = hex[(unsigned char)ssid[i] & 0x0f];
+    }
+    ssid_hex[ssid_len * 2] = '\0';
+    if (apd_nr_element_hex(bssid, op_class, channel, phy_type, ft_capable,
+                           nr_hex) != 0)
+        return -1;
+    rc = snprintf(command, sizeof(command), "SET_NEIGHBOR %s ssid=%s nr=%s",
+                  bssid, ssid_hex, nr_hex);
+    if (rc < 0 || (size_t)rc >= sizeof(command))
+        return -1;
+    rc = apd_hostapd_request(ctrl_path, command, response,
+                              sizeof(response), &response_len, 0, &stage);
+    if (rc != APD_HOSTAPD_REQUEST_OK ||
+        (strcmp(response, "OK") && strcmp(response, "OK\n")))
+        return -1;
+    return apd_phase3_neighbor_readback(ctrl_path, bssid, ssid_hex, nr_hex);
+}
+
+/* Send DEL_NEIGHBOR <bssid> to hostapd. Returns 0 on success. */
+static int apd_phase3_del_neighbor(const char *ctrl_path,
+                                    const char *bssid)
+{
+    char command[65];
+    char response[256];
+    size_t response_len = 0;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+    int rc;
+
+    if (!ctrl_path || !bssid)
+        return -1;
+    rc = snprintf(command, sizeof(command), "DEL_NEIGHBOR %s", bssid);
+    if (rc < 0 || (size_t)rc >= sizeof(command))
+        return -1;
+    rc = apd_hostapd_request(ctrl_path, command, response,
+                              sizeof(response), &response_len, 0, &stage);
+    return rc == APD_HOSTAPD_REQUEST_OK && !apd_hostapd_is_fail(response) ?
+           0 : -1;
+}
+
+/* Send BSS_TM_REQ with a real candidate list to hostapd.
+ *
+ * Every token after the STA address must be space prefixed, because hostapd
+ * matches them with os_strstr(cmd, " valid_int=") and friends. " pref=1"
+ * marks the list preferred; subelement 3 assigns the target preference 255.
+ *
+ * Returns 0 only when a candidate was actually included and hostapd accepted
+ * the request. */
+static int apd_phase3_send_btm(const char *ctrl_path,
+                                 const char *sta_mac,
+                                 const char *target_bssid,
+                                 int op_class,
+                                 int channel,
+                                 int phy_type,
+                                 int ft_capable,
+                                 int validity,
+                                 const char *target_bssid_2,
+                                 int op_class_2,
+                                 int channel_2,
+                                 int phy_type_2,
+                                 int ft_capable_2,
+                                 int disassoc_imminent,
+                                 int disassoc_timer)
+{
+    char command[384];
+    char response[256];
+    char normalized[18];
+    char normalized_target[18];
+    char normalized_target_2[18] = {0};
+    size_t response_len = 0;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+    uint32_t info;
+    uint32_t info_2;
+    int rc;
+
+    if (!ctrl_path ||
+        apd_hostapd_parse_mac(sta_mac, normalized) != 0 ||
+        apd_hostapd_parse_mac(target_bssid, normalized_target) != 0)
+        return -1;
+    /* Refuse rather than send a transition request with an empty candidate
+     * list: hostapd answers OK to that, so the caller would record a steer
+     * that never gave the station anywhere to go. */
+    if (op_class <= 0 || op_class > 255 || channel <= 0 || channel > 255 ||
+        phy_type <= 0 || phy_type > 255 || validity < 0 || validity > 255 ||
+        disassoc_imminent < 0 || disassoc_imminent > 1 ||
+        disassoc_timer < 0 || disassoc_timer > 65535)
+        return -1;
+    if (target_bssid_2 && target_bssid_2[0] &&
+        (apd_hostapd_parse_mac(target_bssid_2, normalized_target_2) != 0 ||
+         op_class_2 <= 0 || op_class_2 > 255 || channel_2 <= 0 ||
+         channel_2 > 255 || phy_type_2 <= 0 || phy_type_2 > 255 ||
+         !strcasecmp(normalized_target, normalized_target_2)))
+        return -1;
+    if (!apd_phase4_station_associated(ctrl_path, normalized) ||
+        apd_roaming_monitor_attach(ctrl_path) != 0)
+        return -1;
+    info = apd_nr_bssid_info(phy_type, ft_capable);
+    rc = snprintf(command, sizeof(command),
+                  "BSS_TM_REQ %s neighbor=%s,%u,%d,%d,%d,0301ff pref=1",
+                  normalized, normalized_target, (unsigned int)info,
+                  op_class, channel, phy_type);
+    if (rc < 0 || (size_t)rc >= sizeof(command))
+        return -1;
+    if (validity > 0) {
+        int written = snprintf(command + rc, sizeof(command) - (size_t)rc,
+                               " valid_int=%d", validity);
+        if (written < 0 || (size_t)written >= sizeof(command) - (size_t)rc)
+            return -1;
+        rc += written;
+    }
+    if (target_bssid_2 && target_bssid_2[0]) {
+        info_2 = apd_nr_bssid_info(phy_type_2, ft_capable_2);
+        rc += snprintf(command + rc, sizeof(command) - (size_t)rc,
+                       " neighbor=%s,%u,%d,%d,%d,0301fe pref=1",
+                       normalized_target_2, (unsigned int)info_2, op_class_2,
+                       channel_2, phy_type_2);
+        if (rc < 0 || (size_t)rc >= sizeof(command))
+            return -1;
+    }
+    rc += snprintf(command + rc, sizeof(command) - (size_t)rc,
+                   " disassoc_imminent=%d disassoc_timer=%d",
+                   disassoc_imminent, disassoc_timer);
+    if (rc < 0 || (size_t)rc >= sizeof(command))
+        return -1;
+    rc = apd_hostapd_request(ctrl_path, command, response,
+                              sizeof(response), &response_len, 0, &stage);
+    return rc == APD_HOSTAPD_REQUEST_OK && !apd_hostapd_is_fail(response) ?
+           0 : -1;
+}
+
+/* Phase 4: is this station currently associated with this BSS?
+ *
+ * hostapd's DEAUTHENTICATE sends the frame whether or not the station is on
+ * this BSS -- ap_get_sta() returning NULL only skips the local cleanup.  So a
+ * misrouted request would put a deauth frame on the air for someone else's
+ * client and still answer OK.  Ask hostapd first and refuse if it does not
+ * know the station: the AC does its own ownership check, this is the second
+ * one at the point of no return. */
+static int apd_phase4_station_associated(const char *ctrl_path,
+                                         const char *sta_mac)
+{
+    char command[128];
+    char *response;
+    size_t response_len = 0;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+    int rc;
+
+    if (!ctrl_path || !sta_mac || !sta_mac[0])
+        return 0;
+    rc = snprintf(command, sizeof(command), "STA %s", sta_mac);
+    if (rc < 0 || (size_t)rc >= sizeof(command))
+        return 0;
+    response = calloc(1, APD_HOSTAPD_RESPONSE_LIMIT + 2U);
+    if (!response)
+        return 0;
+    rc = apd_hostapd_request(ctrl_path, command, response,
+                             APD_HOSTAPD_RESPONSE_LIMIT + 2U,
+                             &response_len, 0, &stage);
+    rc = rc == APD_HOSTAPD_REQUEST_OK && !apd_hostapd_is_fail(response) &&
+         strncasecmp(response, sta_mac, strlen(sta_mac)) == 0 &&
+         strstr(response, "[ASSOC]") != NULL;
+    apd_hostapd_clear(response, APD_HOSTAPD_RESPONSE_LIMIT + 2U);
+    free(response);
+    return rc;
+}
+
+/* Send DEAUTHENTICATE for one station.
+ *
+ * Wire format is "DEAUTHENTICATE <mac> reason=<n>": hostapd parses the address
+ * with hwaddr_aton() first, then looks for the space-prefixed " reason=" token
+ * (ctrl_iface_ap.c).  Anything malformed makes hostapd answer FAIL rather than
+ * misfire, but the association check above runs first regardless.
+ *
+ * Deliberately never emits " test=", " tx=0" or " p2p=": those hostapd
+ * branches either forge a frame or silently drop the station locally without
+ * telling it, and both would make the audit trail lie about what happened. */
+static int apd_phase4_send_deauth(const char *ctrl_path, const char *sta_mac,
+                                  int reason)
+{
+    char command[160];
+    char response[256];
+    size_t response_len = 0;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+    int rc;
+
+    if (!ctrl_path || !sta_mac || !sta_mac[0])
+        return -1;
+    if (reason <= 0 || reason > 65535)
+        return -1;
+    if (!apd_phase4_station_associated(ctrl_path, sta_mac))
+        return -1;
+    rc = snprintf(command, sizeof(command), "DEAUTHENTICATE %s reason=%d",
+                  sta_mac, reason);
+    if (rc < 0 || (size_t)rc >= sizeof(command))
+        return -1;
+    rc = apd_hostapd_request(ctrl_path, command, response, sizeof(response),
+                             &response_len, 0, &stage);
+    return rc == APD_HOSTAPD_REQUEST_OK && !apd_hostapd_is_fail(response) ?
+           0 : -1;
+}
+
+#define APD_REASSOC_BSS_MAX 16
+#ifndef APD_REASSOC_WORKER_EXE
+#define APD_REASSOC_WORKER_EXE "/proc/self/exe"
+#endif
+
+struct apd_reassoc_bss {
+    char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    char bssid[18];
+    dev_t device;
+    ino_t inode;
+    int owned;
+};
+
+static volatile sig_atomic_t apd_reassoc_cancelled;
+
+static void apd_reassoc_signal(int signo)
+{
+    (void)signo;
+    apd_reassoc_cancelled = 1;
+}
+
+static int apd_reassoc_lock_open(const char *mac)
+{
+    char normalized[18], path[APD_HOSTAPD_DIR_LEN + 64];
+    unsigned char bytes[6];
+    struct stat st;
+    int fd;
+
+    if (apd_hostapd_parse_mac(mac, normalized) != 0 ||
+        apd_parse_mac(normalized, bytes) != 0 || (bytes[0] & 1) ||
+        !strcmp(normalized, "00:00:00:00:00:00") ||
+        apd_hostapd_local_dir_prepare() != 0)
+        return -1;
+    snprintf(path, sizeof(path), "%s/reassoc-%s.lock",
+             APD_HOSTAPD_LOCAL_DIR, normalized);
+    fd = open(path, O_RDWR | O_CREAT | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd >= 0 && (fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) ||
+                    st.st_uid != geteuid() || (st.st_mode & 0077))) {
+        close(fd);
+        return -1;
+    }
+    return fd;
+}
+
+int apd_reassoc_block_release(const char *station_mac)
+{
+    struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    int fd = apd_reassoc_lock_open(station_mac);
+    int64_t deadline = apd_monotonic_ms() + 5000;
+    int rc = 1;
+
+    if (fd < 0)
+        return 1;
+    if (fcntl(fd, F_GETLK, &lock) != 0)
+        goto done;
+    if (lock.l_type != F_UNLCK && kill(lock.l_pid, SIGTERM) != 0)
+        goto done;
+    do {
+        lock.l_type = F_WRLCK;
+        if (fcntl(fd, F_GETLK, &lock) != 0)
+            break;
+        if (lock.l_type == F_UNLCK) {
+            rc = 0;
+            break;
+        }
+        poll(NULL, 0, 50);
+    } while (apd_monotonic_ms() < deadline);
+done:
+    close(fd);
+    return rc;
+}
+
+static int apd_reassoc_status(const char *path,
+                              struct apd_hostapd_bss_observation *status)
+{
+    char response[4096];
+    size_t length = 0;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+
+    memset(status, 0, sizeof(*status));
+    return apd_hostapd_request(path, "STATUS", response, sizeof(response),
+        &length, 0, &stage) == APD_HOSTAPD_REQUEST_OK &&
+        apd_hostapd_parse_status(response, status) == 0 &&
+        status->has_bssid && status->has_ssid ? 0 : -1;
+}
+
+static int apd_reassoc_band(int frequency)
+{
+    return frequency >= 5925 && frequency <= 7125 ? 6 :
+           frequency >= 4900 && frequency < 5925 ? 5 :
+           frequency >= 2400 && frequency <= 2500 ? 2 : 0;
+}
+
+static int apd_reassoc_band_rank(int frequency)
+{
+    return frequency >= 5925 && frequency <= 7125 ? 4 :
+           frequency >= 5700 && frequency < 5925 ? 3 :
+           frequency >= 4900 && frequency < 5700 ? 2 :
+           frequency >= 2400 && frequency <= 2500 ? 1 : 0;
+}
+
+static int apd_reassoc_add_bss(struct apd_reassoc_bss *bsses, size_t *count,
+                              const char *path, const char *bssid)
+{
+    struct stat st;
+    size_t i;
+
+    for (i = 0; i < *count; i++)
+        if (!strcasecmp(bsses[i].bssid, bssid))
+            return 0;
+    if (*count == APD_REASSOC_BSS_MAX || lstat(path, &st) != 0 ||
+        !S_ISSOCK(st.st_mode) || !apd_hostapd_uid_trusted(st.st_uid))
+        return -1;
+    snprintf(bsses[*count].path, sizeof(bsses[*count].path), "%s", path);
+    snprintf(bsses[*count].bssid, sizeof(bsses[*count].bssid), "%s", bssid);
+    bsses[*count].device = st.st_dev;
+    bsses[*count].inode = st.st_ino;
+    (*count)++;
+    return 0;
+}
+
+/* Enumerate only live BSS identities, not stations or vendor driver controls.
+ * The serving BSS goes last: ADD_MAC can disconnect immediately. */
+static int apd_reassoc_scope(const char *source_path, const char *source_bssid,
+    const char *ssid, const char *scope, const char *target,
+    int target_frequency_mhz,
+    struct apd_reassoc_bss *bsses, size_t *count)
+{
+    struct apd_hostapd_bss_observation *status = calloc(1, sizeof(*status));
+    char dirs[APD_HOSTAPD_VENDOR_DIR_LIMIT + 1][APD_HOSTAPD_DIR_LEN];
+    size_t directory_count, i, scanned = 0;
+    int band, rc = -1;
+
+    if (!status || apd_reassoc_status(source_path, status) != 0 ||
+        strcasecmp(status->bssid, source_bssid) || strcmp(status->ssid, ssid) ||
+        strcmp(status->state, "ENABLED") ||
+        status->has_mld_address || status->has_link_id)
+        goto done;
+    band = apd_reassoc_band(status->frequency_mhz);
+    if (!band)
+        goto done;
+    if (strcmp(scope, "bss")) {
+        snprintf(dirs[0], sizeof(dirs[0]), "%s", APD_HOSTAPD_RUN_DIR);
+        directory_count = 1 + apd_hostapd_vendor_dirs(
+            &dirs[1], APD_HOSTAPD_VENDOR_DIR_LIMIT);
+        for (i = 0; i < directory_count; i++) {
+            struct dirent *entry;
+            DIR *directory = opendir(dirs[i]);
+
+            if (!directory)
+                goto done;
+            while ((entry = readdir(directory)) != NULL) {
+                char path[sizeof(bsses[0].path)];
+                struct stat st;
+
+                if (entry->d_name[0] == '.' || !strcmp(entry->d_name, "global"))
+                    continue;
+                if (++scanned > APD_HOSTAPD_SOCKET_SCAN_LIMIT) {
+                    closedir(directory);
+                    goto done;
+                }
+                if (!apd_hostapd_safe_name(entry->d_name) ||
+                    apd_hostapd_socket_path(dirs[i], entry->d_name,
+                        path, sizeof(path)) != 0 ||
+                    lstat(path, &st) != 0 || !S_ISSOCK(st.st_mode))
+                    continue;
+                if (apd_reassoc_status(path, status) != 0) {
+                    closedir(directory);
+                    goto done;
+                }
+                if (strcmp(status->ssid, ssid) ||
+                    strcmp(status->state, "ENABLED") ||
+                    !strcasecmp(status->bssid, source_bssid))
+                    continue;
+                /* The selected target must remain reachable even when its
+                 * band would otherwise fall inside the lower-band deny set. */
+                if (!strcasecmp(status->bssid, target))
+                    continue;
+                if (!apd_reassoc_band(status->frequency_mhz)) {
+                    closedir(directory);
+                    goto done;
+                }
+                if (!strcmp(scope, "band") &&
+                    apd_reassoc_band(status->frequency_mhz) != band)
+                    continue;
+                /* "lower" follows the measured target, not the source band.
+                 * This covers 2.4 -> 5 GHz, 5.2 -> 5.8 GHz and 5 -> 6 GHz
+                 * without denying the selected target BSSID. */
+                if (!strcmp(scope, "lower") &&
+                    apd_reassoc_band_rank(status->frequency_mhz) >=
+                        apd_reassoc_band_rank(target_frequency_mhz))
+                    continue;
+                if (status->has_mld_address || status->has_link_id) {
+                    closedir(directory);
+                    goto done;
+                }
+                if (!strcasecmp(status->bssid, target))
+                    continue;
+                if (apd_reassoc_add_bss(bsses, count, path, status->bssid) != 0) {
+                    closedir(directory);
+                    goto done;
+                }
+            }
+            closedir(directory);
+        }
+    }
+    if (apd_reassoc_add_bss(bsses, count, source_path, source_bssid) != 0)
+        goto done;
+    rc = 0;
+done:
+    free(status);
+    return rc;
+}
+
+/* -1 is an unreadable/unsupported list, never an empty ACL. */
+static int apd_reassoc_acl_contains(const char *path, const char *mac)
+{
+    char response[8192], *line, *save = NULL;
+    size_t length = 0;
+    int found = 0, rc;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+
+    rc = apd_hostapd_request(path, "DENY_ACL SHOW", response, sizeof(response),
+                             &length, 0, &stage);
+    if ((rc != APD_HOSTAPD_REQUEST_OK && rc != APD_HOSTAPD_REQUEST_EMPTY) ||
+        apd_hostapd_is_fail(response) || apd_hostapd_is_unknown_command(response) ||
+        length >= sizeof(response) - 1)
+        return -1;
+    for (line = strtok_r(response, "\n", &save); line;
+         line = strtok_r(NULL, "\n", &save)) {
+        char address[18], normalized[18];
+        size_t size = strlen(line);
+
+        if (!size)
+            continue;
+        if (size < 17 || (size > 17 && !isspace((unsigned char)line[17])))
+            return -1;
+        memcpy(address, line, 17);
+        address[17] = '\0';
+        if (apd_hostapd_parse_mac(address, normalized) != 0)
+            return -1;
+        if (!strcasecmp(normalized, mac))
+            found = 1;
+    }
+    return found;
+}
+
+static int apd_reassoc_acl_write(const char *path, const char *operation,
+                                 const char *mac)
+{
+    char command[80], response[80];
+    size_t length = 0;
+    enum apd_hostapd_stage stage = APD_HOSTAPD_STAGE_NONE;
+
+    snprintf(command, sizeof(command), "DENY_ACL %s_MAC %s", operation, mac);
+    return apd_hostapd_request(path, command, response, sizeof(response),
+        &length, 0, &stage) == APD_HOSTAPD_REQUEST_OK &&
+        (!strcmp(response, "OK") || !strcmp(response, "OK\n")) ? 0 : -1;
+}
+
+static int apd_reassoc_cleanup(struct apd_reassoc_bss *bsses, size_t count,
+                               const char *mac)
+{
+    size_t i;
+    int remaining = 0;
+
+    for (i = 0; i < count; i++) {
+        struct stat st;
+        int present;
+
+        if (!bsses[i].owned)
+            continue;
+        /* A replaced hostapd socket has no ownership relationship with this
+         * lease. Dynamic ACLs on the old BSS died with that socket. */
+        if (lstat(bsses[i].path, &st) != 0) {
+            if (errno == ENOENT)
+                bsses[i].owned = 0;
+            else
+                remaining++;
+            continue;
+        }
+        if (st.st_dev != bsses[i].device || st.st_ino != bsses[i].inode) {
+            bsses[i].owned = 0;
+            continue;
+        }
+        present = apd_reassoc_acl_contains(bsses[i].path, mac);
+        if (present == 1) {
+            apd_reassoc_acl_write(bsses[i].path, "DEL", mac);
+            present = apd_reassoc_acl_contains(bsses[i].path, mac);
+        }
+        if (present == 0)
+            bsses[i].owned = 0;
+        else
+            remaining++;
+    }
+    return remaining;
+}
+
+/* This exec'd, detached process owns both writes and expiry. No APD/AC
+ * callback is needed after it starts, including when its parent is killed. */
+int apd_reassoc_block_worker(int fd)
+{
+    struct apd_reassoc_bss bsses[APD_REASSOC_BSS_MAX] = {0};
+    struct flock lock = { .l_type = F_WRLCK, .l_whence = SEEK_SET };
+    struct json_object *section = NULL, *options, *receipt;
+    const char *mac = NULL, *source, *ssid, *scope, *target, *text;
+    char input[8192], path[sizeof(bsses[0].path)], normalized[18];
+    char *end;
+    struct pollfd pfd = { .fd = fd, .events = POLLIN };
+    int lock_fd = -1, seconds = 0, ok = 0, owned = 0, pending = 0;
+    int target_frequency_mhz = 0;
+    int64_t deadline = 0, expires_at = 0, not_after;
+    size_t count = 0, i;
+    ssize_t length;
+    const char *reason = "reassoc_block_invalid";
+
+    if (fd < 3 || poll(&pfd, 1, 5000) != 1 ||
+        (length = recv(fd, input, sizeof(input) - 1, 0)) <= 0)
+        return 1;
+    input[length] = '\0';
+    signal(SIGPIPE, SIG_IGN);
+    signal(SIGTERM, apd_reassoc_signal);
+    signal(SIGINT, apd_reassoc_signal);
+    signal(SIGHUP, apd_reassoc_signal);
+    if (!apd_hostapd_reassoc_backend_safe()) {
+        reason = "reassoc_block_native_backend_quarantined";
+        goto reply;
+    }
+    section = json_tokener_parse(input);
+    options = json_object_object_get(section, "options");
+    mac = json_object_get_string(json_object_object_get(options, "station_mac"));
+    source = json_object_get_string(json_object_object_get(options, "source_bssid"));
+    ssid = json_object_get_string(json_object_object_get(options, "source_ssid"));
+    scope = json_object_get_string(json_object_object_get(options, "block_scope"));
+    target = json_object_get_string(json_object_object_get(options, "target_bssid"));
+    text = json_object_get_string(json_object_object_get(options, "block_duration_sec"));
+    if (!mac || !source || !ssid || !ssid[0] || strlen(ssid) > 32 ||
+        !scope || (strcmp(scope, "bss") && strcmp(scope, "ap") &&
+                   strcmp(scope, "band") && strcmp(scope, "lower")) ||
+        apd_hostapd_parse_mac(source, normalized) != 0 ||
+        apd_hostapd_parse_mac(target, normalized) != 0 || !text)
+        goto reply;
+    seconds = (int)strtol(text, &end, 10);
+    if (*end || seconds < 1 || seconds > 30)
+        goto reply;
+    if (!strcmp(scope, "lower")) {
+        text = json_object_get_string(json_object_object_get(
+            options, "target_frequency_mhz"));
+        if (!text)
+            goto reply;
+        target_frequency_mhz = (int)strtol(text, &end, 10);
+        if (*end || !apd_reassoc_band_rank(target_frequency_mhz))
+            goto reply;
+    }
+    text = json_object_get_string(json_object_object_get(options, "block_not_after"));
+    if (!text)
+        goto reply;
+    not_after = strtoll(text, &end, 10);
+    if (*end || not_after < (int64_t)time(NULL) ||
+        not_after > (int64_t)time(NULL) + 60) {
+        reason = "reassoc_block_expired";
+        goto reply;
+    }
+    lock_fd = apd_reassoc_lock_open(mac);
+    if (lock_fd < 0 || fcntl(lock_fd, F_SETLK, &lock) != 0) {
+        reason = "reassoc_block_already_active";
+        goto reply;
+    }
+    if (apd_phase3_ctrl_path(json_object_get_string(
+            json_object_object_get(section, "section")), path, sizeof(path)) != 0 ||
+        apd_reassoc_scope(path, source, ssid, scope, target,
+                          target_frequency_mhz, bsses, &count) != 0 ||
+        !apd_phase4_station_associated(path, mac)) {
+        reason = "reassoc_block_source_or_scope_changed";
+        goto reply;
+    }
+    for (i = 0; i < count; i++) {
+        int present = apd_reassoc_acl_contains(bsses[i].path, mac);
+
+        if (present < 0) {
+            reason = "reassoc_block_acl_unavailable";
+            goto reply;
+        }
+        bsses[i].owned = present ? 0 : 2; /* Planned, but not written yet. */
+    }
+    deadline = apd_monotonic_ms() + seconds * 1000;
+    expires_at = (int64_t)time(NULL) + seconds;
+    for (i = 0; i < count; i++) {
+        if (apd_reassoc_cancelled || apd_monotonic_ms() >= deadline ||
+            (int64_t)time(NULL) > not_after) {
+            reason = "reassoc_block_cancelled";
+            goto reply;
+        }
+        if (bsses[i].owned != 2)
+            continue;
+        /* A lost ACK may still have installed the entry. Claim before send. */
+        bsses[i].owned = 1;
+        owned++;
+        if (apd_reassoc_acl_write(bsses[i].path, "ADD", mac) != 0 ||
+            apd_reassoc_acl_contains(bsses[i].path, mac) != 1) {
+            reason = "reassoc_block_install_failed";
+            goto reply;
+        }
+    }
+    if (apd_phase4_station_associated(path, mac) &&
+        apd_phase4_send_deauth(path, mac, 5) != 0) {
+        reason = "reassoc_block_disconnect_failed";
+        goto reply;
+    }
+    ok = 1;
+    reason = "reassoc_block_installed";
+reply:
+    for (i = 0; i < count; i++)
+        if (bsses[i].owned == 2)
+            bsses[i].owned = 0;
+    if (!ok)
+        pending = apd_reassoc_cleanup(bsses, count, mac);
+    receipt = json_object_new_object();
+    json_object_object_add(receipt, "ok", json_object_new_boolean(ok));
+    json_object_object_add(receipt, "reason", json_object_new_string(reason));
+    json_object_object_add(receipt, "worker_pid", json_object_new_int(getpid()));
+    json_object_object_add(receipt, "bss_count", json_object_new_int((int)count));
+    json_object_object_add(receipt, "owned_entries", json_object_new_int(owned));
+    json_object_object_add(receipt, "duration_sec", json_object_new_int(seconds));
+    json_object_object_add(receipt, "expires_at", json_object_new_int64(expires_at));
+    json_object_object_add(receipt, "cleanup_pending", json_object_new_boolean(pending));
+    text = json_object_to_json_string_ext(receipt, JSON_C_TO_STRING_PLAIN);
+    if (send(fd, text, strlen(text), MSG_NOSIGNAL) != (ssize_t)strlen(text))
+        apd_reassoc_cancelled = 1;
+    close(fd);
+    json_object_put(receipt);
+    while (ok && !apd_reassoc_cancelled && apd_monotonic_ms() < deadline) {
+        int remaining = (int)(deadline - apd_monotonic_ms());
+        poll(NULL, 0, remaining > 100 ? 100 : remaining);
+    }
+    /* Keep ownership until every reachable original BSS confirms removal.
+     * If hostapd is briefly busy, recovery continues without the controller. */
+    while (apd_reassoc_cleanup(bsses, count, mac) > 0)
+        poll(NULL, 0, 250);
+    if (owned)
+        syslog(LOG_NOTICE, "apd reassoc_block released station=%s entries=%d",
+               mac, owned);
+    if (lock_fd >= 0)
+        close(lock_fd);
+    json_object_put(section);
+    return ok ? 0 : 1;
+}
+
+static int apd_reassoc_block_start(struct json_object *section,
+                                   struct json_object **receipt)
+{
+    int pair[2], status;
+    long max_fd = sysconf(_SC_OPEN_MAX);
+    pid_t child, waited;
+    const char *request = json_object_to_json_string_ext(
+        section, JSON_C_TO_STRING_PLAIN);
+    char response[2048];
+    struct pollfd pfd;
+    ssize_t length;
+
+    *receipt = NULL;
+    if (max_fd < 0 || socketpair(AF_UNIX, SOCK_DGRAM, 0, pair) != 0)
+        return -1;
+    fcntl(pair[0], F_SETFD, FD_CLOEXEC);
+    fcntl(pair[1], F_SETFD, FD_CLOEXEC);
+    child = fork();
+    if (child == 0) {
+        char *const argv[] = {
+            (char *)APD_REASSOC_WORKER_EXE, "--reassoc-block-worker", "3", NULL
+        };
+        int null_fd, next;
+        pid_t detached;
+
+        if (dup2(pair[1], 3) < 0 || fcntl(3, F_SETFD, 0) != 0 ||
+            setsid() < 0)
+            _exit(1);
+        detached = fork();
+        if (detached < 0)
+            _exit(1);
+        if (detached > 0)
+            _exit(0);
+        null_fd = open("/dev/null", O_RDWR);
+        if (null_fd < 0)
+            _exit(1);
+        for (next = 0; next < 3; next++)
+            if (dup2(null_fd, next) < 0)
+                _exit(1);
+        for (next = 4; next < max_fd; next++)
+            close(next);
+        execv(argv[0], argv);
+        _exit(1);
+    }
+    close(pair[1]);
+    if (child < 0) {
+        close(pair[0]);
+        return -1;
+    }
+    do {
+        waited = waitpid(child, &status, 0);
+    } while (waited < 0 && errno == EINTR);
+    pfd.fd = pair[0];
+    pfd.events = POLLIN;
+    pfd.revents = 0;
+    if (waited != child || !WIFEXITED(status) || WEXITSTATUS(status) != 0 ||
+        strlen(request) >= 8192 ||
+        send(pair[0], request, strlen(request), MSG_NOSIGNAL) !=
+            (ssize_t)strlen(request) || poll(&pfd, 1, 12000) != 1 ||
+        (length = recv(pair[0], response, sizeof(response) - 1, 0)) <= 0) {
+        close(pair[0]);
+        return -1;
+    }
+    close(pair[0]);
+    response[length] = '\0';
+    *receipt = json_tokener_parse(response);
+    return json_object_get_boolean(
+        json_object_object_get(*receipt, "ok")) ? 0 : -1;
+}
+
+/* Process hostapd action sections from a config candidate.
+ * Each section has "hostapd_action_type" in its options and uses the BSS
+ * interface name as the section identifier.  Returns 0 if all actions
+ * succeeded, -1 if any failed. */
+static int apd_config_apply_hostapd_actions(struct json_object *sections,
+                                           struct json_object **block_receipt)
+{
+    size_t i, count;
+    int failures = 0;
+
+    if (!sections || !json_object_is_type(sections, json_type_array))
+        return 0;
+    pthread_mutex_lock(&g_apd_roaming_lock);
+    count = json_object_array_length(sections);
+    for (i = 0; i < count; i++) {
+        struct json_object *section = json_object_array_get_idx(sections, i);
+        struct json_object *options = NULL;
+        struct json_object *action_type_obj = NULL;
+        const char *action_type;
+        const char *bss_iface;
+        char ctrl_path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+
+        if (!section)
+            continue;
+        json_object_object_get_ex(section, "options", &options);
+        if (!options)
+            continue;
+        action_type_obj = json_object_object_get(options,
+                                                  "hostapd_action_type");
+        if (!action_type_obj)
+            continue;
+        action_type = json_object_get_string(action_type_obj);
+        bss_iface = json_object_get_string(
+            json_object_object_get(section, "section"));
+        if (!bss_iface || !action_type)
+            continue;
+        if (!strcmp(action_type, "reassoc_block")) {
+            if (apd_reassoc_block_start(section, block_receipt) != 0)
+                failures++;
+            continue;
+        }
+        if (apd_phase3_ctrl_path(bss_iface, ctrl_path,
+                                  sizeof(ctrl_path)) != 0) {
+            failures++;
+            continue;
+        }
+        if (!strcmp(action_type, "set_neighbor")) {
+            const char *bssid = json_object_get_string(
+                json_object_object_get(options, "neighbor_bssid"));
+            const char *ssid = json_object_get_string(
+                json_object_object_get(options, "neighbor_ssid"));
+            const char *opclass = json_object_get_string(
+                json_object_object_get(options, "neighbor_opclass"));
+            const char *channel = json_object_get_string(
+                json_object_object_get(options, "neighbor_channel"));
+            const char *phy = json_object_get_string(
+                json_object_object_get(options, "neighbor_phy"));
+            if (!bssid || !ssid || !opclass || !channel || !phy ||
+                !apd_phase3_neighbor_owner(ctrl_path, options) ||
+                apd_phase3_set_neighbor(ctrl_path, bssid, ssid,
+                                         atoi(opclass), atoi(channel),
+                                         atoi(phy), json_object_get_int(
+                                             json_object_object_get(
+                                                 options, "neighbor_ft"))) != 0)
+                failures++;
+        } else if (!strcmp(action_type, "del_neighbor")) {
+            const char *bssid = json_object_get_string(
+                json_object_object_get(options, "neighbor_bssid"));
+            if (!bssid ||
+                apd_phase3_del_neighbor(ctrl_path, bssid) != 0)
+                failures++;
+        } else if (!strcmp(action_type, "btm_request")) {
+            const char *sta_mac = json_object_get_string(
+                json_object_object_get(options, "station_mac"));
+            const char *target_bssid = json_object_get_string(
+                json_object_object_get(options, "target_bssid"));
+            struct json_object *validity_obj =
+                json_object_object_get(options, "btm_validity");
+            struct json_object *opclass_obj =
+                json_object_object_get(options, "target_opclass");
+            struct json_object *channel_obj =
+                json_object_object_get(options, "target_channel");
+            struct json_object *phy_obj =
+                json_object_object_get(options, "target_phy");
+            const char *target_bssid_2 = json_object_get_string(
+                json_object_object_get(options, "target_bssid_2"));
+            struct json_object *opclass_obj_2 =
+                json_object_object_get(options, "target_opclass_2");
+            struct json_object *channel_obj_2 =
+                json_object_object_get(options, "target_channel_2");
+            struct json_object *phy_obj_2 =
+                json_object_object_get(options, "target_phy_2");
+            struct json_object *imminent_obj =
+                json_object_object_get(options, "btm_disassoc_imminent");
+            struct json_object *timer_obj =
+                json_object_object_get(options, "btm_disassoc_timer");
+            int validity = validity_obj ?
+                json_object_get_int(validity_obj) : 0;
+            int have_second = target_bssid_2 && target_bssid_2[0];
+            if (!sta_mac || !target_bssid ||
+                !opclass_obj || !channel_obj || !phy_obj ||
+                (have_second && (!opclass_obj_2 || !channel_obj_2 || !phy_obj_2)) ||
+                apd_phase3_send_btm(ctrl_path, sta_mac, target_bssid,
+                                     json_object_get_int(opclass_obj),
+                                     json_object_get_int(channel_obj),
+                                     json_object_get_int(phy_obj),
+                                     json_object_get_int(json_object_object_get(
+                                         options, "target_ft")), validity,
+                                     target_bssid_2,
+                                     opclass_obj_2 ? json_object_get_int(opclass_obj_2) : 0,
+                                     channel_obj_2 ? json_object_get_int(channel_obj_2) : 0,
+                                     phy_obj_2 ? json_object_get_int(phy_obj_2) : 0,
+                                     json_object_get_int(json_object_object_get(
+                                         options, "target_ft_2")),
+                                     imminent_obj ? json_object_get_int(imminent_obj) : 0,
+                                     timer_obj ? json_object_get_int(timer_obj) : 0) != 0)
+                failures++;
+        } else if (!strcmp(action_type, "beacon_request")) {
+            /* Phase 2: ask the station to measure a candidate channel.  The
+             * answer is asynchronous, so success here means "the request was
+             * accepted", never "we have a measurement". */
+            const char *sta_mac = json_object_get_string(
+                json_object_object_get(options, "station_mac"));
+            struct json_object *opclass_obj =
+                json_object_object_get(options, "measure_opclass");
+            struct json_object *channel_obj =
+                json_object_object_get(options, "measure_channel");
+            struct json_object *duration_obj =
+                json_object_object_get(options, "measure_duration_tu");
+            const char *measure_bssid = json_object_get_string(
+                json_object_object_get(options, "measure_bssid"));
+            if (!sta_mac || !opclass_obj || !channel_obj ||
+                apd_phase2_request_beacon(ctrl_path, sta_mac,
+                                          json_object_get_int(opclass_obj),
+                                          json_object_get_int(channel_obj),
+                                          duration_obj ?
+                                              json_object_get_int(duration_obj) :
+                                              0,
+                                          measure_bssid,
+                                          json_object_get_string(
+                                              json_object_object_get(
+                                                  options, "measure_ssid"))) < 0) {
+                failures++;
+                break;
+            }
+        } else if (!strcmp(action_type, "deauth_request")) {
+            /* Phase 4.  Every authorisation decision was made by the AC before
+             * this section was ever emitted; APD's job is to refuse anything
+             * malformed and to confirm the station is really here. */
+            const char *sta_mac = json_object_get_string(
+                json_object_object_get(options, "station_mac"));
+            struct json_object *reason_obj =
+                json_object_object_get(options, "deauth_reason");
+            if (!sta_mac || !reason_obj ||
+                apd_phase4_send_deauth(ctrl_path, sta_mac,
+                                       json_object_get_int(reason_obj)) != 0)
+                failures++;
+        } else {
+            failures++;
+        }
+    }
+    pthread_mutex_unlock(&g_apd_roaming_lock);
+    return failures > 0 ? -1 : 0;
+}
+
+/* Mirror the executor's failure shape for rejections raised here, so a caller
+ * cannot tell from the result whether the executor or this split step said no. */
+static int apd_openwrt_apply_fail(struct json_object **out, const char *reason)
+{
+    struct json_object *result = json_object_new_object();
+
+    json_object_object_add(result, "operation", json_object_new_string("apply"));
+    json_object_object_add(result, "ok", json_object_new_boolean(0));
+    json_object_object_add(result, "reason", json_object_new_string(reason));
+    if (out)
+        *out = result;
+    else
+        json_object_put(result);
+    return -1;
+}
+
 static int apd_openwrt_apply(struct json_object *candidate,
                              struct json_object **out)
 {
     struct apd_config_paths paths = { "/sbin/uci", "/sbin/wifi",
                                       "/etc/config",
                                       "/tmp/dreamingwrt-apd-config-candidate" };
-    return apd_config_apply(&paths, candidate, out);
+    struct json_object *sections = NULL;
+    struct json_object *uci_sections = json_object_new_array();
+    struct json_object *hostapd_sections = json_object_new_array();
+    struct json_object *uci_candidate = NULL;
+    size_t i, count;
+    int rc;
+
+    /* Separate sections into UCI config and hostapd actions. */
+    json_object_object_get_ex(candidate, "sections", &sections);
+    if (sections && json_object_is_type(sections, json_type_array)) {
+        count = json_object_array_length(sections);
+        for (i = 0; i < count; i++) {
+            struct json_object *sec = json_object_array_get_idx(sections, i);
+            struct json_object *opts = NULL;
+
+            json_object_object_get_ex(sec, "options", &opts);
+            if (opts && json_object_object_get(opts, "hostapd_action_type"))
+                json_object_array_add(hostapd_sections, json_object_get(sec));
+            else
+                json_object_array_add(uci_sections, json_object_get(sec));
+        }
+    }
+
+    if (json_object_array_length(uci_sections) == 0) {
+        json_object_put(uci_sections);
+        rc = apd_config_hostapd_actions_validate(candidate, out);
+    } else {
+        /* Build a UCI-only candidate for the config executor.
+         *
+         * The digest has to be recomputed over the subset, not copied from
+         * the parent.  The executor verifies the digest against the sections
+         * it is handed, so a candidate that mixes UCI options with
+         * hostapd-action sections -- which every multi-AP roaming apply
+         * produces, since the 11r/k/v options and the SET_NEIGHBOR actions go
+         * into one array and are digested together -- would be rejected with
+         * candidate_digest_mismatch before touching anything.
+         *
+         * Recomputing is only safe because the parent digest is verified
+         * first, immediately below: the subset is thereby known to be part of
+         * an authentic candidate rather than something assembled locally. */
+        {
+            struct json_object *parent_sections = NULL;
+            struct json_object *parent_digest = NULL;
+            char expected[APD_CONFIG_DIGEST_MAX];
+            char subset[APD_CONFIG_DIGEST_MAX];
+
+            parent_digest = json_object_object_get(candidate,
+                                                   "candidate_digest");
+            json_object_object_get_ex(candidate, "sections", &parent_sections);
+            if (!parent_digest || !parent_sections ||
+                apd_config_candidate_digest(parent_sections, expected,
+                                            sizeof(expected)) != 0 ||
+                strcmp(json_object_get_string(parent_digest), expected)) {
+                json_object_put(uci_sections);
+                json_object_put(hostapd_sections);
+                return apd_openwrt_apply_fail(out,
+                                              "candidate_digest_mismatch");
+            }
+            uci_candidate = json_object_new_object();
+            json_object_object_add(uci_candidate, "format",
+                json_object_get(json_object_object_get(candidate, "format")));
+            json_object_object_add(uci_candidate, "sections", uci_sections);
+            if (apd_config_candidate_digest(uci_sections, subset,
+                                            sizeof(subset)) != 0) {
+                json_object_put(uci_candidate);
+                json_object_put(hostapd_sections);
+                return apd_openwrt_apply_fail(out, "digest_failed");
+            }
+            json_object_object_add(uci_candidate, "candidate_digest",
+                                   json_object_new_string(subset));
+            rc = apd_config_apply(&paths, uci_candidate, out);
+            json_object_put(uci_candidate);
+        }
+    }
+
+    /* Process hostapd actions after UCI config is applied and reloaded. */
+    if (rc == 0 && json_object_array_length(hostapd_sections) > 0) {
+        struct json_object *block_receipt = NULL;
+        int ha_rc = apd_config_apply_hostapd_actions(hostapd_sections, &block_receipt);
+        int neighbors_only = 1;
+
+        for (i = 0; i < json_object_array_length(hostapd_sections); i++) {
+            struct json_object *opts = json_object_object_get(
+                json_object_array_get_idx(hostapd_sections, i), "options");
+
+            if (strcmp(json_object_get_string(json_object_object_get(
+                    opts, "hostapd_action_type")), "set_neighbor"))
+                neighbors_only = 0;
+        }
+
+        rc = ha_rc;
+        if (out && *out) {
+            struct json_object *digest =
+                json_object_object_get(candidate, "candidate_digest");
+
+            json_object_object_add(*out, "operation",
+                                   json_object_new_string("hostapd_actions"));
+            json_object_object_add(*out, "ok", json_object_new_boolean(rc == 0));
+            json_object_object_add(*out, "match", json_object_new_boolean(rc == 0));
+            json_object_object_add(*out, "candidate_digest", json_object_get(digest));
+            if (rc == 0)
+                json_object_object_add(*out, "readback_digest", json_object_get(digest));
+            json_object_object_add(*out, "evidence_type",
+                json_object_new_string(block_receipt ?
+                    "hostapd_temporary_reassociation_block" : neighbors_only ?
+                    "hostapd_neighbor_readback" : "hostapd_command_ack"));
+            json_object_object_add(*out, "reason", json_object_new_string(
+                rc != 0 ? "hostapd_action_failed" :
+                neighbors_only ? "hostapd_neighbors_verified" :
+                                 "hostapd_commands_accepted"));
+            if (block_receipt)
+                json_object_object_add(*out, "reassoc_block",
+                                       json_object_get(block_receipt));
+        }
+        json_object_put(block_receipt);
+    }
+    json_object_put(hostapd_sections);
+    return rc;
 }
+#endif
+#ifndef APD_HOSTAPD_STANDALONE_TEST
 
 static int apd_openwrt_readback(struct json_object *candidate,
                                 struct json_object **out)

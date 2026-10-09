@@ -1,0 +1,185 @@
+html,body { height:100%; margin:0; }
+body { color:var(--color-text-primary); }
+.nas-shell { box-sizing:border-box; height:auto; min-height:100%; padding:var(--dwrt-space-4,16px); display:flex; flex-direction:column; gap:var(--dwrt-space-3,12px); }
+.nas-shell > * { flex-shrink:0; }
+.nas-toolbar { display:flex; align-items:center; gap:8px; flex-wrap:wrap; }
+.nas-toolbar > button { min-width:84px; white-space:nowrap; }
+.nas-toolbar h1 { margin:0; font-size:18px; }
+.nas-toolbar .dwrt-kit-field { min-width:120px; flex:1; margin:0; }
+.nas-notice { margin:0; overflow-wrap:anywhere; font-size:13px; }
+.nas-content { min-width:0; }
+.nas-grid { display:grid; grid-template-columns:repeat(auto-fill,minmax(165px,1fr)); gap:12px; }
+.nas-item { min-width:0; display:flex; flex-direction:column; gap:6px; border-bottom:1px solid var(--color-border-subtle); padding-bottom:12px; }
+.nas-item h2 { font-size:14px; margin:0; overflow-wrap:anywhere; }
+.nas-item img { width:100%; height:150px; object-fit:cover; border-radius:var(--dwrt-radius-md,8px); }
+.nas-item small { color:var(--color-text-secondary); overflow-wrap:anywhere; }
+.nas-item-actions { display:flex; flex-wrap:wrap; gap:4px; }
+.nas-table-wrap { overflow:auto; max-width:100%; }
+.nas-table { width:100%; border-collapse:collapse; font-size:13px; }
+.nas-table th,.nas-table td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--color-border-subtle); overflow-wrap:anywhere; }
+.nas-player { display:flex; flex-direction:column; gap:8px; }
+.nas-player video { max-height:45vh; width:100%; }
+.nas-player audio { width:100%; }
+.nas-jobs { margin-top:auto; font-size:13px; }
+.nas-jobs ul { padding:0; list-style:none; }
+.nas-jobs li { border-top:1px solid var(--color-border-subtle); padding:8px 0; overflow-wrap:anywhere; }
+.nas-result { max-height:240px; overflow:auto; white-space:pre-wrap; overflow-wrap:anywhere; }
+.nas-empty { padding:32px 0; color:var(--color-text-secondary); }
+.nas-selection { display:flex; align-items:center; gap:6px; }
+.nas-selection input { width:20px; height:20px; }
+.nas-path { overflow-wrap:anywhere; }
+@media(max-width:480px) { .nas-shell { padding:12px; } .nas-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; } .nas-item img { height:112px; } .nas-toolbar>button { flex:1; } .nas-toolbar .dwrt-kit-field { min-width:100%; } .nas-table th,.nas-table td { padding:8px 5px; } }
+
+.nas-lyrics { white-space:pre-wrap; overflow-wrap:anywhere; max-height:240px; overflow:auto; font:inherit; }
+.nas-preview-missing { display:flex; align-items:center; justify-content:center; min-height:100px; font-size:12px; color:var(--color-text-secondary); }
+
+.nas-queue ol { padding:0; list-style:none; max-height:240px; overflow:auto; }
+.nas-queue li { display:flex; align-items:center; gap:8px; justify-content:space-between; padding:8px 0; border-bottom:1px solid var(--color-border-subtle); }
+.nas-queue li>button { min-width:0; white-space:normal; overflow-wrap:anywhere; text-align:left; }
+.nas-queue li>div { display:flex; gap:4px; flex-shrink:0; }
+.nas-queue [aria-current="true"] { border-color:var(--color-accent); }
+.nas-lyrics .dwrt-kit-button { display:block; width:100%; text-align:left; white-space:normal; overflow-wrap:anywhere; }
+.nas-lyrics [aria-current="true"] { color:var(--color-accent); font-weight:700; }
+.nas-player[hidden] { display:none; }
+@media(max-width:480px) { .nas-queue li { align-items:stretch; flex-direction:column; } .nas-queue li>div { flex-wrap:wrap; } }
+
+.nas-text-preview { white-space: pre-wrap; overflow-wrap: anywhere; font-family: var(--font-mono, monospace); font-size: 13px; line-height: 1.6; }
+
+.nas-sheet-body { display:flex; flex-direction:column; gap:16px; padding:16px var(--dwrt-kit-sheet-padding-x); }
+.nas-sheet-body > * { flex-shrink:0; margin:0; }
+.nas-sheet-body [data-sheet-error]:empty { display:none; }
+
+.nas-layout { flex-direction:row; gap:0; height:100dvh; min-height:0; overflow:hidden; padding:0; }
+.nas-rail { min-height:0; }
+.nas-rail h1 { margin:0; padding:18px 20px; min-height:60px; display:flex; align-items:center; gap:12px; font-size:16px; font-weight:600; border-bottom:1px solid var(--color-border-subtle); }
+.nas-rail h1 svg { width:22px; height:22px; flex:none; color:var(--color-accent); }
+.nas-layout .nas-rail { padding:0; }
+.nas-rail .dwrt-rail-list { margin:0; padding:10px 0; gap:2px; }
+.nas-rail .dwrt-rail-item { min-height:48px; padding:10px 20px; gap:14px; }
+.nas-rail .dwrt-rail-item-title { font-size:14px; font-weight:400; }
+.nas-rail .dwrt-rail-item.is-active .dwrt-rail-item-title { font-weight:500; }
+.nas-nav-icon { flex:none; width:20px; height:20px; display:flex; align-items:center; }
+.nas-nav-icon svg { width:20px; height:20px; }
+.nas-nav-count { margin-left:auto; font-size:12px; font-variant-numeric:tabular-nums; color:var(--color-text-secondary); }
+.nas-search-field { position:relative; margin:0; }
+.nas-search-field > svg { position:absolute; left:12px; top:50%; transform:translateY(-50%); width:16px; height:16px; color:var(--color-text-secondary); pointer-events:none; z-index:1; }
+.nas-search-field input { padding-left:36px; }
+.nas-menu { position:relative; flex:none; }
+.nas-menu > summary { display:flex; align-items:center; justify-content:center; width:44px; height:44px; cursor:pointer; list-style:none; border-radius:6px; }
+.nas-menu > summary::-webkit-details-marker { display:none; }
+.nas-menu > summary:hover { background:var(--dwrt-interactive-hover-bg); }
+.nas-menu > div { position:absolute; z-index:30; right:0; top:calc(100% + 4px); width:max-content; max-width:260px; padding:6px; border:1px solid var(--color-border-control); border-radius:var(--app-radius-compact,8px); background:var(--color-surface-solid); box-shadow:0 8px 24px color-mix(in srgb,var(--color-text-primary) 12%,transparent); display:flex; flex-direction:column; }
+.nas-menu > div .dwrt-kit-button { justify-content:flex-start; border-color:transparent; background:transparent; width:100%; font-weight:400; }
+.nas-toolbar svg,.nas-item-actions svg { width:18px; height:18px; flex:none; }
+.nas-main { display:flex; flex-direction:column; flex:1; min-width:0; min-height:0; padding:var(--app-page-gutter,12px); gap:8px; }
+.nas-main > * { flex:none; min-width:0; }
+.nas-main > .nas-content { flex:1; min-height:0; overflow:auto; }
+.nas-layout .nas-toolbar { gap:8px; padding:0 0 8px; align-items:center; border-bottom:1px solid var(--color-border-subtle); }
+.nas-layout .nas-toolbar > button { min-width:0; flex:none; }
+.nas-toolbar .nas-search { flex:1 1 120px; width:120px; min-width:80px; }
+.nas-toolbar > .dwrt-kit-select { width:auto; max-width:150px; }
+.nas-toolbar .dwrt-kit-button { padding:6px 12px; }
+.nas-more { position:relative; }
+.nas-more > summary { cursor:pointer; min-height:36px; display:flex; align-items:center; padding:6px 8px; white-space:nowrap; }
+.nas-more > div { display:flex; flex-wrap:wrap; gap:4px; padding:4px 0; }
+.nas-toolbar > .nas-more[open] { flex:1 1 100%; }
+.nas-statusbar { display:flex; justify-content:space-between; flex-wrap:wrap; gap:4px 12px; border-top:1px solid var(--color-border-subtle); padding-top:8px; font-size:12px; color:var(--color-text-secondary); }
+.nas-selectionbar { display:flex; align-items:center; flex-wrap:wrap; gap:4px; padding:4px 0; }
+.nas-selectionbar > span { margin-right:8px; font-size:13px; }
+.nas-notice:empty { display:none; }
+.nas-empty { padding:32px 16px; text-align:center; display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:240px; height:100%; }
+.nas-empty strong { color:var(--color-text-primary); font-size:20px; font-weight:500; }
+.nas-empty p { max-width:440px; margin:12px 0 24px; font-size:14px; }
+.nas-empty-icon { display:flex; justify-content:center; margin-bottom:24px; color:var(--color-text-secondary); }
+.nas-empty-icon svg { width:64px; height:64px; stroke-width:1.5; }
+.nas-shell .dwrt-kit-button { font-weight:500; }
+.nas-layout:not(:has(.download-toolbar)) .nas-main { padding:0; gap:0; }
+.nas-layout .nas-library-toolbar { min-height:60px; padding:8px 16px; flex-wrap:nowrap; justify-content:flex-start; }
+.nas-library-toolbar .nas-search-field { max-width:320px; min-width:120px; }
+.nas-library-toolbar > .nas-menu { margin-left:auto; }
+.nas-layout:not(:has(.download-toolbar)) .nas-content { padding:16px 20px; }
+.nas-layout:not(:has(.download-toolbar)) .nas-statusbar { padding:10px 20px; }
+.nas-layout:not(:has(.download-toolbar)) .nas-notice:not(:empty),.nas-layout:not(:has(.download-toolbar)) .nas-selectionbar { padding:8px 20px; }
+.nas-layout .nas-player { padding:12px 20px; }
+.nas-job-panel { font-size:12px; max-height:25vh; overflow:auto; }
+.nas-job-panel summary { cursor:pointer; }
+.nas-job-panel:not(:has(li)) { display:none; }
+.download-table td { vertical-align:middle; }
+.download-name { display:block; font-weight:600; }
+.download-progress { display:flex; align-items:center; gap:8px; margin-block:6px; font-size:12px; }
+.download-progress progress { width:100%; max-width:300px; height:6px; accent-color:var(--color-accent); }
+.download-speed { min-width:100px; font-variant-numeric:tabular-nums; }
+.download-speed span,.download-speed small { display:block; white-space:nowrap; }
+.download-table small { color:var(--color-text-secondary); }
+@media(max-width:767px) {
+ .nas-layout { flex-direction:column; }
+ .nas-layout .nas-rail { flex:none; width:100%; max-height:140px; padding:4px 8px; border-right:0; border-bottom:1px solid var(--color-border-subtle); }
+ .nas-rail h1 { display:none; }
+ .nas-rail .dwrt-rail-list { flex-direction:row; overflow:auto; flex:none; padding:0; gap:4px; }
+ .nas-rail .dwrt-rail-item { width:auto; flex:none; min-height:44px; }
+ .nas-rail .dwrt-rail-item { padding:8px 12px; gap:8px; }
+ .nas-layout .nas-library-toolbar { flex-wrap:wrap; padding:8px; }
+ .nas-library-toolbar .nas-search-field { min-width:120px; flex:1; }
+ .nas-layout:not(:has(.download-toolbar)) .nas-content { padding:12px; }
+ .nas-rail .dwrt-rail-group-label { display:none; }
+ .nas-main { padding:8px; }
+ .nas-layout .nas-toolbar { flex-wrap:wrap; }
+ .nas-more > summary { min-height:44px; }
+ .download-table .download-speed { display:none; }
+ .download-table th:nth-child(3) { display:none; }
+ .download-table td:last-child { width:80px; }
+}
+.nas-date-group { margin-bottom:24px; }
+.nas-date-group > header { display:flex; justify-content:space-between; align-items:center; margin:8px 0 12px; }
+.nas-date-group > header h2 { font-size:14px; margin:0; }
+.nas-date-group > header span,.nas-scope-note { font-size:12px; color:var(--color-text-secondary); }
+.nas-grid.nas-photo-grid { grid-template-columns:repeat(auto-fill,minmax(128px,1fr)); gap:8px; }
+.nas-media-card { gap:4px; border:0; padding:0 0 8px; }
+.nas-media-card .nas-art { position:relative; aspect-ratio:1; overflow:hidden; border-radius:var(--app-radius-compact,8px); }
+.nas-art-open { border:0; padding:0; background:transparent; cursor:pointer; width:100%; height:100%; display:block; color:inherit; }
+.nas-media-card img { width:100%; height:100%; border-radius:0; object-fit:cover; display:block; }
+.nas-media-card h2 { font-size:12px; overflow:hidden; white-space:nowrap; text-overflow:ellipsis; font-weight:500; }
+.nas-media-card .nas-selection { position:absolute; left:8px; top:8px; padding:0; min-width:32px; min-height:32px; }
+.nas-media-card .nas-selection input { accent-color:var(--color-accent); width:20px; height:20px; }
+.nas-media-card.is-selected .nas-art { outline:2px solid var(--color-accent); outline-offset:-2px; }
+.nas-favorite-label { position:absolute; bottom:8px; right:8px; font-size:12px; padding:2px 6px; color:var(--color-text-primary); background:var(--color-surface-solid); border-radius:4px; pointer-events:none; }
+.nas-art .nas-preview-missing { height:100%; padding:16px; border:1px solid var(--color-border-subtle); }
+.nas-poster-grid { grid-template-columns:repeat(auto-fill,minmax(140px,1fr)); gap:16px; }
+.nas-poster-grid .nas-art { aspect-ratio:2/3; }
+.nas-poster-grid h2 { font-size:14px; font-weight:600; }
+.nas-track { display:flex; gap:8px; align-items:center; }
+.nas-track > div:last-child { min-width:0; }
+.nas-track .dwrt-kit-button { text-align:left; white-space:normal; padding:4px; }
+.nas-track small { display:block; padding-left:4px; }
+.nas-track-art { width:40px; height:40px; flex:none; overflow:hidden; border-radius:4px; }
+.nas-track-art img { width:100%; height:100%; object-fit:cover; }
+.nas-track-art .nas-preview-missing { min-height:40px; height:40px; font-size:10px; text-align:center; }
+.nas-track-table th:nth-child(4),.nas-track-table td:nth-child(4) { white-space:nowrap; }
+.nas-album { display:flex; flex-direction:column; text-align:left; align-items:stretch; gap:8px; padding:8px; }
+.nas-album img { width:100%; aspect-ratio:1; object-fit:cover; }
+.nas-detail { display:grid; grid-template-columns:120px minmax(0,1fr); gap:16px; }
+.nas-detail-poster img { width:100%; aspect-ratio:2/3; object-fit:cover; }
+.nas-detail h2 { margin:0; font-size:18px; }
+.nas-load-more { display:flex; justify-content:center; padding:16px; }
+.nas-main .nas-player { border-top:1px solid var(--color-border-subtle); padding-top:8px; max-height:45%; overflow:auto; }
+.nas-main .nas-player .nas-toolbar { border:0; padding:0; }
+.nas-player .dwrt-kit-field { flex:none; min-width:0; }
+.nas-player .dwrt-kit-select { width:auto; min-width:0; }
+.nas-player-idle { padding:12px 0; color:var(--color-text-secondary); font-size:13px; }
+.nas-playback-details { font-size:12px; }
+.nas-playback-details summary { cursor:pointer; padding-block:4px; }
+@media(max-width:767px) { .nas-grid.nas-photo-grid { grid-template-columns:repeat(auto-fill,minmax(104px,1fr)); } .nas-track-table td:nth-child(3),.nas-track-table th:nth-child(3) { display:none; } .nas-main .nas-player { max-height:40%; } }
+@media(max-width:400px) { .nas-poster-grid { grid-template-columns:repeat(2,minmax(0,1fr)); gap:8px; } .nas-detail { grid-template-columns:80px minmax(0,1fr); gap:12px; } }
+.nas-archive-shell { height:100dvh; min-height:0; overflow:hidden; gap:8px; }
+.nas-archive-shell > .nas-content { flex:1; min-height:0; overflow:auto; }
+.nas-archive-shell > .nas-jobs { max-height:25vh; overflow:auto; margin:0; }
+.nas-archive-identity { display:flex; flex-direction:column; gap:4px; padding:8px 0; }
+.nas-archive-identity strong { overflow-wrap:anywhere; }
+.nas-archive-identity span { font-size:12px; color:var(--color-text-secondary); }
+.nas-media-card .nas-selection { min-width:44px; min-height:44px; left:0; top:0; padding:8px; }
+.download-inline-speed { display:none; }
+@media(max-width:767px) { .download-inline-speed { display:block; } }
+.nas-player .nas-toolbar .dwrt-kit-field { display:flex; flex-direction:row; align-items:center; gap:8px; }
+.nas-player .nas-toolbar .dwrt-kit-select { min-height:36px; padding-block:4px; }
+
+.nas-job-panel { margin:0; }

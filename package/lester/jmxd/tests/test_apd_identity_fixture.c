@@ -101,7 +101,7 @@ int main(int argc, char **argv)
                                   (int64_t)time(NULL) + 300);
     } else if (strcmp(command, "pairing-begin-short") == 0) {
         rc = apd_db_pairing_begin("controller-test", "request-test",
-                                  (int64_t)time(NULL) + 1);
+                                  (int64_t)time(NULL) + 2);
     } else if (strcmp(command, "pairing-challenge") == 0) {
         rc = apd_db_pairing_set_challenge("request-test", challenge,
                                           sizeof(challenge) - 1);

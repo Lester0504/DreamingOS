@@ -23,7 +23,17 @@
 #include <libubox/uloop.h>
 #include <libubox/utils.h>
 #include <libubus.h>
+#include "../event_semantics.h"
 #include "../jmx_storage_guard.h"
+#include "../storage/storage_binding.h"
+
+#include "../ap_control_log.h"
+
+int logd_ap_mode(void);
+int logd_storage_ready(void);
+int logd_ap_enqueue(struct json_object *body, const char *detail);
+struct json_object *logd_ap_exchange(const char *method, struct json_object *body);
+struct json_object *logd_ap_status(void);
 
 #define LOGD_DB_PATH "/etc/dreamingwrt/log.db"
 #define LOGD_CONFIG_DB_PATH "/etc/dreamingwrt/config.db"
@@ -70,6 +80,11 @@ struct logd_collector_config {
 
 extern sqlite3 *g_logd_db;
 extern sqlite3 *g_config_db;
+extern char g_logd_db_path[512];
+extern int g_logd_storage_frozen;
+int logd_storage_authorizer(void *opaque, int action,
+                            const char *arg1, const char *arg2,
+                            const char *db_name, const char *trigger);
 extern struct ubus_context *g_logd_ubus;
 extern struct blob_buf g_logd_blob;
 extern uint64_t g_event_seq;
@@ -103,7 +118,10 @@ sqlite3_stmt *logd_prepare(const char *sql);
 sqlite3_stmt *logd_config_prepare(const char *sql);
 int logd_db_init(void);
 int logd_config_db_init(void);
+int logd_db_reopen_path(const char *new_path);
 void logd_db_close(void);
+void logd_memory_prepare_write(void);
+void logd_memory_write_failed(int sqlite_code);
 int logd_prune_if_needed(void);
 int logd_collector_state_prune(void);
 int logd_collector_state_get(const char *name, const char *key,

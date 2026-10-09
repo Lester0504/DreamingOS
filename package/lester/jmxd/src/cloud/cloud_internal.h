@@ -19,6 +19,7 @@
 #define DREAMINGOS_CLOUD_INTERNAL_H
 
 #include <errno.h>
+#include "jmx_dataset_path.h"
 #include <fcntl.h>
 #include <netdb.h>
 #include <poll.h>
@@ -106,7 +107,7 @@
 /* Overridable at compile time on the same terms as CLOUD_STATE_DIR, so tests can
  * exercise the real queries against a temporary database. */
 #ifndef CLOUD_APP_DB_PATH
-#define CLOUD_APP_DB_PATH "/etc/dreamingwrt/apid.db"
+#define CLOUD_APP_DB_PATH jmx_dataset_path("apid")
 #endif
 
 /* Local webd. The inner request is replayed here as ordinary HTTP. */
@@ -389,11 +390,133 @@ struct json_object *cloud_enroll_job_json(void);
 int cloud_enroll_token_load(char *out, size_t out_size);
 int cloud_enroll_token_present(void);
 
+/* ── publicly-trusted TLS certificate (cloud_cert.c) ─────────────── */
+
+/*
+ * CSR-relay certificate flow (port of dreamingrelay/internal/certagent).
+ *
+ * The router generates its OWN P-256 TLS key pair and CSR — that private key
+ * never leaves the device — proves possession of its factory Ed25519 signing
+ * key to authorize the request, and receives back a publicly-trusted fullchain
+ * from the cloud (which runs ACME DNS-01 through Cloudflare). The router never
+ * sees the Cloudflare token; the cloud never sees the TLS private key.
+ *
+ * config relay 'cert'
+ *     option enabled        '0'    # gates only the automatic renewal timer
+ *     option api_host       'api-os.dreamingnet.com'
+ *     option api_port       '443'
+ *     option label          'lester'      # <label>.<domain_suffix>
+ *     option lan_ip         '192.168.30.1'
+ *     option fullchain_path '/etc/dreamingwrt/tls/lester-dev.crt'
+ *     option key_path       '/etc/dreamingwrt/tls/lester-dev.key'
+ *     option reload_cmd     'kill -HUP $(cat /var/run/nginx.pid)'
+ *     option tls_verify     '1'
+ *     option ca_path        ''
+ */
+struct cloud_cert_config {
+    int enabled;
+    char api_host[256];
+    uint16_t api_port;
+    char label[64];
+    char lan_ip[64];
+    char fullchain_path[256];
+    char key_path[256];
+    char reload_cmd[256];
+    int tls_verify;
+    char ca_path[256];
+};
+
+int cloud_cert_config_load(struct cloud_cert_config *out);
+
+/*
+ * Signing transcript, byte-for-byte identical to certwire.Transcript:
+ *   Context "\n" routerID "\n" challenge "\n" domain "\n" lanIP "\n" csrHashHex
+ * with Context "dreamingos-cloud-cert-v1" and NO trailing newline. routerID is
+ * always the key fingerprint (relay_router_id), and csrHashHex is lowercase.
+ */
+#define CLOUD_CERT_CONTEXT "dreamingos-cloud-cert-v1"
+
+/*
+ * Asynchronous certificate obtain/renew, mirroring cloud_enroll_job_start.
+ * Runs on a detached thread so uloop keeps answering status polls while the two
+ * TLS round trips and ACME issuance complete.
+ *
+ * Returns 0 when a job was started, 1 when one is already running, 2 when the
+ * installed certificate is not yet at its renewal point and force was not set
+ * (declined, LE rate-limit friendly), -1 on a start failure (unconfigured or
+ * the worker thread could not be created).
+ */
+int cloud_cert_job_start(int force);
+
+/* Snapshot of the last or current job. Never NULL on success. */
+struct json_object *cloud_cert_job_json(void);
+
+/* Reads the installed leaf and reports validity plus the renewal decision. */
+struct json_object *cloud_cert_status_json(void);
+
+/*
+ * Automatic renewal timer. Registered on the uloop after the tunnel starts and
+ * gated on the cert section's `enabled`: it checks the installed leaf on a slow
+ * cadence and starts a renewal once the 2/3-lifetime point is reached, retrying
+ * on every tick until it succeeds.
+ */
+void cloud_cert_timer_start(void);
+void cloud_cert_timer_stop(void);
+
+/* ── account binding by stable code (cloud_bind.c) ───────────────── */
+
+/*
+ * Redeems a cloud account's stable binding code so the account records "this
+ * router belongs to me" (cloud-web contract §15.4). The device proves
+ * possession of its Ed25519 signing key (challenge/response, contract §5) and
+ * hands over the user-typed code; no account password ever reaches the device.
+ *
+ * This registers only the binding relationship (a quota slot + a "my devices"
+ * entry on the account). It does NOT open the browser data plane: that tunnel
+ * is the separate, locked 09-23 web-access track and is untouched here.
+ *
+ * Transport and TLS trust are the shared cloud API gateway config (relay
+ * 'cert': api_host/api_port/tls_verify/ca_path), the same one cloud_cert uses.
+ */
+struct cloud_bind_result {
+    int ok;
+    int http_status;
+    char code[64];
+    char message[192];
+    char cloud_id[64];
+    char canonical_host[256];
+    char entry_url[512];
+    char direct_url[512];
+    int64_t generation;
+};
+
+int cloud_bind_run(const struct cloud_cert_config *config,
+                   const char *stable_code, const char *display_name,
+                   struct cloud_bind_result *out);
+
+/*
+ * Asynchronous wrapper around cloud_bind_run(), mirroring cloud_enroll_job.
+ * Binding does two TLS round trips, too long to hold the uloop thread, so it
+ * runs detached and the caller polls cloud_bind_job_json(). The code is a
+ * bearer credential and is cleansed from the shared slot once the worker copies
+ * it. Returns 0 when a job was started, 1 when one is already running, -1 on a
+ * failure to start the worker.
+ */
+int cloud_bind_job_start(const char *stable_code, const char *display_name);
+
+/* Snapshot of the last or current job: {state, code, message, cloud_id,
+ * canonical_host, entry_url, direct_url, generation, cloud_status, started_at,
+ * finished_at}. Never NULL on success. */
+struct json_object *cloud_bind_job_json(void);
+
 /* ── ubus surface (cloud_ubus.c) ────────────────────────────────── */
 
 int cloud_ubus_start(void);
 void cloud_ubus_stop(void);
 struct json_object *cloud_status_json(void);
 struct json_object *cloud_identity_json(void);
+void cloud_browser_start(void);
+void cloud_browser_stop(void);
+struct json_object *cloud_browser_status_json(void);
 
 #endif

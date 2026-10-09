@@ -39,6 +39,11 @@ static void require_begin_rejects_paths_and_types(const char *root) {
     struct webd_upload_meta m;
     char err[128];
     assert(webd_upload_staging_set_root_for_tests(root) == 0);
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+    assert(webd_upload_staging_check_capacity(UINT64_MAX, err, sizeof(err)) != 0);
+    assert(strcmp(err, "staging_insufficient_space") == 0);
+    assert(webd_upload_staging_check_capacity(0, err, sizeof(err)) == 0);
+#endif
     assert(BEGIN("../firmware", "x.bin", 10, 0, 60, &m, err, sizeof(err)) != 0);
     assert(BEGIN("firmware", "../../etc/passwd", 4, 16, 60, &m, err, sizeof(err)) != 0);
     assert(BEGIN("firmware", "fw.bin", 4, 16, 60, &m, err, sizeof(err)) == 0);
@@ -225,6 +230,8 @@ def main():
             pass
         subprocess.run(cmd, check=True)
         subprocess.run([str(exe), str(root)], check=True)
+        subprocess.run(cmd + ["-DOTAD_SINGLE_SLOT_SUPPORTED=1"], check=True)
+        subprocess.run([str(exe), str(root) + "-single"], check=True)
 
 if __name__ == "__main__":
     main()

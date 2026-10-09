@@ -5,15 +5,46 @@ STOP=10
 USE_PROCD=1
 
 APD_BIN="/usr/bin/dreamingwrt-apd"
+APD_STATE_DIR="/etc/dreamingwrt"
+APD_RUNTIME_DIR="/var/run/dreamingwrt-apd"
 
 start_service() {
 	[ -x "$APD_BIN" ] || return 1
 
+	[ -d "$APD_STATE_DIR" ] || mkdir -m 0700 "$APD_STATE_DIR" || return 1
+	chmod 0700 "$APD_STATE_DIR" || return 1
+	if [ -f "$APD_STATE_DIR/rrm-forward.conf" ]; then
+		[ -d "$APD_RUNTIME_DIR" ] || mkdir -m 0750 "$APD_RUNTIME_DIR" || return 1
+	fi
+
 	procd_open_instance
 	procd_set_param command "$APD_BIN"
+	if [ -f "$APD_STATE_DIR/disable-vendor-queries" ]; then
+		procd_set_param env DREAMINGWRT_APD_VENDOR_QUERIES=0
+	fi
 	procd_set_param respawn 3600 5 5
 	procd_set_param term_timeout 15
 	procd_set_param stdout 1
 	procd_set_param stderr 1
 	procd_close_instance
+}
+
+service_stopped() {
+	local attempt process running executable
+
+	[ -f /var/run/dreamingwrt-apd/rrm-forward.state ] || return 0
+	# procd's delete reply can arrive before the old process has exited.
+	for attempt in $(seq 1 20); do
+		running=0
+		for process in /proc/[0-9]*/exe; do
+			executable="$(readlink "$process" 2>/dev/null)" || continue
+			case "$executable" in
+				"$APD_BIN"|"$APD_BIN (deleted)") running=1; break ;;
+			esac
+		done
+		[ "$running" = 1 ] || break
+		sleep 1
+	done
+	[ "$running" = 0 ] || return 1
+	"$APD_BIN" --rrm-forward-restore
 }

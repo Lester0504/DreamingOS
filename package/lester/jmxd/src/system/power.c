@@ -3,6 +3,7 @@
 #define _GNU_SOURCE
 
 #include "power.h"
+#include "../dw_business_event.h"
 
 #include <ctype.h>
 #include <errno.h>
@@ -1094,6 +1095,26 @@ static int power_action_lock_finish(sqlite3 *db, const char *action_id,
     return 0;
 }
 
+/* Read only committed history. "dispatched" is not proof of shutdown. */
+static void power_log_action(sqlite3 *db, const char *action_id)
+{
+    sqlite3_stmt *st = NULL;
+    if (power_prepare(db, &st, "SELECT event,result,error,actor,source_ip,source,schedule_id "
+                                "FROM power_schedule_history WHERE action_id=?1") != 0) return;
+    sqlite3_bind_text(st, 1, action_id, -1, SQLITE_STATIC);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        struct json_object *detail = json_object_new_object();
+        const char *fields[] = {"action", "result", "failure_reason", "actor", "source_ip", "trigger", "object_id"};
+        for (size_t i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+            json_object_object_add(detail, fields[i], json_object_new_string(power_sql_text(st, (int)i)));
+        if (!power_sql_text(st, 6)[0]) json_object_object_add(detail, "object_id", json_object_new_string("system"));
+        json_object_object_add(detail, "task_id", json_object_new_string(action_id));
+        dw_business_event("power", "SYSTEM_POWER_ACTION", detail);
+        json_object_put(detail);
+    }
+    sqlite3_finalize(st);
+}
+
 static int power_action_mark_dispatched(const char *action_id, pid_t executor_pid)
 {
     sqlite3 *db = NULL;
@@ -1132,6 +1153,7 @@ static int power_action_mark_dispatched(const char *action_id, pid_t executor_pi
         power_sql_exec(db, "COMMIT") != 0)
         goto rollback;
     rc = 0;
+    power_log_action(db, action_id);
     goto out;
 rollback:
     if (st) { sqlite3_finalize(st); st = NULL; }
@@ -1152,6 +1174,8 @@ static void power_detached_exec_failure(const char *action_id)
     if (power_action_lock_finish(db, action_id, "failed", "execv_failed", now) != 0 ||
         power_sql_exec(db, "COMMIT") != 0)
         (void)power_sql_exec(db, "ROLLBACK");
+    else
+        power_log_action(db, action_id);
 out:
     if (db) sqlite3_close(db);
 }
@@ -1526,7 +1550,7 @@ static int power_exec_fixed(const char *action, const char *action_id, int execu
     char **argv;
     int handshake[2] = {-1, -1};
     int release_gate[2] = {-1, -1};
-    pid_t dispatcher, detached = -1;
+    pid_t dispatcher, worker_pid = -1;
     struct pollfd pfd;
     ssize_t got;
     int status;
@@ -1561,15 +1585,16 @@ static int power_exec_fixed(const char *action, const char *action_id, int execu
         close(handshake[0]);
         close(release_gate[1]);
         if (setsid() < 0) {
-            (void)write(handshake[1], &detached, sizeof(detached));
+            (void)!write(handshake[1], &worker_pid, sizeof(worker_pid));
             _exit(126);
         }
-        detached = fork();
-        if (detached != 0) {
-            close(release_gate[0]);
-            (void)write(handshake[1], &detached, sizeof(detached));
-            _exit(detached > 0 ? 0 : 126);
-        }
+        /* Stay a direct core child until exec. A double fork makes this
+         * process an orphan while its argv still identifies the core; the
+         * supervisor then kills it during the dispatch delay. setsid alone
+         * isolates the worker's session without losing that parent identity. */
+        worker_pid = getpid();
+        if (write(handshake[1], &worker_pid, sizeof(worker_pid)) != sizeof(worker_pid))
+            _exit(126);
         close(handshake[1]);
         open_max = sysconf(_SC_OPEN_MAX);
         if (open_max < 0 || open_max > 65536)
@@ -1600,16 +1625,18 @@ static int power_exec_fixed(const char *action, const char *action_id, int execu
         return -1;
     }
     do {
-        got = read(handshake[0], &detached, sizeof(detached));
+        got = read(handshake[0], &worker_pid, sizeof(worker_pid));
     } while (got < 0 && errno == EINTR);
     close(handshake[0]);
-    while (waitpid(dispatcher, &status, 0) < 0 && errno == EINTR) {}
-    if (got != (ssize_t)sizeof(detached) || detached <= 0 ||
-        !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    if (got != (ssize_t)sizeof(worker_pid) || worker_pid != dispatcher) {
         close(release_gate[1]);
+        (void)kill(dispatcher, SIGKILL);
+        while (waitpid(dispatcher, &status, 0) < 0 && errno == EINTR) {}
         return -1;
     }
-    result->dispatcher_pid = detached;
+    /* The core's uloop SIGCHLD reaper owns the asynchronous worker. Waiting
+     * here would deadlock on the release gate before the audit is persisted. */
+    result->dispatcher_pid = dispatcher;
     result->release_fd = release_gate[1];
     return 0;
 }
@@ -1728,6 +1755,7 @@ struct json_object *jmx_system_power_immediate_action(
         if (power_db_open(&db) == 0 && power_sql_exec(db, "BEGIN IMMEDIATE") == 0 &&
             power_action_lock_finish(db, action_id, "failed", "dispatch_failed", failed_at) == 0 &&
             power_sql_exec(db, "COMMIT") == 0) {
+            power_log_action(db, action_id);
             sqlite3_close(db);
             return power_error("action_dispatch_failed", "detached_dispatch_could_not_start");
         }
@@ -1747,9 +1775,10 @@ struct json_object *jmx_system_power_immediate_action(
         if (power_db_open(&db) == 0 && power_sql_exec(db, "BEGIN IMMEDIATE") == 0 &&
             power_action_lock_finish(db, action_id, "failed", "dispatch_release_failed",
                                      failed_at) == 0 &&
-            power_sql_exec(db, "COMMIT") == 0)
+            power_sql_exec(db, "COMMIT") == 0) {
+            power_log_action(db, action_id);
             sqlite3_close(db);
-        else if (db) {
+        } else if (db) {
             (void)power_sql_exec(db, "ROLLBACK");
             sqlite3_close(db);
         }
@@ -1936,6 +1965,7 @@ struct json_object *jmx_system_power_scheduler_tick(int64_t now_epoch, int execu
         if (power_db_open(&db) == 0 && power_sql_exec(db, "BEGIN IMMEDIATE") == 0 &&
             power_action_lock_finish(db, action_id, "failed", "dispatch_failed", failed_at) == 0 &&
             power_sql_exec(db, "COMMIT") == 0) {
+            power_log_action(db, action_id);
             sqlite3_close(db);
             return power_error("action_dispatch_failed", "detached_dispatch_could_not_start");
         }
@@ -1955,9 +1985,10 @@ struct json_object *jmx_system_power_scheduler_tick(int64_t now_epoch, int execu
         if (power_db_open(&db) == 0 && power_sql_exec(db, "BEGIN IMMEDIATE") == 0 &&
             power_action_lock_finish(db, action_id, "failed", "dispatch_release_failed",
                                      failed_at) == 0 &&
-            power_sql_exec(db, "COMMIT") == 0)
+            power_sql_exec(db, "COMMIT") == 0) {
+            power_log_action(db, action_id);
             sqlite3_close(db);
-        else if (db) {
+        } else if (db) {
             (void)power_sql_exec(db, "ROLLBACK");
             sqlite3_close(db);
         }

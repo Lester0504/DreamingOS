@@ -2,8 +2,11 @@
 /* Dashboard hot telemetry and bounded rollup storage. */
 #include "jmx_metrics_store.h"
 
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <limits.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +31,8 @@ extern struct json_object *jmx_gen_api_response_data(int code,
 #define RETENTION_SEC (31LL * DAY_SEC)
 #define SNAPSHOT_INTERVAL_SEC 30
 #define SNAPSHOT_PATH "/tmp/dreamingwrt-metrics-hot.snapshot"
+#define METRICS_SNAPSHOT_VERSION 2
+#define SNAPSHOT_LINE_MAX 1024
 
 struct hot_sample {
     int64_t ts;
@@ -89,6 +94,247 @@ static int64_t g_last_maintenance_minute;
 static int64_t g_last_wall;
 static char g_hot_gap_reason[64] = "process_start";
 
+static struct minute_acc *minute_for(const char *wan_id, int64_t bucket);
+static struct counter_state *counter_for(const char *wan_id);
+static void metrics_snapshot(int64_t now);
+static void metrics_snapshot_force(int64_t now);
+
+static void minute_add_sample(struct minute_acc *a,
+                              const struct hot_sample *sample)
+{
+    if (!a || !sample)
+        return;
+    if (a->samples == 0) {
+        a->first_ts = sample->ts;
+        a->up_min = a->up_max = sample->up_rate;
+        a->down_min = a->down_max = sample->down_rate;
+        a->conn_max = sample->connections;
+    } else {
+        if (sample->up_rate < a->up_min) a->up_min = sample->up_rate;
+        if (sample->up_rate > a->up_max) a->up_max = sample->up_rate;
+        if (sample->down_rate < a->down_min) a->down_min = sample->down_rate;
+        if (sample->down_rate > a->down_max) a->down_max = sample->down_rate;
+        if (sample->connections > a->conn_max)
+            a->conn_max = sample->connections;
+    }
+    a->last_ts = sample->ts;
+    a->samples++;
+    a->up_sum += sample->up_rate;
+    a->down_sum += sample->down_rate;
+    a->conn_sum += sample->connections;
+    if (sample->latency_avg > 0) {
+        if (a->latency_samples == 0) {
+            a->latency_min = sample->latency_min > 0 ?
+                             sample->latency_min : sample->latency_avg;
+            a->latency_max = sample->latency_max > 0 ?
+                             sample->latency_max : sample->latency_avg;
+        }
+        if (sample->latency_min > 0 && sample->latency_min < a->latency_min)
+            a->latency_min = sample->latency_min;
+        if (sample->latency_max > a->latency_max)
+            a->latency_max = sample->latency_max;
+        a->latency_sum += sample->latency_avg;
+        a->latency_samples++;
+    }
+}
+
+static int snapshot_line_complete(const char *line, int consumed)
+{
+    const unsigned char *p;
+
+    if (!line || consumed < 0)
+        return 0;
+    p = (const unsigned char *)line + consumed;
+    while (*p && isspace(*p))
+        p++;
+    return *p == '\0';
+}
+
+static int snapshot_nonnegative_finite(double value)
+{
+    return isfinite(value) && value >= 0.0;
+}
+
+static int snapshot_nonnegative_finite_ld(long double value)
+{
+    return isfinite(value) && value >= 0.0L;
+}
+
+static int snapshot_line_blank(const char *line)
+{
+    const unsigned char *p = (const unsigned char *)line;
+
+    if (!p)
+        return 1;
+    while (*p && isspace(*p))
+        p++;
+    return *p == '\0';
+}
+
+static int snapshot_parse_header(const char *line, long long *generation,
+                                 long long *saved_at, int *version)
+{
+    int consumed = 0;
+    int parsed;
+
+    if (!line || !generation || !saved_at || !version)
+        return -1;
+    parsed = sscanf(line, "generation=%lld saved_at=%lld version=%d %n",
+                    generation, saved_at, version, &consumed);
+    if (parsed == 3 && snapshot_line_complete(line, consumed))
+        return 0;
+    consumed = 0;
+    *version = 1;
+    parsed = sscanf(line, "generation=%lld saved_at=%lld %n",
+                    generation, saved_at, &consumed);
+    return parsed == 2 && snapshot_line_complete(line, consumed) ? 0 : -1;
+}
+
+static int snapshot_parse_sample(const char *line, struct hot_sample *sample)
+{
+    char wan_id[sizeof(sample->wan_id)] = {0};
+    long long row_ts = 0;
+    long long up_rate = 0;
+    long long down_rate = 0;
+    int connections = 0;
+    double latency_avg = 0;
+    double latency_min = 0;
+    double latency_max = 0;
+    int consumed = 0;
+    int parsed;
+
+    if (!line || !sample)
+        return -1;
+    if (!strncmp(line, "sample ", 7))
+        parsed = sscanf(line,
+                        "sample %lld %31s %lld %lld %d %lf %lf %lf %n",
+                        &row_ts, wan_id, &up_rate, &down_rate, &connections,
+                        &latency_avg, &latency_min, &latency_max, &consumed);
+    else
+        parsed = sscanf(line,
+                        "%lld %31s %lld %lld %d %lf %lf %lf %n",
+                        &row_ts, wan_id, &up_rate, &down_rate, &connections,
+                        &latency_avg, &latency_min, &latency_max, &consumed);
+    if (parsed != 8 || !snapshot_line_complete(line, consumed) ||
+        !wan_id[0] || !snapshot_nonnegative_finite(latency_avg) ||
+        !snapshot_nonnegative_finite(latency_min) ||
+        !snapshot_nonnegative_finite(latency_max))
+        return -1;
+    memset(sample, 0, sizeof(*sample));
+    sample->ts = row_ts;
+    snprintf(sample->wan_id, sizeof(sample->wan_id), "%s", wan_id);
+    sample->up_rate = (int64_t)up_rate;
+    sample->down_rate = (int64_t)down_rate;
+    sample->connections = connections;
+    sample->latency_avg = latency_avg;
+    sample->latency_min = latency_min;
+    sample->latency_max = latency_max;
+    return 0;
+}
+
+static int snapshot_parse_minute(const char *line, struct minute_acc *minute)
+{
+    char wan_id[sizeof(minute->wan_id)] = {0};
+    long long bucket_ts = 0;
+    long long first_ts = 0;
+    long long last_ts = 0;
+    long long up_min = 0;
+    long long up_max = 0;
+    long long down_min = 0;
+    long long down_max = 0;
+    long long latency_samples = 0;
+    int samples = 0;
+    int conn_max = 0;
+    long double up_sum = 0;
+    long double down_sum = 0;
+    long double conn_sum = 0;
+    long double latency_sum = 0;
+    double latency_min = 0;
+    double latency_max = 0;
+    int consumed = 0;
+    int parsed;
+
+    if (!line || !minute)
+        return -1;
+    parsed = sscanf(line,
+        "minute %lld %31s %d %lld %lld %Lf %Lf %lld %lld %lld %lld %Lf %d %Lf %lf %lf %lld %n",
+        &bucket_ts, wan_id, &samples, &first_ts, &last_ts, &up_sum,
+        &down_sum, &up_min, &up_max, &down_min, &down_max, &conn_sum,
+        &conn_max, &latency_sum, &latency_min, &latency_max,
+        &latency_samples, &consumed);
+    if (parsed != 17 || !snapshot_line_complete(line, consumed) ||
+        !wan_id[0] || !snapshot_nonnegative_finite_ld(up_sum) ||
+        !snapshot_nonnegative_finite_ld(down_sum) ||
+        !snapshot_nonnegative_finite_ld(conn_sum) ||
+        !snapshot_nonnegative_finite_ld(latency_sum) ||
+        !snapshot_nonnegative_finite(latency_min) ||
+        !snapshot_nonnegative_finite(latency_max))
+        return -1;
+    memset(minute, 0, sizeof(*minute));
+    minute->active = 1;
+    minute->bucket_ts = bucket_ts;
+    snprintf(minute->wan_id, sizeof(minute->wan_id), "%s", wan_id);
+    minute->samples = samples;
+    minute->first_ts = first_ts;
+    minute->last_ts = last_ts;
+    minute->up_sum = up_sum;
+    minute->down_sum = down_sum;
+    minute->up_min = up_min;
+    minute->up_max = up_max;
+    minute->down_min = down_min;
+    minute->down_max = down_max;
+    minute->conn_sum = conn_sum;
+    minute->conn_max = conn_max;
+    minute->latency_sum = latency_sum;
+    minute->latency_min = latency_min;
+    minute->latency_max = latency_max;
+    minute->latency_samples = (int)latency_samples;
+    return 0;
+}
+
+static int snapshot_parse_counter(const char *line,
+                                  struct counter_state *counter)
+{
+    char wan_id[sizeof(counter->wan_id)] = {0};
+    unsigned long long raw_rx = 0;
+    unsigned long long raw_tx = 0;
+    unsigned long long total_rx = 0;
+    unsigned long long total_tx = 0;
+    long long first_ts = 0;
+    long long last_ts = 0;
+    long long checkpoint_hour = 0;
+    long long generation = 0;
+    int online = 0;
+    int reset_count = 0;
+    int consumed = 0;
+    int parsed;
+
+    if (!line || !counter)
+        return -1;
+    parsed = sscanf(line,
+        "counter %31s %d %llu %llu %llu %llu %d %lld %lld %lld %lld %n",
+        wan_id, &online, &raw_rx, &raw_tx, &total_rx, &total_tx,
+        &reset_count, &first_ts, &last_ts, &checkpoint_hour, &generation,
+        &consumed);
+    if (parsed != 11 || !snapshot_line_complete(line, consumed) ||
+        !wan_id[0])
+        return -1;
+    memset(counter, 0, sizeof(*counter));
+    counter->active = 1;
+    counter->online = online ? 1 : 0;
+    snprintf(counter->wan_id, sizeof(counter->wan_id), "%s", wan_id);
+    counter->raw_rx = (uint64_t)raw_rx;
+    counter->raw_tx = (uint64_t)raw_tx;
+    counter->total_rx = (uint64_t)total_rx;
+    counter->total_tx = (uint64_t)total_tx;
+    counter->reset_count = reset_count;
+    counter->first_ts = first_ts;
+    counter->last_ts = last_ts;
+    counter->checkpoint_hour = checkpoint_hour;
+    counter->generation = generation;
+    return 0;
+}
+
 static int64_t metrics_now(void)
 {
     const char *test_now = getenv("DREAMINGWRT_METRICS_TEST_NOW");
@@ -149,31 +395,117 @@ static const char *metrics_path(void)
 static void metrics_restore_snapshot(void)
 {
     FILE *fp = fopen(metrics_snapshot_path(), "r");
-    struct hot_sample sample;
-    long long generation = 0;
+    char line[SNAPSHOT_LINE_MAX];
+    long long header_generation = 0;
     long long saved_at = 0;
-    long long up_rate = 0;
-    long long down_rate = 0;
+    int version = 1;
     int restored = 0;
-    int64_t cutoff = metrics_now() - HOT_RETENTION_SEC;
+    int saw_minute = 0;
+    int saw_counter = 0;
+    int malformed = 0;
+    int header_fields;
+    int64_t now = metrics_now();
+    int64_t cutoff = now - HOT_RETENTION_SEC;
 
     if (!fp)
         return;
-    if (fscanf(fp, "generation=%lld saved_at=%lld\n", &generation, &saved_at) != 2 ||
-        saved_at < cutoff) {
+    if (!fgets(line, sizeof(line), fp)) {
         fclose(fp);
         snprintf(g_hot_gap_reason, sizeof(g_hot_gap_reason), "snapshot_stale_or_invalid");
         return;
     }
-    while (fscanf(fp, "%lld %31s %lld %lld %d %lf %lf %lf\n",
-                  &generation, sample.wan_id, &up_rate, &down_rate,
-                  &sample.connections, &sample.latency_avg, &sample.latency_min,
-                  &sample.latency_max) == 8) {
-        sample.ts = generation;
-        sample.up_rate = (int64_t)up_rate;
-        sample.down_rate = (int64_t)down_rate;
-        if (sample.ts < cutoff || !strcmp(sample.wan_id, "global"))
+    header_fields = snapshot_parse_header(line, &header_generation, &saved_at,
+                                          &version);
+    if (header_fields != 0 || header_generation <= 0 || saved_at <= 0 ||
+        version < 1 || version > METRICS_SNAPSHOT_VERSION || saved_at < cutoff ||
+        saved_at > now) {
+        fclose(fp);
+        snprintf(g_hot_gap_reason, sizeof(g_hot_gap_reason), "snapshot_stale_or_invalid");
+        return;
+    }
+    while (fgets(line, sizeof(line), fp)) {
+        struct hot_sample sample;
+        char *newline;
+        int parsed;
+
+        newline = strpbrk(line, "\r\n");
+        if (newline)
+            *newline = '\0';
+        if (snapshot_line_blank(line))
             continue;
+        if (!strncmp(line, "minute ", 7)) {
+            struct minute_acc minute;
+            struct minute_acc *slot;
+
+            parsed = snapshot_parse_minute(line, &minute);
+            if (parsed != 0 || !minute.wan_id[0] ||
+                !strcmp(minute.wan_id, "global") || minute.samples <= 0 ||
+                minute.bucket_ts < cutoff || minute.bucket_ts > saved_at ||
+                minute.first_ts < cutoff || minute.first_ts > minute.last_ts ||
+                minute.last_ts > saved_at || minute.latency_samples < 0 ||
+                minute.latency_samples > minute.samples ||
+                minute.up_min > minute.up_max ||
+                minute.down_min > minute.down_max ||
+                minute.bucket_ts !=
+                    (minute.bucket_ts / MINUTE_SEC) * MINUTE_SEC ||
+                minute.first_ts < minute.bucket_ts ||
+                minute.last_ts >= minute.bucket_ts + MINUTE_SEC ||
+                (minute.latency_samples == 0 && minute.latency_sum != 0.0L)) {
+                malformed = 1;
+                break;
+            }
+            slot = minute_for(minute.wan_id, minute.bucket_ts);
+            if (!slot) {
+                malformed = 1;
+                break;
+            }
+            if (slot->samples > 0) {
+                malformed = 1;
+                break;
+            }
+            *slot = minute;
+            saw_minute = 1;
+            continue;
+        }
+        if (!strncmp(line, "counter ", 8)) {
+            struct counter_state counter;
+            struct counter_state *slot;
+
+            parsed = snapshot_parse_counter(line, &counter);
+            if (parsed != 0 || !counter.wan_id[0] ||
+                !strcmp(counter.wan_id, "global") || counter.first_ts <= 0 ||
+                counter.first_ts > saved_at || counter.last_ts < counter.first_ts ||
+                counter.last_ts > saved_at || counter.reset_count < 0 ||
+                counter.checkpoint_hour < 0 || counter.generation <= 0) {
+                malformed = 1;
+                break;
+            }
+            slot = counter_for(counter.wan_id);
+            if (!slot) {
+                malformed = 1;
+                break;
+            }
+            if (slot->first_ts > 0) {
+                malformed = 1;
+                break;
+            }
+            *slot = counter;
+            saw_counter = 1;
+            continue;
+        }
+        parsed = snapshot_parse_sample(line, &sample);
+        if (parsed != 0) {
+            malformed = 1;
+            break;
+        }
+        if (sample.ts < cutoff)
+            continue;
+        if (!sample.wan_id[0] || !strcmp(sample.wan_id, "global") ||
+            sample.ts > saved_at || sample.connections < 0 ||
+            sample.up_rate < 0 || sample.down_rate < 0) {
+            malformed = 1;
+            break;
+        }
         g_hot[g_hot_head] = sample;
         g_hot_head = (g_hot_head + 1) % HOT_CAP;
         if (g_hot_count < HOT_CAP)
@@ -181,7 +513,36 @@ static void metrics_restore_snapshot(void)
         restored++;
     }
     fclose(fp);
-    if (restored > 0)
+    if (malformed) {
+        memset(g_hot, 0, sizeof(g_hot));
+        memset(g_minutes, 0, sizeof(g_minutes));
+        memset(g_counters, 0, sizeof(g_counters));
+        g_hot_head = 0;
+        g_hot_count = 0;
+        snprintf(g_hot_gap_reason, sizeof(g_hot_gap_reason),
+                 "snapshot_stale_or_invalid");
+        return;
+    }
+    g_generation = header_generation > 0 ? header_generation : now;
+    g_last_wall = saved_at;
+    g_last_snapshot = saved_at;
+    if (!saw_minute && restored > 0) {
+        int64_t current_minute = (now / MINUTE_SEC) * MINUTE_SEC;
+        size_t i;
+        for (i = 0; i < g_hot_count; i++) {
+            size_t idx = (g_hot_head + HOT_CAP - g_hot_count + i) % HOT_CAP;
+            struct hot_sample *sample = &g_hot[idx];
+            struct minute_acc *minute;
+            if ((sample->ts / MINUTE_SEC) * MINUTE_SEC != current_minute)
+                continue;
+            minute = minute_for(sample->wan_id, current_minute);
+            if (minute)
+                minute_add_sample(minute, sample);
+        }
+    }
+    /* Version 1 snapshots only carried samples. Rebuild the current minute
+     * from those samples; version 2 snapshots already carry exact accumulators. */
+    if (restored > 0 || saw_minute || saw_counter)
         snprintf(g_hot_gap_reason, sizeof(g_hot_gap_reason), "restored_tmpfs_snapshot");
 }
 
@@ -199,17 +560,43 @@ static void metrics_snapshot(int64_t now)
     fp = fopen(tmp, "w");
     if (!fp)
         return;
-    fprintf(fp, "generation=%lld saved_at=%lld\n",
-            (long long)g_generation, (long long)now);
+    fprintf(fp, "generation=%lld saved_at=%lld version=%d\n",
+            (long long)g_generation, (long long)now,
+            METRICS_SNAPSHOT_VERSION);
     for (i = 0; i < g_hot_count; i++) {
         size_t idx = (g_hot_head + HOT_CAP - g_hot_count + i) % HOT_CAP;
         const struct hot_sample *s = &g_hot[idx];
         if (s->ts < cutoff)
             continue;
-        fprintf(fp, "%lld %s %lld %lld %d %.3f %.3f %.3f\n",
+        fprintf(fp, "sample %lld %s %lld %lld %d %.17g %.17g %.17g\n",
                 (long long)s->ts, s->wan_id, (long long)s->up_rate,
                 (long long)s->down_rate, s->connections, s->latency_avg,
                 s->latency_min, s->latency_max);
+    }
+    for (i = 0; i < WAN_CAP; i++) {
+        const struct minute_acc *a = &g_minutes[i];
+        if (!a->active || a->samples <= 0)
+            continue;
+        fprintf(fp,
+                "minute %lld %s %d %lld %lld %.17Lg %.17Lg %lld %lld %lld %lld %.17Lg %d %.17Lg %.17g %.17g %d\n",
+                (long long)a->bucket_ts, a->wan_id, a->samples,
+                (long long)a->first_ts, (long long)a->last_ts, a->up_sum,
+                a->down_sum, (long long)a->up_min, (long long)a->up_max,
+                (long long)a->down_min, (long long)a->down_max, a->conn_sum,
+                a->conn_max, a->latency_sum, a->latency_min, a->latency_max,
+                a->latency_samples);
+    }
+    for (i = 0; i < WAN_CAP; i++) {
+        const struct counter_state *c = &g_counters[i];
+        if (!c->active || c->first_ts <= 0)
+            continue;
+        fprintf(fp,
+                "counter %s %d %llu %llu %llu %llu %d %lld %lld %lld %lld\n",
+                c->wan_id, c->online, (unsigned long long)c->raw_rx,
+                (unsigned long long)c->raw_tx, (unsigned long long)c->total_rx,
+                (unsigned long long)c->total_tx, c->reset_count,
+                (long long)c->first_ts, (long long)c->last_ts,
+                (long long)c->checkpoint_hour, (long long)c->generation);
     }
     if (fflush(fp) == 0 && fsync(fileno(fp)) == 0 && fclose(fp) == 0 &&
         rename(tmp, metrics_snapshot_path()) == 0) {
@@ -217,6 +604,12 @@ static void metrics_snapshot(int64_t now)
     } else {
         unlink(tmp);
     }
+}
+
+static void metrics_snapshot_force(int64_t now)
+{
+    g_last_snapshot = 0;
+    metrics_snapshot(now);
 }
 
 int jmx_metrics_store_init(void)
@@ -272,8 +665,12 @@ int jmx_metrics_store_init(void)
 
 void jmx_metrics_store_close(void)
 {
+    int64_t now;
+
     if (!g_metrics) return;
     jmx_metrics_store_maintenance();
+    now = metrics_now();
+    metrics_snapshot_force(now);
     sqlite3_close(g_metrics);
     g_metrics = NULL;
     g_legacy = NULL;
@@ -579,6 +976,7 @@ void jmx_metrics_counter_observe(const char *wan_id, uint64_t rx_bytes,
     if (!online) {
         c->online = 0;
         c->last_ts = now;
+        metrics_snapshot(now);
         return;
     }
     if (!c->first_ts && sqlite3_prepare_v2(g_metrics,
@@ -623,6 +1021,7 @@ void jmx_metrics_counter_observe(const char *wan_id, uint64_t rx_bytes,
     } else if (reset) {
         write_checkpoint(c, now, 1);
     }
+    metrics_snapshot(now);
 }
 
 static int usage_one(const char *wan_id, int64_t start, int64_t end,
@@ -767,7 +1166,7 @@ static int append_hot_query_buckets(struct json_object *buckets, int64_t cutoff,
         int j;
         int64_t up_avg = 0, down_avg = 0, conn_avg = 0;
         int64_t up_min = 0, up_max = 0, down_min = 0, down_max = 0;
-        int conn_max = 0, samples = 0, latency_series = 0;
+        int conn_max = 0, samples = 0, coverage_samples = 0, latency_series = 0;
         double latency_avg = 0, latency_min = 0, latency_max = 0;
         struct json_object *b;
 
@@ -788,7 +1187,13 @@ static int append_hot_query_buckets(struct json_object *buckets, int64_t cutoff,
                 if (!latency_series || a->latency_max > latency_max) latency_max = a->latency_max;
                 latency_series++;
             }
-            if (a->samples > samples) samples = a->samples;
+            if (global) {
+                samples += a->samples;
+                if (a->samples > coverage_samples)
+                    coverage_samples = a->samples;
+            } else if (a->samples > samples) {
+                samples = coverage_samples = a->samples;
+            }
             a->active = 0;
         }
         b = json_object_new_object();
@@ -810,8 +1215,8 @@ static int append_hot_query_buckets(struct json_object *buckets, int64_t cutoff,
         }
         json_object_object_add(b, "sample_count", json_object_new_int(samples));
         json_object_object_add(b, "valid_duration",
-                               json_object_new_int(samples * 2 > output_res ?
-                                                   (int)output_res : samples * 2));
+                               json_object_new_int(coverage_samples * 2 > output_res ?
+                                                   (int)output_res : coverage_samples * 2));
         json_object_object_add(b, "source", json_object_new_string("memory_hot"));
         {
             size_t n = json_object_array_length(buckets);
@@ -969,6 +1374,54 @@ static int64_t hot_query_start(const char *wan, int global, int64_t now)
     return start;
 }
 
+static int64_t activity_series_count(int64_t start, int64_t hot_start,
+                                     int64_t minute_start, int source_res,
+                                     int64_t now, int global)
+{
+    sqlite3_stmt *st = NULL;
+    char ids[WAN_CAP][32] = {{0}};
+    int count = 0;
+    int64_t cutoff = hot_start > start ? hot_start : start;
+    const char *sql =
+        "SELECT DISTINCT wan_id FROM metric_bucket "
+        "WHERE bucket_ts>=?1 AND bucket_ts<?2 AND wan_id<>'global' AND "
+        "((?3=60 AND resolution=60) OR "
+        "(?3=300 AND ((resolution=300 AND bucket_ts<?4) OR "
+        "(resolution=60 AND bucket_ts>=?4))))";
+
+    if (!global)
+        return 1;
+    if (g_metrics && sqlite3_prepare_v2(g_metrics, sql, -1, &st, NULL) == SQLITE_OK) {
+        sqlite3_bind_int64(st, 1, start);
+        sqlite3_bind_int64(st, 2, hot_start);
+        sqlite3_bind_int(st, 3, source_res);
+        sqlite3_bind_int64(st, 4, minute_start);
+        while (sqlite3_step(st) == SQLITE_ROW && count < WAN_CAP) {
+            const char *id = (const char *)sqlite3_column_text(st, 0);
+            if (id && id[0])
+                snprintf(ids[count++], sizeof(ids[0]), "%s", id);
+        }
+        sqlite3_finalize(st);
+    }
+    for (size_t i = 0; i < g_hot_count; i++) {
+        size_t idx = (g_hot_head + HOT_CAP - g_hot_count + i) % HOT_CAP;
+        const struct hot_sample *sample = &g_hot[idx];
+        int seen = 0;
+
+        if (sample->ts < cutoff || sample->ts > now)
+            continue;
+        for (int j = 0; j < count; j++) {
+            if (!strcmp(ids[j], sample->wan_id)) {
+                seen = 1;
+                break;
+            }
+        }
+        if (!seen && count < WAN_CAP)
+            snprintf(ids[count++], sizeof(ids[0]), "%s", sample->wan_id);
+    }
+    return count;
+}
+
 struct json_object *jmx_metrics_activity_api(struct json_object *req)
 {
     const char *range=req_string(req,"range","1d"); const char *wan=req_string(req,"wan_id","");
@@ -988,7 +1441,7 @@ struct json_object *jmx_metrics_activity_api(struct json_object *req)
       "WITH p AS (SELECT bucket_ts,SUM(up_avg) up_avg,SUM(up_min) up_min,SUM(up_max) up_max,"
       "SUM(down_avg) down_avg,SUM(down_min) down_min,SUM(down_max) down_max,"
       "SUM(connections_avg) conn_avg,SUM(connections_max) conn_max,AVG(latency_avg) lat_avg,"
-      "MIN(latency_min) lat_min,MAX(latency_max) lat_max,MAX(sample_count) samples,"
+      "MIN(latency_min) lat_min,MAX(latency_max) lat_max,SUM(sample_count) samples,"
       "MAX(valid_duration) duration,MAX(estimated) estimated FROM metric_bucket "
       "WHERE bucket_ts>=?1 AND bucket_ts<?2 AND wan_id<>'global' AND "
       "((?3=60 AND resolution=60) OR "
@@ -1006,7 +1459,14 @@ struct json_object *jmx_metrics_activity_api(struct json_object *req)
     }
     append_hot_query_buckets(buckets, hot_start, output_res,
                              wan, global, &samples);
-    expected=(retention/2)*(global?1:1);
+    {
+        int64_t series_count = activity_series_count(now - retention, hot_start,
+                                                      minute_start, source_res,
+                                                      now, global);
+        expected = (retention / 2) * (global ? series_count : 1);
+        json_object_object_add(data, "series_count",
+                               json_object_new_int64(series_count));
+    }
     json_object_object_add(data,"ts",json_object_new_int64(now));json_object_object_add(data,"range",json_object_new_string(range));json_object_object_add(data,"wan_id",json_object_new_string(global?"":wan));json_object_object_add(data,"scope",json_object_new_string(global?"global":"wan"));
     json_object_object_add(data,"start_ts",json_object_new_int64(now-retention));json_object_object_add(data,"end_ts",json_object_new_int64(now));json_object_object_add(data,"bucket_sec",json_object_new_int64(output_res));json_object_object_add(data,"retention_sec",json_object_new_int64(retention));json_object_object_add(data,"resolution_sec",json_object_new_int(source_res));
     json_object_object_add(data,"source",json_object_new_string(source_res==60?"metrics_minute":"metrics_mixed_rollup"));json_object_object_add(data,"hot_source",json_object_new_string("memory_hot"));json_object_object_add(data,"sample_count",json_object_new_int64(samples));json_object_object_add(data,"expected_sample_count",json_object_new_int64(expected));json_object_object_add(data,"completeness_ratio",json_object_new_double(expected>0?(samples>expected?1.0:(double)samples/expected):0));json_object_object_add(data,"generation",json_object_new_int64(g_generation));json_object_object_add(data,"gap_reason",json_object_new_string(g_hot_gap_reason));json_object_object_add(data,"counter_reset",json_object_new_boolean(0));json_object_object_add(data,"estimated",json_object_new_boolean(estimated));json_object_object_add(data,"period_start",json_object_new_int64(now-retention));json_object_object_add(data,"period_end",json_object_new_int64(now));json_object_object_add(data,"unit",json_object_new_string("B/s"));json_object_object_add(data,"latency_unit",json_object_new_string("ms"));

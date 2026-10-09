@@ -3,8 +3,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text, webd_function_text
 INIT = (ROOT / "src/init/config_restore.c").read_text()
-WEB = (ROOT / "src/webd/jmx_app_api.c").read_text()
+WEB = webd_dispatch_text()
 
 REQUIRED = (
     "network_meta",
@@ -26,13 +29,12 @@ def between(source: str, start: str, end: str) -> str:
 
 
 init_validator = between(INIT, "static int sqlite_validate", "static int sqlite_backup_file")
-web_validator = between(
-    WEB,
-    "static int webd_config_db_validate_path",
-    "static struct json_object *webd_config_restore_control_response",
-)
+# webd_config_db_validate_path and webd_config_restore_stage_response moved to
+# webd/api/api_maintenance.c in the Phase 7A split (control_response de-static'd),
+# so slice inside each moved definition by name instead of over the whole dispatch text.
+web_validator = webd_function_text("api_maintenance.c", "webd_config_db_validate_path")
 staged_manifest = between(
-    WEB,
+    webd_function_text("api_maintenance.c", "webd_config_restore_stage_response"),
     "pending_manifest = json_object_new_object();",
     "if (webd_restore_write_manifest",
 )

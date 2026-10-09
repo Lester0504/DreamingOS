@@ -1,0 +1,54 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex,nofollow">
+  <title>AI 助手 · DreamingOS</title>
+  <script>
+    (() => {
+      const root = document.documentElement;
+      function theme() {
+        let family = 'frosted-glass', pref = 'system';
+        try {
+          family = localStorage.getItem('dreamingwrt.web.themeFamily') || family;
+          pref = localStorage.getItem('dreamingwrt.web.themePref') || pref;
+        } catch (_) {}
+        root.dataset.themeFamily = ['frosted-glass', 'liquid-glass', 'traditional'].includes(family) ? family : 'frosted-glass';
+        root.dataset.themeResolved = pref === 'dark' || (pref === 'system' && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+      }
+      theme();
+      addEventListener('storage', theme);
+      matchMedia('(prefers-color-scheme: dark)').addEventListener('change', theme);
+      try {
+        if (parent !== window && parent.location.origin === location.origin && parent.DWRT_DESKTOP_HOST) {
+          window.DWRT_SESSION = parent.DWRT_SESSION;
+          root.dataset.desktopApp = 'true';
+        }
+      } catch (_) {}
+      window.DWRT_DESKTOP_HOST = true;
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/ui-kit/dwrt-ui-kit.css?v=20260905-sidebar-tabs-01">
+  <link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
+  <link rel="stylesheet" href="/static/css/theme-families.css?v=20261008-desktop-material-01">
+  <link rel="stylesheet" href="/static/desktop/dwrt-rail.css?v=20261008-desktop-material-01">
+  <link rel="stylesheet" href="/static/css/ai-assistant.css?v=20261003-ai-local-01">
+</head>
+<body class="ai-desktop-page">
+  <div id="aiApp"></div>
+  <script src="/static/js/dwrt-session-gate.js?v=20260808-region-ink-uses-painted-density-01" defer></script>
+  <script src="/static/ui-kit/lucide.min.js" defer></script>
+  <script src="/static/ui-kit/dwrt-ui-kit.js?v=20260905-sidebar-tabs-01" defer></script>
+  <script src="/static/desktop/glass-foreground.js?v=20261008-desktop-material-01" defer></script>
+  <script type="module">
+    import { mount } from '/plugins/native/ai-assistant.js?v=20261003-ai-local-01';
+    window.aiWorkbench = mount({
+      root: document.getElementById('aiApp'), mode: 'desktop',
+      ui: window.DWRT_UI_KIT || {},
+      listContextSources: () => parent !== window ? parent.DWRT_AI_CONTEXT?.list() || [] : [],
+      getSourceContext: id => parent !== window ? parent.DWRT_AI_CONTEXT?.read(id) : null
+    });
+  </script>
+</body>
+</html>

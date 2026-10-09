@@ -7,7 +7,7 @@
 #define PCDN_SOURCE_NAME "OpenHosts PCDN domains"
 #define PCDN_SOURCE_URL "https://raw.githubusercontent.com/743859910/OpenHosts/master/Block_PCDN_Domain.txt"
 #define PCDN_SOURCE_LICENSE "MIT"
-#define PCDN_ARTIFACT_PREFIX AEGISXD_FEED_DIR "/pcdn-openhosts-"
+#define PCDN_ARTIFACT_PREFIX "pcdn-openhosts-"
 #define PCDN_ARTIFACT_SUFFIX ".domains"
 #define PCDN_MAX_BYTES (2U * 1024U * 1024U)
 #define PCDN_MAX_RULES 20000U
@@ -119,11 +119,14 @@ out:
 static int pcdn_artifact_path_ok(const char *path)
 {
     const char *name;
+    char prefix[AEGISXD_MAX_PATH];
     size_t len, suffix_len = strlen(PCDN_ARTIFACT_SUFFIX);
 
-    if (!path || strncmp(path, PCDN_ARTIFACT_PREFIX, strlen(PCDN_ARTIFACT_PREFIX)))
+    if (snprintf(prefix, sizeof(prefix), "%s/%s", AEGISXD_FEED_DIR,
+                 PCDN_ARTIFACT_PREFIX) >= (int)sizeof(prefix) ||
+        !path || strncmp(path, prefix, strlen(prefix)))
         return 0;
-    name = path + strlen(PCDN_ARTIFACT_PREFIX);
+    name = path + strlen(prefix);
     len = strlen(name);
     if (len != 64 + suffix_len || strchr(name, '/'))
         return 0;
@@ -280,8 +283,8 @@ static int pcdn_active_artifact_path(char out[AEGISXD_MAX_PATH])
     for (size_t i = 0; i < 64; i++)
         if (!isxdigit((unsigned char)sha256[i]))
             goto out;
-    if (snprintf(out, AEGISXD_MAX_PATH, PCDN_ARTIFACT_PREFIX "%s" PCDN_ARTIFACT_SUFFIX,
-                 sha256) >= AEGISXD_MAX_PATH)
+    if (snprintf(out, AEGISXD_MAX_PATH, "%s/" PCDN_ARTIFACT_PREFIX "%s" PCDN_ARTIFACT_SUFFIX,
+                 AEGISXD_FEED_DIR, sha256) >= AEGISXD_MAX_PATH)
         out[0] = '\0';
     else
         ok = 1;
@@ -882,7 +885,7 @@ static int pcdn_installed_settings_load(struct pcdn_settings *settings,
     settings->rule_count = json_object_get_int(
         json_object_object_get(pcdn, "rule_count"));
     if (snprintf(settings->artifact_path, sizeof(settings->artifact_path),
-                 PCDN_ARTIFACT_PREFIX "%s" PCDN_ARTIFACT_SUFFIX, sha256) >=
+                 "%s/" PCDN_ARTIFACT_PREFIX "%s" PCDN_ARTIFACT_SUFFIX, AEGISXD_FEED_DIR, sha256) >=
         (int)sizeof(settings->artifact_path))
         goto out;
     ok = pcdn_artifact_ready(settings);
@@ -1048,8 +1051,8 @@ static int pcdn_artifact_install(const char *canonical, const char *sha256,
         return -1;
     *installed_new = 0;
     *repaired = 0;
-    if (snprintf(final, AEGISXD_MAX_PATH, PCDN_ARTIFACT_PREFIX "%s"
-                 PCDN_ARTIFACT_SUFFIX, sha256) >= AEGISXD_MAX_PATH)
+    if (snprintf(final, AEGISXD_MAX_PATH, "%s/" PCDN_ARTIFACT_PREFIX "%s"
+                 PCDN_ARTIFACT_SUFFIX, AEGISXD_FEED_DIR, sha256) >= AEGISXD_MAX_PATH)
         return -1;
     if (lstat(final, &st) != 0) {
         if (errno != ENOENT || rename(canonical, final) != 0)
@@ -1123,8 +1126,8 @@ static struct json_object *pcdn_sync_run(void)
         error = "pcdn_workdir_failed";
         goto fail;
     }
-    snprintf(raw, sizeof(raw), AEGISXD_FEED_DIR "/.pcdn-raw.%ld", (long)getpid());
-    snprintf(canonical, sizeof(canonical), AEGISXD_FEED_DIR "/.pcdn-domains.%ld", (long)getpid());
+    snprintf(raw, sizeof(raw), "%s/.pcdn-raw.%ld", AEGISXD_FEED_DIR, (long)getpid());
+    snprintf(canonical, sizeof(canonical), "%s/.pcdn-domains.%ld", AEGISXD_FEED_DIR, (long)getpid());
     download.fp = fopen(raw, "wb");
     curl = curl_easy_init();
     if (!download.fp || !curl) {

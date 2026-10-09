@@ -1168,7 +1168,16 @@ void update_client_hostname(void)
     {
         if (strlen(line_buf) <= 16)
             continue;
-        sscanf(line_buf, "%*s %s %s %s", mac_buf, ip_buf, hostname_buf);
+        /* Widths are mandatory here: the hostname field comes from the DHCP
+         * client's own Option 12, so any device that joins the LAN controls it.
+         * An unbounded %s let a lease line longer than hostname_buf overrun the
+         * stack. Each width is one less than its buffer to leave room for NUL.
+         * The return value is checked as well, otherwise a short line silently
+         * reuses the previous iteration's values. */
+        mac_buf[0] = ip_buf[0] = hostname_buf[0] = '\0';
+        if (sscanf(line_buf, "%*s %31s %31s %127s",
+                   mac_buf, ip_buf, hostname_buf) < 2)
+            continue;
         client_node_t *node = find_client_node(mac_buf);
         if (!node)
         {
@@ -1357,11 +1366,20 @@ void update_client_from_kernel(void)
         LOG_DEBUG("open client file....failed\n");
         goto ipv6_neigh;
     }
-    fgets(line_buf, sizeof(line_buf), fp); // title
+    if (!fgets(line_buf, sizeof(line_buf), fp)) // title
+    {
+        fclose(fp);
+        goto ipv6_neigh;
+    }
     while (fgets(line_buf, sizeof(line_buf), fp))
     {
         int id;
-        int parsed = sscanf(line_buf, "%d %s %s %s %u %u", &id, mac_buf, ip_buf, ipv6_buf, &up_rate, &down_rate);
+        /* Same reasoning as update_client_hostname(): bound every %s to the
+         * destination size minus the NUL. af_client is kernel-produced, but the
+         * fields it echoes back are client-supplied, so an unbounded conversion
+         * is still a stack overrun waiting for a long line. */
+        mac_buf[0] = ip_buf[0] = ipv6_buf[0] = '\0';
+        int parsed = sscanf(line_buf, "%d %31s %31s %127s %u %u", &id, mac_buf, ip_buf, ipv6_buf, &up_rate, &down_rate);
         LOG_DEBUG("update_client_from_kernel: parsed = %d, line_buf = %s\n", parsed, line_buf);
         if (parsed < 3) 
         {
@@ -1423,7 +1441,10 @@ ipv6_neigh:
     fp = fopen("/proc/net/arp", "r");
     if (!fp)
         return;
-    fgets(line_buf, sizeof(line_buf), fp);
+    if (!fgets(line_buf, sizeof(line_buf), fp)) { // title
+        fclose(fp);
+        return;
+    }
     while (fgets(line_buf, sizeof(line_buf), fp)) {
         char ip[64] = {0};
         char flags[16] = {0};
@@ -1591,7 +1612,11 @@ void update_client_visiting_info(void)
         return;
     }
 
-    fgets(line_buf, sizeof(line_buf), fp); // title
+    if (!fgets(line_buf, sizeof(line_buf), fp)) // title
+    {
+        fclose(fp);
+        return;
+    }
     while (fgets(line_buf, sizeof(line_buf), fp))
     {
         memset(mac_buf, 0, sizeof(mac_buf));

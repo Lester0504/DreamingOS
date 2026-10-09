@@ -32,4 +32,12 @@ void update_jmx_proc_u32_value(char *key, u_int32_t value);
  * screen for config generators reading rows that predate the check. */
 int jmx_uci_value_ok(const char *s);
 const char *jmx_uci_value_sanitize(const char *s, char *buf, size_t buf_len);
+
+/* Returns 1 when ifname is on the LAN side of the network topology.
+ * Checks bridge membership via /sys/class/net/<if>/master rather than
+ * guessing from interface name prefixes.  br- prefix is kept as a device-type
+ * check (bridges are LAN-side unless explicitly named br-wan/br-docker).
+ */
+int jmx_iface_is_lan(const char *ifname);
+
 #endif

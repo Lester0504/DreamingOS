@@ -17,7 +17,9 @@
 #include "native_plugins.h"
 #include "webd_http.h"
 
+#ifndef NATIVE_PLUGIN_ROOT
 #define NATIVE_PLUGIN_ROOT "/usr/share/dreamingwrt/native-plugins"
+#endif
 #define NATIVE_MANIFEST_MAX (64 * 1024)
 #define NATIVE_PROXY_BODY_MAX (1024 * 1024)
 #define NATIVE_PROXY_RESPONSE_MAX (4 * 1024 * 1024)
@@ -404,25 +406,43 @@ static int native_plugin_installed(const char *plugin_id)
     return 1;
 }
 
-struct json_object *webd_native_plugins_scan(void)
+struct json_object *webd_native_plugins_scan_checked(int *errors)
 {
     struct json_object *plugins = json_object_new_array();
     DIR *dir = opendir(NATIVE_PLUGIN_ROOT);
     struct dirent *entry;
 
-    if (!dir)
+    if (errors)
+        *errors = 0;
+    if (!dir) {
+        if (errors && errno != ENOENT)
+            *errors = 1;
         return plugins;
-    while ((entry = readdir(dir)) != NULL) {
+    }
+    for (;;) {
         struct json_object *manifest;
-
+        errno = 0;
+        entry = readdir(dir);
+        if (!entry) {
+            if (errors && errno)
+                (*errors)++;
+            break;
+        }
         if (entry->d_name[0] == '.')
             continue;
         manifest = read_manifest(entry->d_name);
         if (manifest)
             json_object_array_add(plugins, manifest);
+        else if (errors)
+            (*errors)++;
     }
     closedir(dir);
     return plugins;
+}
+
+struct json_object *webd_native_plugins_scan(void)
+{
+    return webd_native_plugins_scan_checked(NULL);
 }
 
 static struct json_object *find_menu_group(struct json_object *items, const char *id)

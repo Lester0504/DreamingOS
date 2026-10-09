@@ -2,6 +2,11 @@
 /* DreamingWrt webd unauthenticated static/login shell serving. */
 #include <stdio.h>
 #include <string.h>
+#include <unistd.h>
+#include <spawn.h>
+#include <sys/wait.h>
+#include <fcntl.h>
+#include <errno.h>
 #include "webd_http.h"
 #include "webd_static.h"
 
@@ -15,6 +20,29 @@
 #define WEBD_CLIENT_UPLOAD_URL "/luci-static/dreamingwrt/uploads/clients/"
 #define WEBD_CLIENT_UPLOAD_ROOT "/etc/dreamingwrt/uploads/clients"
 #define WEBD_CLIENT_UPLOAD_LEGACY_ROOT "/www/luci-static/dreamingwrt/uploads/clients"
+#define WEBD_RESOURCE_IMAGE_URL "/luci-static/dreamingwrt/fingerprint/images/"
+#define WEBD_RESOURCE_IMAGE_ROOT "/etc/dreamingwrt/fingerprint/images"
+
+/* Runs in a request worker; argv is never interpreted by a shell. */
+static int webd_resource_image_fetch(const char *relative)
+{
+    extern char **environ;
+    char *args[] = {"dreamingwrt-resource-sync", "--image", (char *)relative, NULL};
+    posix_spawn_file_actions_t actions;
+    pid_t pid;
+    int status = 0;
+    posix_spawn_file_actions_init(&actions);
+    posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_WRONLY, 0);
+    int rc = posix_spawn(&pid, "/usr/bin/dreamingwrt-resource-sync", &actions, NULL, args, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (rc != 0)
+        return 1;
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno != EINTR)
+            return 1;
+    }
+    return WIFEXITED(status) ? WEXITSTATUS(status) : 1;
+}
 
 static int webd_static_rel_ok(const char *rel)
 {
@@ -88,6 +116,10 @@ int webd_send_static(int fd, const char *path, const char *method, int accepts_g
         root = WEBD_CLIENT_UPLOAD_ROOT;
         fallback_root = WEBD_CLIENT_UPLOAD_LEGACY_ROOT;
         rel = path + strlen(WEBD_CLIENT_UPLOAD_URL);
+    } else if (!strncmp(path, WEBD_RESOURCE_IMAGE_URL, strlen(WEBD_RESOURCE_IMAGE_URL))) {
+        root = WEBD_RESOURCE_IMAGE_ROOT;
+        fallback_root = "/usr/share/dreamingwrt/fingerprint/images";
+        rel = path + strlen(WEBD_RESOURCE_IMAGE_URL);
     } else if (!strncmp(path, "/luci-static/", 13)) {
         root = "/www/luci-static";
         rel = path + 13;
@@ -114,6 +146,20 @@ int webd_send_static(int fd, const char *path, const char *method, int accepts_g
             return 1;
     }
 
+    if (!strcmp(root, WEBD_RESOURCE_IMAGE_ROOT)) {
+        if (method && !strcmp(method, "HEAD")) {
+            http_send(fd, 404, "Not Found", "text/plain", "not cached", 10);
+            return 1;
+        }
+        int rc = webd_resource_image_fetch(rel);
+        if (rc == 0 && http_send_file_path_encoded(fd, full, method, accepts_gzip) == 0)
+            return 1;
+        const char *body = rc == 77 ? "{\"ok\":false,\"error\":\"license_denied\"}" :
+                                    "{\"ok\":false,\"error\":\"resource_unavailable\"}";
+        http_send(fd, rc == 77 ? 403 : 503, rc == 77 ? "Forbidden" : "Service Unavailable",
+                  "application/json", body, strlen(body));
+        return 1;
+    }
     http_send(fd, 404, "Not Found", "text/plain", "not found", 9);
     return 1;
 }

@@ -1,0 +1,552 @@
+{
+  "schema": "dwrt-appstore-catalog/1",
+  "note": "后端权威目录（webd 下发）。package 字段为服务端安装白名单：仅带 package 的应用可经 apk/opkg 安装，其余为浏览态。package 名须与设备实际 feed 核对，不存在则安装时由包管理器如实报错。",
+  "generated_at": "2026-09-19T15:40:00+08:00",
+  "source": "dwrt-appstore-seed",
+  "categories": [
+    {
+      "id": "featured",
+      "name": "精选推荐",
+      "icon": "star",
+      "description": "编辑精选的优质应用",
+      "sort": 0
+    },
+    {
+      "id": "media",
+      "name": "媒体娱乐",
+      "icon": "film",
+      "description": "音视频和娱乐应用",
+      "sort": 1
+    },
+    {
+      "id": "storage",
+      "name": "存储备份",
+      "icon": "hard-drive",
+      "description": "数据存储和备份",
+      "sort": 2
+    },
+    {
+      "id": "productivity",
+      "name": "效率工具",
+      "icon": "zap",
+      "description": "提升工作效率的应用",
+      "sort": 3
+    },
+    {
+      "id": "development",
+      "name": "开发工具",
+      "icon": "code",
+      "description": "开发者必备工具",
+      "sort": 4
+    },
+    {
+      "id": "network",
+      "name": "网络工具",
+      "icon": "globe",
+      "description": "网络和通信应用",
+      "sort": 5
+    },
+    {
+      "id": "security",
+      "name": "安全隐私",
+      "icon": "shield",
+      "description": "安全防护应用",
+      "sort": 6
+    },
+    {
+      "id": "tools",
+      "name": "系统工具",
+      "icon": "settings",
+      "description": "系统增强和管理工具",
+      "sort": 7
+    },
+    {
+      "id": "automation",
+      "name": "自动化",
+      "icon": "bot",
+      "description": "自动化和脚本工具",
+      "sort": 8
+    },
+    {
+      "id": "monitoring",
+      "name": "监控运维",
+      "icon": "activity",
+      "description": "系统监控和运维",
+      "sort": 9
+    },
+    {
+      "id": "ai",
+      "name": "AI 工具",
+      "icon": "cpu",
+      "description": "人工智能和机器学习应用",
+      "sort": 10
+    }
+  ],
+  "apps": [
+    {
+      "id": "adguard-home",
+      "name": "AdGuard Home",
+      "shortDescription": "全网络广告与追踪拦截 DNS",
+      "description": "AdGuard Home 是运行在网关上的全网络级 DNS 拦截器，为家中所有设备统一屏蔽广告、追踪与恶意域名，无需在每台设备单独安装。支持自定义过滤规则、DNS-over-HTTPS/TLS 加密上游、按客户端分组策略与解析日志。",
+      "category": "security",
+      "rating": 9.4,
+      "ratingCount": 18240,
+      "downloads": 3120000,
+      "version": "0.107.52",
+      "developer": "AdGuard",
+      "size": "28 MB",
+      "heroColor": "#2563eb",
+      "featured": true,
+      "homepage": true,
+      "tags": [
+        "DNS",
+        "去广告",
+        "隐私"
+      ],
+      "features": [
+        "全网络级广告拦截",
+        "DoH/DoT 加密上游",
+        "按客户端分组策略",
+        "实时解析查询日志",
+        "自定义过滤规则订阅"
+      ],
+      "requirements": [
+        "64 MB 可用内存",
+        "50 MB 存储空间"
+      ],
+      "package": "adguardhome"
+    },
+    {
+      "id": "wireguard",
+      "name": "WireGuard",
+      "shortDescription": "现代高速的加密 VPN 隧道",
+      "description": "WireGuard 是一款以简洁、高性能著称的现代 VPN。相比传统方案握手更快、代码面更小、更省电，适合在网关上搭建随时可用的远程接入与站点互联隧道。",
+      "category": "network",
+      "rating": 9.5,
+      "ratingCount": 15080,
+      "downloads": 2760000,
+      "version": "1.0.20210914",
+      "developer": "WireGuard",
+      "size": "6 MB",
+      "heroColor": "#c026d3",
+      "featured": true,
+      "homepage": true,
+      "tags": [
+        "VPN",
+        "隧道",
+        "远程接入"
+      ],
+      "features": [
+        "极简高性能隧道",
+        "现代加密套件",
+        "漫游友好",
+        "低功耗常驻",
+        "站点到站点互联"
+      ],
+      "requirements": [
+        "内核 WireGuard 模块",
+        "32 MB 可用内存"
+      ],
+      "package": "wireguard-tools"
+    },
+    {
+      "id": "jellyfin",
+      "name": "Jellyfin",
+      "shortDescription": "免费开源的媒体服务器",
+      "description": "Jellyfin 是一个免费的媒体系统，帮你集中管理并串流家中的电影、电视剧、音乐与图片。无需订阅、无遥测，支持多用户与丰富的客户端。",
+      "category": "media",
+      "rating": 9.0,
+      "ratingCount": 8920,
+      "downloads": 1850000,
+      "version": "10.8.13",
+      "developer": "Jellyfin Team",
+      "size": "180 MB",
+      "heroColor": "#7c3aed",
+      "featured": true,
+      "homepage": true,
+      "new": true,
+      "tags": [
+        "媒体服务器",
+        "视频",
+        "音乐"
+      ],
+      "features": [
+        "无需订阅完全免费",
+        "多用户支持",
+        "丰富客户端生态",
+        "元数据自动刮削",
+        "外挂字幕支持"
+      ],
+      "requirements": [
+        "1 GB 可用内存",
+        "外接存储推荐"
+      ]
+    },
+    {
+      "id": "samba",
+      "name": "Samba 文件共享",
+      "shortDescription": "局域网 SMB/CIFS 文件共享",
+      "description": "把接在网关上的硬盘变成局域网共享盘。Samba 提供标准 SMB/CIFS 协议，Windows、macOS 与移动端都能直接访问，支持多用户与访问控制。",
+      "category": "storage",
+      "rating": 8.6,
+      "ratingCount": 6410,
+      "downloads": 1440000,
+      "version": "4.19.2",
+      "developer": "Samba Team",
+      "size": "22 MB",
+      "heroColor": "#059669",
+      "featured": true,
+      "tags": [
+        "文件共享",
+        "SMB",
+        "NAS"
+      ],
+      "features": [
+        "标准 SMB/CIFS 协议",
+        "多用户与权限控制",
+        "跨平台访问",
+        "回收站与快照",
+        "时间机器备份目标"
+      ],
+      "requirements": [
+        "外接存储",
+        "64 MB 可用内存"
+      ],
+      "package": "samba4-server"
+    },
+    {
+      "id": "nextcloud",
+      "name": "Nextcloud",
+      "shortDescription": "私有云存储与协作平台",
+      "description": "Nextcloud 是开源的私有云解决方案，提供文件同步、共享、日历、联系人等能力，多端同步，是商业云盘的自托管替代。",
+      "category": "storage",
+      "rating": 9.2,
+      "ratingCount": 12580,
+      "downloads": 2580000,
+      "version": "28.0.1",
+      "developer": "Nextcloud GmbH",
+      "size": "512 MB",
+      "heroColor": "#0ea5e9",
+      "featured": true,
+      "tags": [
+        "云存储",
+        "协作",
+        "同步"
+      ],
+      "features": [
+        "文件同步与共享",
+        "日历联系人管理",
+        "在线文档编辑",
+        "端到端加密",
+        "丰富的应用生态"
+      ],
+      "requirements": [
+        "2 GB 可用内存",
+        "10 GB 存储空间"
+      ]
+    },
+    {
+      "id": "qbittorrent",
+      "name": "qBittorrent",
+      "shortDescription": "轻量无广告的 BT 下载器",
+      "description": "qBittorrent 是开源、无广告的 BitTorrent 客户端，带 Web 界面，可在网关上 7×24 挂机下载并直接落盘到共享存储。",
+      "category": "productivity",
+      "rating": 8.8,
+      "ratingCount": 9330,
+      "downloads": 1980000,
+      "version": "4.6.2",
+      "developer": "qBittorrent Project",
+      "size": "34 MB",
+      "heroColor": "#ea580c",
+      "tags": [
+        "下载",
+        "BT",
+        "远程管理"
+      ],
+      "features": [
+        "内置 Web 界面",
+        "顺序下载与限速",
+        "RSS 自动订阅",
+        "IP 过滤",
+        "落盘到共享存储"
+      ],
+      "requirements": [
+        "128 MB 可用内存",
+        "外接存储推荐"
+      ]
+    },
+    {
+      "id": "uptime-kuma",
+      "name": "Uptime Kuma",
+      "shortDescription": "自托管的服务可用性监控",
+      "description": "Uptime Kuma 是好看又易用的自托管监控工具，监测 HTTP、TCP、DNS 等目标的可用性，异常时通过多种渠道告警，并提供公开状态页。",
+      "category": "monitoring",
+      "rating": 9.3,
+      "ratingCount": 7620,
+      "downloads": 1360000,
+      "version": "1.23.11",
+      "developer": "Louis Lam",
+      "size": "120 MB",
+      "heroColor": "#16a34a",
+      "new": true,
+      "tags": [
+        "监控",
+        "告警",
+        "状态页"
+      ],
+      "features": [
+        "多协议探测",
+        "多渠道通知",
+        "美观状态页",
+        "证书到期提醒",
+        "多监控分组"
+      ],
+      "requirements": [
+        "256 MB 可用内存"
+      ]
+    },
+    {
+      "id": "vaultwarden",
+      "name": "Vaultwarden",
+      "shortDescription": "自托管的 Bitwarden 密码库",
+      "description": "Vaultwarden 是资源占用极低的 Bitwarden 兼容服务端，可在网关上自托管你的密码库，兼容官方全平台客户端与浏览器扩展。",
+      "category": "security",
+      "rating": 9.1,
+      "ratingCount": 10240,
+      "downloads": 2210000,
+      "version": "1.30.1",
+      "developer": "Vaultwarden",
+      "size": "48 MB",
+      "heroColor": "#0d9488",
+      "featured": true,
+      "tags": [
+        "密码管理",
+        "自托管",
+        "加密"
+      ],
+      "features": [
+        "Bitwarden 客户端兼容",
+        "端到端加密",
+        "组织与共享",
+        "两步验证",
+        "极低资源占用"
+      ],
+      "requirements": [
+        "128 MB 可用内存"
+      ]
+    },
+    {
+      "id": "code-server",
+      "name": "Code Server",
+      "shortDescription": "浏览器中的 VS Code",
+      "description": "Code Server 让你在浏览器里运行完整的 VS Code，随时随地通过网关访问你的开发环境，支持插件、终端与远程工作区。",
+      "category": "development",
+      "rating": 8.9,
+      "ratingCount": 8110,
+      "downloads": 1520000,
+      "version": "4.20.0",
+      "developer": "Coder",
+      "size": "240 MB",
+      "heroColor": "#4f46e5",
+      "homepage": true,
+      "tags": [
+        "IDE",
+        "远程开发",
+        "VS Code"
+      ],
+      "features": [
+        "完整 VS Code 体验",
+        "浏览器随处访问",
+        "插件与终端支持",
+        "远程工作区",
+        "多用户隔离"
+      ],
+      "requirements": [
+        "1 GB 可用内存",
+        "2 GB 存储空间"
+      ]
+    },
+    {
+      "id": "home-assistant",
+      "name": "Home Assistant",
+      "shortDescription": "本地优先的智能家居中枢",
+      "description": "Home Assistant 是本地优先、隐私友好的开源智能家居平台，聚合上千种设备与服务，提供强大的自动化编排能力。",
+      "category": "automation",
+      "rating": 9.4,
+      "ratingCount": 16820,
+      "downloads": 2940000,
+      "version": "2024.1",
+      "developer": "Open Home Foundation",
+      "size": "420 MB",
+      "heroColor": "#0891b2",
+      "featured": true,
+      "tags": [
+        "智能家居",
+        "自动化",
+        "本地控制"
+      ],
+      "features": [
+        "上千种设备集成",
+        "本地优先隐私友好",
+        "强大自动化引擎",
+        "可视化仪表盘",
+        "语音助手接入"
+      ],
+      "requirements": [
+        "2 GB 可用内存",
+        "推荐外接存储"
+      ]
+    },
+    {
+      "id": "syncthing",
+      "name": "Syncthing",
+      "shortDescription": "去中心化的设备间文件同步",
+      "description": "Syncthing 在你自己的设备之间持续、安全地同步文件，无需任何云服务，数据始终留在你掌控的设备上。",
+      "category": "storage",
+      "rating": 9.0,
+      "ratingCount": 7010,
+      "downloads": 1290000,
+      "version": "1.27.2",
+      "developer": "Syncthing Foundation",
+      "size": "26 MB",
+      "heroColor": "#2563eb",
+      "tags": [
+        "同步",
+        "去中心化",
+        "隐私"
+      ],
+      "features": [
+        "点对点加密同步",
+        "无需云服务",
+        "版本历史",
+        "选择性同步",
+        "跨平台"
+      ],
+      "requirements": [
+        "128 MB 可用内存"
+      ],
+      "package": "syncthing"
+    },
+    {
+      "id": "pihole",
+      "name": "Pi-hole",
+      "shortDescription": "经典的网络级 DNS 去广告",
+      "description": "Pi-hole 是广受欢迎的网络级广告拦截器，作为 DNS sinkhole 为全网设备屏蔽广告与追踪，附带直观的统计仪表盘。",
+      "category": "network",
+      "rating": 9.1,
+      "ratingCount": 13440,
+      "downloads": 2680000,
+      "version": "5.18.2",
+      "developer": "Pi-hole LLC",
+      "size": "30 MB",
+      "heroColor": "#dc2626",
+      "tags": [
+        "DNS",
+        "去广告",
+        "统计"
+      ],
+      "features": [
+        "网络级广告拦截",
+        "直观统计仪表盘",
+        "黑白名单管理",
+        "按客户端查询日志",
+        "上游 DNS 可选"
+      ],
+      "requirements": [
+        "64 MB 可用内存"
+      ]
+    },
+    {
+      "id": "frpc",
+      "name": "frp 内网穿透",
+      "shortDescription": "把内网服务安全暴露到公网",
+      "description": "frp 是高性能的反向代理，帮你把网关后的内网服务通过一台有公网 IP 的服务器安全地暴露出去，支持 TCP/UDP/HTTP/HTTPS。",
+      "category": "network",
+      "rating": 8.7,
+      "ratingCount": 5920,
+      "downloads": 1180000,
+      "version": "0.54.0",
+      "developer": "fatedier",
+      "size": "12 MB",
+      "heroColor": "#7c3aed",
+      "tags": [
+        "内网穿透",
+        "反向代理",
+        "远程访问"
+      ],
+      "features": [
+        "多协议穿透",
+        "加密与压缩",
+        "多路复用",
+        "断线自动重连",
+        "细粒度端口映射"
+      ],
+      "requirements": [
+        "一台公网服务器",
+        "16 MB 可用内存"
+      ],
+      "package": "frpc"
+    },
+    {
+      "id": "netdata",
+      "name": "Netdata",
+      "shortDescription": "秒级粒度的实时性能监控",
+      "description": "Netdata 提供开箱即用、秒级粒度的实时系统监控，自动发现指标并渲染精美图表，适合盯住网关的 CPU、内存、磁盘与网络。",
+      "category": "monitoring",
+      "rating": 9.2,
+      "ratingCount": 8830,
+      "downloads": 1610000,
+      "version": "1.44.1",
+      "developer": "Netdata Inc.",
+      "size": "95 MB",
+      "heroColor": "#16a34a",
+      "tags": [
+        "监控",
+        "实时",
+        "图表"
+      ],
+      "features": [
+        "秒级实时指标",
+        "零配置自动发现",
+        "精美内置仪表盘",
+        "异常检测",
+        "低开销采集"
+      ],
+      "requirements": [
+        "256 MB 可用内存"
+      ],
+      "package": "netdata"
+    },
+    {
+      "id": "ollama",
+      "name": "Ollama",
+      "shortDescription": "在本地运行大语言模型",
+      "description": "Ollama 让你在自己的硬件上便捷地拉取并运行开源大语言模型，数据不出本地，提供简单的 API 供其他应用调用。",
+      "category": "ai",
+      "rating": 9.0,
+      "ratingCount": 9640,
+      "downloads": 1730000,
+      "version": "0.1.20",
+      "developer": "Ollama",
+      "size": "680 MB",
+      "heroColor": "#4338ca",
+      "new": true,
+      "tags": [
+        "大模型",
+        "本地推理",
+        "隐私"
+      ],
+      "features": [
+        "一键拉取开源模型",
+        "本地推理数据不出网",
+        "简洁 REST API",
+        "多模型管理",
+        "量化模型支持"
+      ],
+      "requirements": [
+        "4 GB 可用内存",
+        "推荐独立 GPU"
+      ]
+    }
+  ]
+}

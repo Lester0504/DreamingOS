@@ -5,9 +5,12 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text
 PROTOCOL = (ROOT / "src/ai_local_rpc_protocol.h").read_text()
 SERVER = (ROOT / "src/webd/ai_local_rpc.c").read_text()
-API = (ROOT / "src/webd/jmx_app_api.c").read_text()
+API = webd_dispatch_text()
 CLI = (ROOT / "src/ctl/jmctl.c").read_text()
 MAKEFILE = (ROOT / "src/Makefile").read_text()
 

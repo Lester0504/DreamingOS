@@ -114,20 +114,22 @@ def main() -> None:
         assert listing["path"] == str(mount)
         assert listing["capabilities"]["list"] is True
         assert listing["capabilities"]["read"] is False
+        assert listing["capabilities"]["upload"] is True
+        assert listing["limits"]["max_edit_bytes"] == 256 * 1024
         assert listing["capabilities"]["download"] is False
         # A writable root reports exactly the four actions
         # POST /storage/files/mutate accepts.  These were pinned false until
         # 2026-08-08, which greyed out the file manager's create/save/rename
         # buttons even after the write route was wired.
-        for capability in ("mkdir", "create", "rename", "write"):
+        for capability in ("mkdir", "create", "rename", "write",
+                           "delete", "move", "copy"):
             assert listing["capabilities"][capability] is True, (
                 f"{capability} must follow root writability"
             )
         # Everything below has no backend endpoint; reporting it true would
         # enable UI controls that cannot work.
-        for capability in ("upload", "delete", "copy", "move", "compress",
-                           "extract", "permissions", "download_url",
-                           "install_package"):
+        for capability in ("compress", "extract", "permissions",
+                           "download_url", "install_package"):
             assert listing["capabilities"][capability] is False, (
                 f"{capability} has no backend endpoint and must stay false"
             )
@@ -146,7 +148,7 @@ def main() -> None:
         assert by_name["alpha.txt"]["mime"] == "text/plain; charset=utf-8"
         assert by_name["alpha.txt"]["capabilities"]["read"] is True
         assert by_name["alpha.txt"]["capabilities"]["preview"] is True
-        assert by_name["alpha.txt"]["capabilities"]["download"] is False
+        assert by_name["alpha.txt"]["capabilities"]["download"] is True
         assert by_name["binary.bin"]["capabilities"]["read"] is False
         assert by_name["invalid.txt"]["capabilities"]["read"] is False
         assert by_name["large.txt"]["capabilities"]["read"] is False
@@ -162,7 +164,7 @@ def main() -> None:
         assert alpha["encoding"] == "utf-8"
         assert alpha["newline"] == "none"
         assert alpha["size_bytes"] == 5
-        assert alpha["read_only"] is True
+        assert alpha["read_only"] is False
         assert alpha["truncated"] is False
         assert alpha["etag"].startswith('W/"')
 

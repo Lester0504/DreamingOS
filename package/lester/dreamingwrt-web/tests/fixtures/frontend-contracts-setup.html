@@ -1,0 +1,24 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"><link rel="stylesheet" href="/static/css/setup-welcome.css?v=wide-1006"><title>PPPoE import synthetic contract fixture</title></head><body><div id="setupRoot"></div><script>
+(async () => {
+ const realFetch=window.fetch.bind(window);
+ const authority=new URLSearchParams(location.search).get('authority')==='1';
+ if(authority)document.querySelector('link[rel=stylesheet]').href='/static/css/setup-welcome.css?authority=1';
+ const source=await (await realFetch('/static/js/setup-welcome.js?v=wide-1007'+(authority?'&authority=1':''))).text();
+ window.fixtureCalls=[]; window.fixtureMode=new URLSearchParams(location.search).get('mode')||'captured';window.fixturePoll=0;
+ const setup={initialized:false,supported_wifi:false,capabilities:{pppoe_server:fixtureMode!=='disabled'},device:{hostname:'Fixture'},wan_detection:{state:'done',recommended_device:'eth1',recommended_proto:'dhcp',candidates:[{device:'eth1'},{device:'eth2'}]}};
+ window.fetch=async(url,options={})=>{
+  if(!String(url).startsWith('/api/'))return realFetch(url,options);
+  const method=options.method||'GET'; fixtureCalls.push({url,method,body:options.body?JSON.parse(options.body):null});
+  let status=200,data={};
+  if(String(url).includes('/session/init'))data={requires_initial_setup:true,setup_token:'fixture-only',setup_token_expires_in:600};
+  else if(String(url).includes('/setup/status'))data=setup;
+  else if(String(url).includes('/detect-wan'))data=setup.wan_detection;
+  else if(String(url).includes('/import-config/start')) { fixturePoll=0; if(fixtureMode==='rejected'){status=409;data={ok:false,error:{code:'capability_disabled'}};}else data={session_id:'fixture-session',status:'listening',expires_in:120}; }
+  else if(String(url).includes('/import-config/status')) { fixturePoll++; data=fixtureMode==='timeout'?{status:'timeout'}:fixtureMode==='error'?{status:'error'}:fixturePoll<2?{status:'padi_seen'}:{status:'captured',captured:{username:'fixture@isp.test',password:'synthetic-only-password',ac_name:'Fixture AC',service_name:'PPPoE'}}; }
+  else if(String(url).includes('/import-config/stop')){ if(fixtureMode==='stopfail'){status=503;data={ok:false,error:{code:'stop_failed'}};}else data={ok:true}; }
+  else if(String(url).includes('/save-wan') && fixtureMode==='savefail'){status=409;data={ok:false,error:{code:'wan_save_failed'}};}
+  return {ok:status<400,status,text:async()=>JSON.stringify({ok:status<400,data})};
+ };
+ // Instrument only fixture initialization; all handlers/rendering are the production source.
+ (0,eval)(source.replace('  init();', `  init().then(() => { updateStep('network'); setVal('lanIp','192.168.77.1',true); setVal('poolStart','100',true); setVal('poolEnd','200',true); syncImportConfigEntry(); });`));
+})();</script></body></html>

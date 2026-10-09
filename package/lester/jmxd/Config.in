@@ -1,0 +1,40 @@
+menu "DreamingOS device preset"
+
+choice
+	prompt "Factory device role"
+	default DREAMINGOS_DEVICE_ROLE_INHERIT
+
+config DREAMINGOS_DEVICE_ROLE_INHERIT
+	bool "Inherit existing device defaults"
+
+config DREAMINGOS_DEVICE_ROLE_GATEWAY
+	bool "Gateway"
+
+config DREAMINGOS_DEVICE_ROLE_AP
+	bool "Managed access point"
+
+endchoice
+
+config DREAMINGOS_DATA_STORAGE_AUTO
+	bool "Prefer authorized non-system storage for growing datasets"
+	default n
+	help
+	  Applies only to unassigned datasets. Existing bindings and manual
+	  work_dir settings win. Never formats disks or changes extroot.
+
+config DREAMINGOS_STORAGE_AUTOMOUNT
+	bool "Mount explicitly authorized existing data partitions at startup"
+	depends on DREAMINGOS_DATA_STORAGE_AUTO
+	default n
+	help
+	  Does not override disabled fstab entries or authorize existing disks.
+
+config DREAMINGOS_STORAGE_PRIORITY
+	string "Data media priority (system must be last)"
+	depends on DREAMINGOS_DATA_STORAGE_AUTO
+	default "nvme,disk,usb,sd,emmc,system"
+	help
+	  Comma-separated media classes. Unknown or duplicate entries fail
+	  generation. eMMC remains explicit-only pending product approval.
+
+endmenu

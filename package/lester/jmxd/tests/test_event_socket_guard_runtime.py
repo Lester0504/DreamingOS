@@ -20,7 +20,8 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-API = ROOT / "src/webd/jmx_app_api.c"
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text
 FIXTURE = ROOT / "tests/event_socket_guard_fixture.c"
 
 failures: list[str] = []
@@ -90,7 +91,7 @@ def main() -> int:
               "a restart must be able to take the socket once the owner exits")
 
         # Production source must actually carry the guard, not just the fixture.
-        source = API.read_text()
+        source = webd_dispatch_text()
         check("APP_API_EVENT_SOCKET_LOCK" in source,
               "jmx_app_api.c must define a lock path for the event socket")
         check("flock(lock_fd, LOCK_EX | LOCK_NB)" in source,

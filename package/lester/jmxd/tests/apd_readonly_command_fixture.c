@@ -13,7 +13,10 @@ static int child_mode(const char *mode)
         return 0;
     }
     if (!strcmp(mode, "child-fail"))
+    {
+        fputs("fixture-stderr", stderr);
         return 3;
+    }
     if (!strcmp(mode, "child-sleep")) {
         sleep(2);
         return 0;
@@ -59,9 +62,10 @@ int main(int argc, char **argv)
     child_argv[1] = (char *)child;
     child_argv[2] = NULL;
     rc = apd_readonly_command(argv[0], child_argv, &result);
-    printf("rc=%d exit=%d timeout=%d output_limited=%d length=%zu text=%s\n", rc,
+    printf("rc=%d exit=%d timeout=%d output_limited=%d length=%zu text=%s stderr=%s stderr_limited=%d\n", rc,
            result.exit_status, result.timed_out, result.output_limited, result.length,
-           result.text ? result.text : "");
+           result.text ? result.text : "",
+           result.stderr_text ? result.stderr_text : "", result.stderr_limited);
     apd_command_result_free(&result);
     return 0;
 }

@@ -126,8 +126,17 @@ void jmx_netlink_handler(struct uloop_fd *u, unsigned int ev)
     }
 
     struct json_object *ip_obj = json_object_object_get(root, "ip");
-    if (ip_obj)
-        strncpy(node->ip, json_object_get_string(ip_obj), sizeof(node->ip));
+    if (ip_obj) {
+        /* strncpy writes no terminator when the source is at least as long as
+         * the field, so the length must be one less and the NUL explicit. The
+         * ipv6 branch just below already does it this way. */
+        const char *ip_str = json_object_get_string(ip_obj);
+
+        if (ip_str) {
+            strncpy(node->ip, ip_str, sizeof(node->ip) - 1);
+            node->ip[sizeof(node->ip) - 1] = '\0';
+        }
+    }
     
     struct json_object *ipv6_obj = json_object_object_get(root, "ipv6");
     if (ipv6_obj) {
@@ -396,7 +405,9 @@ int jmx_v2_netlink_init(void)
         return -1;
     }
     memset(&nls, 0, sizeof(struct sockaddr_nl));
-    nls.nl_pid = getpid();
+    /* Other core clients may already own the process port. Ask the kernel
+     * for a distinct port; replies use the sending socket's netlink port. */
+    nls.nl_pid = 0;
     nls.nl_groups = 0;
     nls.nl_family = AF_NETLINK;
 

@@ -49,6 +49,8 @@ def production_contract() -> None:
         "apd_neighbor_scan_log_failure",
         ".neighbor_scan = apd_backend_neighbor_scan",
         "static int apd_survey_scan_collect",
+        "has_radio_index",
+        '"Radios:"',
         '"survey", "dump", NULL',
         "apd_backend_survey_scan",
         "name_len = strlen(entry->d_name)",
@@ -88,8 +90,15 @@ def main() -> None:
         make_file(ieee / "phy1/index", "1\n")
         for name, index, state in (
             ("MLD1", 0, "up"),
+            ("phy0.0-ap0", 0, "up"),
+            ("phy0.1-ap0", 0, "up"),
+            ("phy0.2-ap0", 0, "up"),
             ("wifi0", 1, "unknown"),
             ("ath0", 1, "up"),
+            ("wifi1", 0, "unknown"),
+            ("wifi2", 0, "unknown"),
+            ("ath1", 0, "up"),
+            ("ath2", 0, "up"),
         ):
             make_file(net / f"{name}/phy80211/index", f"{index}\n")
             make_file(net / f"{name}/operstate", f"{state}\n")

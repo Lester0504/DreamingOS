@@ -40,6 +40,10 @@ extern "C" {
  */
 #define WEBD_BACKUP_RETENTION_FALLBACK 5u
 
+#define WEBD_BACKUP_RETENTION_DAYS_MIN      0u
+#define WEBD_BACKUP_RETENTION_DAYS_MAX      3650u
+#define WEBD_BACKUP_RETENTION_DAYS_FALLBACK 0u   /* permanent */
+
 /* Single backup: 64 MiB, matching the old staging ceiling for type "backup". */
 #define WEBD_BACKUP_MAX_BYTES (64ULL * 1024ULL * 1024ULL)
 
@@ -52,6 +56,8 @@ extern "C" {
  * keeps. */
 #define WEBD_BACKUP_FREQ_DAILY  "daily"
 #define WEBD_BACKUP_FREQ_WEEKLY "weekly"
+#define WEBD_BACKUP_FREQ_MONTHLY "monthly"
+#define WEBD_BACKUP_FREQ_ONCE   "once"
 
 struct webd_backup_meta {
     char backup_id[WEBD_BACKUP_ID_LEN + 1];
@@ -71,10 +77,11 @@ struct webd_backup_list {
 
 struct webd_backup_schedule {
     int enabled;
-    char frequency[16];       /* daily | weekly */
+    char frequency[16];       /* daily | weekly | monthly | once */
     int hour;                 /* 0-23, local time */
     int minute;               /* 0-59 */
     int weekday;              /* 0-6, Sunday=0; only meaningful when weekly */
+    int day_of_month;         /* 1-31; only meaningful when monthly */
     char owner_id[WEBD_BACKUP_OWNER_ID_LEN + 1];  /* who configured it */
     /*
      * When this schedule was last written. Acts as a floor on due-time: a window
@@ -128,6 +135,19 @@ int webd_backup_last_run_record(const char *result, const char *error,
  */
 unsigned webd_backup_retention_get(int *configured);
 int webd_backup_retention_set(unsigned count, char *err, size_t err_len);
+
+/*
+ * Retention days: age-based retention. 0 means permanent (no age limit).
+ * get() never fails: absent or corrupt state yields the fallback (0).
+ */
+unsigned webd_backup_retention_days_get(int *configured);
+int webd_backup_retention_days_set(unsigned days, char *err, size_t err_len);
+
+/*
+ * Purge backups older than retention_days.  Returns the number removed.
+ * No-op when retention_days is 0 (permanent) or not configured.
+ */
+unsigned webd_backup_purge_expired(void);
 
 /* Number of stored backups. Returns -1 on store failure. */
 int webd_backup_count(char *err, size_t err_len);

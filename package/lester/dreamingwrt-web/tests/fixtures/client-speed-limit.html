@@ -120,6 +120,7 @@
       item: { id: 'authentication-client-speed-limit' },
       ui: {
         mountAll: node => window.DWRT_UI_KIT.mountAll(node),
+        floatingSavebarMarkup: (...args) => window.DWRT_UI_KIT.floatingSavebarMarkup(...args),
         statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args),
         confirmationMarkup: (...args) => window.DWRT_UI_KIT.confirmationMarkup(...args)
       },

@@ -1009,11 +1009,24 @@ struct json_object *webd_ai_oauth_status(const char *provider, int *http_status)
     if (!state && strcmp(reason, "not_connected")) json_object_object_add(o, "state_reason", json_object_new_string(reason));
     reason[0] = 0;
     pending = encrypted_load(provider, "pending", reason, sizeof(reason));
-    json_object_object_add(o, "pending", json_object_new_boolean(pending != NULL));
     if (pending) {
-        json_object_object_add(o, "pending_expires_at", json_object_new_int64(
-            json_i64(pending, "expires_at", 0)));
-        json_object_put(pending);
+        long long pending_expires = json_i64(pending, "expires_at", 0);
+        if (pending_expires > 0 && pending_expires <= now_seconds()) {
+            /* Pending expired, delete it */
+            char pending_path[256];
+            if (!state_path(pending_path, sizeof(pending_path), provider, "pending"))
+                unlink(pending_path);
+            json_object_put(pending);
+            pending = NULL;
+            json_object_object_add(o, "pending", json_object_new_boolean(0));
+            json_object_object_add(o, "pending_state", json_object_new_string("expired"));
+        } else {
+            json_object_object_add(o, "pending", json_object_new_boolean(1));
+            json_object_object_add(o, "pending_expires_at", json_object_new_int64(pending_expires));
+            json_object_put(pending);
+        }
+    } else {
+        json_object_object_add(o, "pending", json_object_new_boolean(0));
     }
     return o;
 }
@@ -1193,8 +1206,15 @@ gemini_start_done:
     curl = curl_easy_init(); if (!curl) return result_error("curl_init_failed", NULL, 500, http_status);
     id = escape(curl, client_id); sc = escape(curl, scope);
     if (id && (!scope || sc)) {
-        if (scope) asprintf(&form, "client_id=%s&scope=%s", id, sc);
-        else asprintf(&form, "client_id=%s", id);
+        /* asprintf leaves form indeterminate on failure, so normalize it to NULL
+         * for the "if (form)" check below rather than reading uninitialized. */
+        if (scope) {
+            if (asprintf(&form, "client_id=%s&scope=%s", id, sc) < 0)
+                form = NULL;
+        } else {
+            if (asprintf(&form, "client_id=%s", id) < 0)
+                form = NULL;
+        }
     }
     if (form) response = http_form(p->device_url, form, &upstream, reason, sizeof(reason));
     curl_free(id); curl_free(sc); free(form); curl_easy_cleanup(curl);
@@ -1238,7 +1258,13 @@ struct json_object *webd_ai_oauth_poll(struct json_object *request,
         json_object_put(pending);
         return result_error("oauth_actor_mismatch", NULL, 403, http_status);
     }
-    if (json_i64(pending, "expires_at", 0) <= now_seconds()) { json_object_put(pending); return result_error("expired_token", "OAuth authorization expired", 410, http_status); }
+    if (json_i64(pending, "expires_at", 0) <= now_seconds()) {
+        char pending_path[256];
+        if (!state_path(pending_path, sizeof(pending_path), provider, "pending"))
+            unlink(pending_path);
+        json_object_put(pending);
+        return result_error("expired_token", "OAuth authorization expired", 410, http_status);
+    }
     if (!strcmp(p->id, "openai")) {
         const char *code = json_string(request, "code");
         const char *returned_state = json_string(request, "state");

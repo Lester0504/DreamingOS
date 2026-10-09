@@ -3,6 +3,7 @@
 #define DREAMINGWRT_NOTIFYD_INTERNAL_H
 
 #include <ctype.h>
+#include "jmx_dataset_path.h"
 #include <errno.h>
 #include <inttypes.h>
 #include <signal.h>
@@ -23,14 +24,22 @@
 #include <libubox/uloop.h>
 #include <libubox/utils.h>
 #include <libubus.h>
+#include "../event_semantics.h"
 #include "../jmx_storage_guard.h"
 
-#define NOTIFYD_DB_PATH "/etc/dreamingwrt/notify.db"
+#define NOTIFYD_DB_PATH jmx_dataset_path("notify")
 #define NOTIFYD_CONFIG_DB_PATH "/etc/dreamingwrt/config.db"
 #define NOTIFYD_SCHEMA_VERSION 1
 #define NOTIFYD_MAX_ID 96
 #define NOTIFYD_MAX_TEXT 512
-#define NOTIFYD_MAX_JSON 4096
+#define NOTIFYD_MAX_JSON 16384
+#define NOTIFYD_ROUTE_SCHEMA_VERSION 1
+#define NOTIFYD_MAX_ROUTE_ACTIONS 8
+#define NOTIFYD_MAX_ROUTE_WINDOWS 32
+#define NOTIFYD_MAX_ROUTE_RECEIVERS 64
+#define NOTIFYD_MAX_TEMPLATE_SUBJECT 256
+#define NOTIFYD_MAX_TEMPLATE_BODY 8192
+#define NOTIFYD_MAX_DEDUPE_WINDOW 86400
 #define NOTIFYD_DEFAULT_LIMIT 100
 #define NOTIFYD_MAX_LIMIT 500
 #define NOTIFYD_DELIVERY_TICK_MS 2000
@@ -39,6 +48,16 @@
 #define NOTIFYD_DELIVERIES_MAX_ROWS 20000
 #define NOTIFYD_OUTBOX_DONE_RETENTION_SEC (7 * 86400)
 #define NOTIFYD_OUTBOX_PENDING_RETENTION_SEC (2 * 86400)
+/*
+ * Per-user notification preference limits.
+ *
+ * A timed mute is bounded so a mis-set expiry cannot silence an account
+ * indefinitely by accident; a genuinely indefinite mute is expressed as
+ * muted_until=0 and is therefore explicit rather than a side effect of a bad
+ * timestamp.
+ */
+#define NOTIFYD_USER_MUTE_MAX_DURATION_S (30 * 86400)
+#define NOTIFYD_MAX_PREF_CHANNELS 32
 
 struct notifyd_channel {
     char id[NOTIFYD_MAX_ID];
@@ -60,14 +79,31 @@ struct notifyd_settings {
     char smtp_from[256];
     char smtp_username[256];
     char smtp_password[512];
+    char mute_schedule_json[NOTIFYD_MAX_JSON];
 };
 
 struct notifyd_outbox_item {
     char id[NOTIFYD_MAX_ID];
     char channel_id[NOTIFYD_MAX_ID];
     char payload_json[NOTIFYD_MAX_JSON];
+    char delivery_options_json[NOTIFYD_MAX_JSON];
+    int action_index;
     int attempts;
     int max_attempts;
+};
+
+/*
+ * Outcome of one delivery attempt.
+ *
+ * Suppression is deliberately not folded into failure. A recipient who muted
+ * their own notifications is an intended, terminal outcome; reporting it as a
+ * failure would drive notifyd status to "degraded", burn retry attempts and put
+ * a red row in the delivery table for something the user asked for.
+ */
+enum notifyd_delivery_outcome {
+    NOTIFYD_DELIVERY_FAILED = 0,
+    NOTIFYD_DELIVERY_OK = 1,
+    NOTIFYD_DELIVERY_SUPPRESSED = 2,
 };
 
 extern sqlite3 *g_notify_db;
@@ -111,6 +147,15 @@ struct json_object *notifyd_channels_delete(struct json_object *body);
 struct json_object *notifyd_routes_json(void);
 struct json_object *notifyd_routes_update(struct json_object *body);
 struct json_object *notifyd_routes_delete(struct json_object *body);
+struct json_object *notifyd_triggers_json(struct json_object *body);
+struct json_object *notifyd_preferences_get(struct json_object *body);
+struct json_object *notifyd_preferences_update(struct json_object *body);
+/*
+ * Whether `username` has silenced deliveries that would reach them through
+ * `channel_id`. Evaluated against the stored expiry at call time, so a timed
+ * mute lapses on its own without a timer or a client clock.
+ */
+int notifyd_user_mute_active(const char *username, const char *channel_id);
 int notifyd_channel_get(const char *id, struct notifyd_channel *out);
 int notifyd_prune_if_needed(void);
 struct json_object *notifyd_enqueue_event(struct json_object *body);
@@ -119,11 +164,11 @@ struct json_object *notifyd_outbox_list(struct json_object *body);
 struct json_object *notifyd_outbox_get(struct json_object *body);
 struct json_object *notifyd_outbox_retry(struct json_object *body);
 int notifyd_delivery_record(const char *outbox_id, const char *channel_id,
-                            int ok, long http_status, const char *error,
-                            int duration_ms);
+                            int outcome, long http_status, const char *error,
+                            int duration_ms, int suppressed_recipients);
 int notifyd_mark_delivery_result(const struct notifyd_outbox_item *item,
-                                 int ok, long http_status, const char *error,
-                                 int duration_ms);
+                                 int outcome, long http_status, const char *error,
+                                 int duration_ms, int suppressed_recipients);
 
 struct json_object *notifyd_test_send(struct json_object *body);
 struct json_object *notifyd_deliver_one(const char *id);

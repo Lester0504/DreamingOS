@@ -1,0 +1,20 @@
+#!/bin/sh
+#
+# First-boot defaults for the DreamingOS cloud relay client.
+#
+# Only fills in absent options so an upgrade cannot clobber an operator's
+# configured relay host or tunnel token. Never enables the service: remote
+# access has to be a deliberate choice.
+#
+
+[ -n "$(uci -q get relay.service)" ] || {
+	uci -q set relay.service=relay
+}
+
+[ -n "$(uci -q get relay.service.enabled)" ] || uci -q set relay.service.enabled='0'
+[ -n "$(uci -q get relay.service.port)" ] || uci -q set relay.service.port='443'
+[ -n "$(uci -q get relay.service.tls_verify)" ] || uci -q set relay.service.tls_verify='1'
+
+uci -q commit relay
+
+exit 0

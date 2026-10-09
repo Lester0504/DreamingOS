@@ -14,6 +14,12 @@ struct json_object *wifi_channel_ai_plan_json(struct json_object *wifi_data,
 struct json_object *wifi_channel_ai_status_json(struct json_object *wifi_data,
                                                 int64_t now_s);
 
+/* Convert one immutable plan into a side-effect-free apply manifest.  The
+ * caller still owns dispatch: local radios use the core Wi-Fi transaction;
+ * one managed AP uses the AC/APD candidate transaction. */
+struct json_object *wifi_channel_ai_apply_manifest_json(
+    struct json_object *plan);
+
 /* Channel-plan writes remain fail-closed until the AC/APD transaction gate is
  * explicitly opened. */
 struct json_object *wifi_channel_ai_apply_disabled_json(const char *plan_id,

@@ -376,7 +376,30 @@
 .system-user-settings-dirty { padding: 9px 12px; border-radius: 9px; color: #a8cbff; background: rgba(75,145,255,.10); box-shadow: inset 0 0 0 1px rgba(113,174,255,.18); font-size: 12px; }
 .system-user-settings-dirty[hidden] { display: none; }
 
+/*
+ * 「安全策略」段：单用户 API-Key 禁令开关、周期性改密周期，以及两者在后端
+ * 尚无合同时的缺口说明。
+ *
+ * 三者都是**卡内行内元素**，不自带卡片形制：这一段已经在
+ * `.system-user-settings-card` 里，再套一层圆角背景就是卡中卡（design.md 第 523 条）。
+ * 缺口说明用中性墨色而不是 notice 的琥珀色——「后端还没这个能力」是事实陈述，
+ * 不是需要用户处理的告警，用告警色会让人以为出了故障。
+ */
+.system-user-policy-row { min-width: 0; display: grid; grid-template-columns: 16px minmax(0, 1fr); align-items: start; gap: 10px; cursor: pointer; }
+.system-user-policy-row input { width: 16px; height: 16px; margin: 1px 0 0; accent-color: #4a99ff; }
+.system-user-policy-row input:disabled { cursor: not-allowed; }
+.system-user-policy-row > span { min-width: 0; display: grid; gap: 3px; color: var(--app-text); font-size: 12.5px; font-weight: 720; }
+.system-user-policy-row > span small { color: var(--app-text-muted); font-size: 11px; font-weight: 600; line-height: 1.5; }
+.system-user-policy-note { color: var(--app-text-secondary); font-size: 11.5px; line-height: 1.55; }
+.system-user-policy-gap { color: var(--app-text-muted); font-size: 11.5px; line-height: 1.6; }
+
 .system-users-form { display: grid; grid-template-columns: repeat(2,minmax(0,1fr)); gap: 14px; }
+/*
+ * 安全策略段是单列。这条必须写在 `.system-users-form` **之后**：两者特异度相同
+ * （都是一个 class），靠顺序决胜。写在前面时被两列规则覆盖，实测每格只有 183px
+ * 宽（卡宽 411px），两段说明文字被挤成并排两条窄柱，读起来像两栏报纸。
+ */
+.system-user-policy-form { grid-template-columns: minmax(0, 1fr); }
 .system-users-form label { min-width: 0; display: grid; gap: 6px; }
 .system-users-form label.is-wide { grid-column: 1/-1; }
 .system-users-form label > span { color: var(--app-text-secondary); font-size: 12px; font-weight: 720; }
@@ -385,6 +408,19 @@
 .system-users-form input:focus,
 .system-users-form select:focus { border-color: rgba(74,153,255,.48); box-shadow: 0 0 0 3px rgba(43,123,255,.10); }
 .system-users-notice { padding: 11px 12px; border-radius: 9px; color: #f4c56e; background: rgba(245,166,35,.10); box-shadow: inset 0 0 0 1px rgba(245,166,35,.17); font-size: 12px; line-height: 1.5; }
+/*
+ * API 密钥的告知性文案。三种都只是卡内/抽屉内的行内说明，不是独立卡片：
+ * 不引入自己的圆角背景阴影组合，避免在玻璃卡里形成卡中卡（design.md 第 523 条）。
+ * 风险条与更换提示共用 notice 的琥珀语义色；明文块用等宽字体并允许任意换行，
+ * 因为密钥是一长串无空格字符，不换行会把抽屉撑出横向滚动。
+ */
+.system-users-api-hint { margin: 0 14px 12px; }
+.system-users-api-risk { line-height: 1.6; }
+.system-users-api-tier-hint,
+.system-users-api-rotate-hint { color: var(--app-text-muted); font-size: 12px; line-height: 1.6; }
+.system-users-api-tier-hint.is-risky { color: #f4c56e; }
+.system-users-api-plaintext { padding: 12px; border-radius: 10px; background: rgba(8,14,26,.34); box-shadow: inset 0 0 0 1px rgba(255,255,255,.10); }
+.system-users-api-plaintext code { display: block; color: var(--app-text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 13px; line-height: 1.6; overflow-wrap: anywhere; user-select: all; }
 .system-user-group-list,
 .system-users-import-list { display: grid; gap: 6px; }
 .system-user-group-list > div,

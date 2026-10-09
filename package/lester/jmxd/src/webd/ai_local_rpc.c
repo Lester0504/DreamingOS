@@ -263,3 +263,12 @@ void webd_ai_local_rpc_done(void)
     unlink(DREAMINGWRT_AI_LOCAL_SOCKET);
     memset(&g_ai_local_hooks, 0, sizeof(g_ai_local_hooks));
 }
+
+void webd_ai_local_rpc_close_in_child(void)
+{
+    if (g_ai_local_listener.fd >= 0) {
+        close(g_ai_local_listener.fd);
+        g_ai_local_listener.fd = -1;
+    }
+    memset(&g_ai_local_hooks, 0, sizeof(g_ai_local_hooks));
+}

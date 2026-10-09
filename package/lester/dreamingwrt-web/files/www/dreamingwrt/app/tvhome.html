@@ -1,0 +1,31 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>TV 桌面 2.0 · DreamingOS</title>
+<link rel="icon" href="/static/images/logo-64.png">
+<link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
+<link rel="stylesheet" href="/static/css/theme-families.css?v=20261008-desktop-material-01">
+<link rel="stylesheet" href="/static/ui-kit/dwrt-ui-kit.css?v=20261001-tvhome-n1-01">
+<link rel="stylesheet" href="/static/desktop/dwrt-rail.css?v=20261008-desktop-material-01">
+<style>html,body,#tvhomeApp{height:100%;margin:0;min-width:0}body{color:var(--dwrt-text-primary);font-family:var(--dwrt-font-family,system-ui);background:transparent}html:not([data-desktop-embedded]) body{background:var(--color-surface-solid)}*{box-sizing:border-box}</style>
+<script src="/static/js/dwrt-session-gate.js?v=20260808-region-ink-uses-painted-density-01"></script>
+<script src="/static/js/menu-icons.js?v=20261001-tvhome-n1-01"></script>
+<script src="/static/ui-kit/dwrt-ui-kit.js?v=20261001-tvhome-n1-01"></script>
+<script>
+(()=>{const root=document.documentElement;
+ function stamp(){let source;try{if(parent!==window&&parent.DWRT_DESKTOP_HOST){source=parent.document.documentElement;root.dataset.desktopEmbedded='tvhome';}}catch(_){}
+ for(const key of ['themeFamily','themePref','themeResolved']){let v=source?.dataset[key];if(!v){if(key==='themeFamily')v=localStorage.getItem('dreamingwrt.web.themeFamily')||'frosted-glass';if(key==='themePref')v=localStorage.getItem('dreamingwrt.web.themePref')||'system';if(key==='themeResolved')v=(root.dataset.themePref==='dark'||root.dataset.themePref==='system'&&matchMedia('(prefers-color-scheme: dark)').matches)?'dark':'light';}root.dataset[key]=v;}}
+ stamp();addEventListener('storage',stamp);matchMedia('(prefers-color-scheme: dark)').addEventListener('change',stamp);
+ try{if(parent!==window){const observer=new MutationObserver(stamp);observer.observe(parent.document.documentElement,{attributes:true,attributeFilter:['data-theme-family','data-theme-pref','data-theme-resolved']});addEventListener('pagehide',()=>observer.disconnect(),{once:true});}}catch(_){}
+})();
+</script>
+</head>
+<body><div id="tvhomeApp"></div>
+<script type="module">
+import {mount} from '/plugins/native/tvhome.js?v=20261005-tvhome-table-03';
+const controller=mount({root:document.getElementById('tvhomeApp'),ui:window.DWRT_UI_KIT,api:{async request(name,url,init){const result=await window.DWRT_REQUEST.json(url,init);return result&&Object.prototype.hasOwnProperty.call(result,'data')?result.data:result;}}});
+addEventListener('pagehide',()=>controller.unmount(),{once:true});
+</script>
+<script src="/static/desktop/glass-foreground.js?v=20261008-desktop-material-01" defer></script>
+</body></html>

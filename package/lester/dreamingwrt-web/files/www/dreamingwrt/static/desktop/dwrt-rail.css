@@ -1,0 +1,280 @@
+/* dwrt-rail.css — THE desktop app left sidebar ("rail").
+ *
+ * 用户 2026-09-27：「把系统设置的左侧菜单栏样式定为规范…和它不一致的改一下」. The 系统设置
+ * rail is the standard for every desktop app sidebar and this file is its ONLY
+ * implementation: the desktop shell (系统设置 and every other multi-page app) and each
+ * same-origin iframe app (应用中心 / 网络工具箱 / 文件管理 / 虚拟机) consume these classes.
+ * Page CSS may add app-specific parts (tree toggles, badge colors, drawer behavior on
+ * narrow windows) on the shared tokens, but must never re-skin the rail itself.
+ * 资源管理器 keeps its own fnOS-style nav by the user's explicit exclusion.
+ *
+ * Material: none of its own. The rail sits on the window's glass — no tint panel and no
+ * second backdrop (that would double-frost, and fog wrongly under traditional).
+ * Foreground: the shared --dwrt-* ink tokens, plus — under frosted-glass — the shared
+ * per-text sampler glass-foreground.js, which is the 资源管理器 readability strategy the
+ * user asked this rail to learn: every label/icon/placeholder independently picks an ink
+ * that clears AA 4.8:1 against the actual blurred wallpaper + glass behind it. Hence the
+ * placeholder inherits the (adaptive) input color instead of pinning a muted token.
+ * Spec: md/desktop-mode-layout-spec.md §9.
+ */
+:root { --dwrt-rail-width: 240px; }
+
+.dwrt-rail {
+  flex: 0 0 var(--dwrt-rail-width);
+  width: var(--dwrt-rail-width);
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  padding: 14px 12px 12px;
+  overflow: hidden;
+  border-right: 1px solid var(--dwrt-glass-edge);
+  background: transparent;
+  color: var(--dwrt-ink);
+}
+
+/* Brand: the DreamingOS wordmark centered above the search, with a hairline divider
+   (参照路由管理 .menu-brand). logo-wide.png is a 2000×681 canvas whose glyphs fill only the
+   middle 377px (22.3% transparent band above and below), so the VISIBLE glyph height is
+   height × 0.554: 48px → ~27px, the same wordmark size as the 路由管理 console sidebar
+   (--app-logo-height: 48px). The previous 30px (~17px visible) read "太小了". The app name
+   is never repeated here — it lives in the centered window titlebar. */
+.dwrt-rail-brand {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin: 0 2px 12px;
+  padding: 0 6px 12px;
+}
+.dwrt-rail-brand img {
+  display: block;
+  width: auto;
+  height: 48px;
+  max-width: 100%;
+  object-fit: contain;
+  filter: drop-shadow(0 8px 16px rgba(0, 0, 0, 0.22));
+}
+/* logo-wide.png is a multicolour brand asset in every family and theme. */
+.dwrt-rail-brand::after {
+  content: "";
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  height: 1px;
+  background: linear-gradient(90deg, transparent, var(--dwrt-glass-edge-strong), transparent);
+}
+
+/* Search pill (参照路由管理 .menu-search-trigger): 999px frosted field + leading magnifier. */
+.dwrt-rail-search { position: relative; flex: 0 0 auto; margin: 0 2px 10px; }
+.dwrt-rail-search-icon {
+  position: absolute;
+  left: 14px;
+  top: 50%;
+  transform: translateY(-50%);
+  display: grid;
+  place-items: center;
+  color: var(--dwrt-muted);
+  pointer-events: none;
+}
+.dwrt-rail-search-icon svg { width: 15px; height: 15px; }
+.dwrt-rail-search-input {
+  width: 100%;
+  height: 38px;
+  margin: 0;
+  padding: 0 16px 0 38px;
+  border: 1px solid var(--dwrt-glass-edge-strong);
+  border-radius: 999px;
+  background: var(--dwrt-glass-surface);
+  color: var(--dwrt-ink);
+  font: inherit;
+  font-size: 13px;
+  outline: none;
+  box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.22), 0 6px 16px rgba(0, 0, 0, 0.10);
+  backdrop-filter: var(--dwrt-glass-backdrop);
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop);
+}
+.dwrt-rail-search-input::placeholder { color: inherit; opacity: 0.72; }
+.dwrt-rail-search-input:focus {
+  border-color: color-mix(in srgb, var(--color-accent) 55%, transparent);
+  background: var(--dwrt-glass-surface-raised);
+}
+
+/* The list is the only part that scrolls; brand, search and foot stay pinned. */
+.dwrt-rail-list {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  margin: 0 -4px;
+  padding: 0 4px;
+  overflow-x: hidden;
+  overflow-y: auto;
+  scrollbar-width: thin;
+}
+.dwrt-rail-group-label {
+  flex: 0 0 auto;
+  margin: 12px 10px 4px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  color: var(--dwrt-muted);
+}
+.dwrt-rail-list > .dwrt-rail-group-label:first-child { margin-top: 2px; }
+.dwrt-rail-group-label[hidden] { display: none; }
+
+/* Collapsible group: a label-styled head (caret + title + count) over its items. */
+.dwrt-rail-group { display: flex; flex-direction: column; gap: 2px; }
+.dwrt-rail-group[hidden] { display: none; }
+.dwrt-rail-group + .dwrt-rail-group { margin-top: 4px; }
+.dwrt-rail-group-head {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  width: 100%;
+  min-height: 30px;
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--dwrt-muted);
+  font: inherit;
+  font-size: 11.5px;
+  font-weight: 700;
+  letter-spacing: 0.4px;
+  text-align: left;
+  cursor: pointer;
+}
+.dwrt-rail-group-head:hover { background: color-mix(in srgb, var(--dwrt-ink) 6%, transparent); }
+.dwrt-rail-group-caret { display: inline-grid; place-items: center; transition: transform 0.18s ease; }
+.dwrt-rail-group-caret svg { width: 14px; height: 14px; }
+.dwrt-rail-group.is-collapsed .dwrt-rail-group-caret { transform: rotate(-90deg); }
+.dwrt-rail-group-count { margin-left: auto; font-weight: 600; }
+.dwrt-rail-group-items { display: flex; flex-direction: column; gap: 2px; }
+.dwrt-rail-group.is-collapsed .dwrt-rail-group-items { display: none; }
+
+/* Item: tinted icon tile + bold title + optional gray description (+ optional trailing meta). */
+.dwrt-rail-item {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  min-width: 0;
+  min-height: 46px;
+  margin: 0;
+  padding: 6px 10px;
+  border: 0;
+  border-radius: 10px;
+  background: transparent;
+  color: var(--dwrt-ink);
+  font: inherit;
+  text-align: left;
+  text-decoration: none;
+  cursor: pointer;
+}
+.dwrt-rail-item[hidden] { display: none; }
+.dwrt-rail-item:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+.dwrt-rail-item-icon {
+  flex: 0 0 30px;
+  width: 30px;
+  height: 30px;
+  display: grid;
+  place-items: center;
+  border-radius: 8px;
+  background: color-mix(in srgb, var(--dwrt-ink) 7%, transparent);
+  color: var(--dwrt-muted);
+}
+.dwrt-rail-item-icon svg, .dwrt-rail-item-icon img { width: 17px; height: 17px; }
+.dwrt-rail-item-text { display: flex; flex: 1 1 auto; flex-direction: column; min-width: 0; line-height: 1.25; }
+.dwrt-rail-item-title { font-size: 13.5px; font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dwrt-rail-item-desc { margin-top: 1px; font-size: 11.5px; color: var(--dwrt-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dwrt-rail-item-meta {
+  flex: 0 0 auto;
+  margin-left: auto;
+  padding: 1px 7px;
+  border: 1px solid var(--dwrt-glass-edge);
+  border-radius: 999px;
+  font-size: 10.5px;
+  line-height: 1.5;
+  color: var(--dwrt-muted);
+  white-space: nowrap;
+}
+.dwrt-rail-item:not(.is-active):not(:disabled):not([aria-disabled="true"]):hover { background: color-mix(in srgb, var(--dwrt-ink) 8%, transparent); }
+/* Selected = a neutral frosted "glass block" (参照路由管理 .menu-active-pill), never an
+   accent fill: raised glass + inset edge ring (no 1px row shift) + soft shadow + a top
+   sheen. isolation on the item keeps the z-index:-1 sheen above the item background and
+   below its content under every family (traditional has no backdrop stacking context). */
+.dwrt-rail-item.is-active {
+  background: var(--dwrt-glass-surface-raised);
+  box-shadow: inset 0 0 0 1px var(--dwrt-glass-edge-strong), inset 0 1px 0 rgba(255, 255, 255, 0.30), 0 8px 20px rgba(0, 0, 0, 0.16);
+  backdrop-filter: var(--dwrt-glass-backdrop);
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop);
+}
+.dwrt-rail-item.is-active::before {
+  content: "";
+  position: absolute;
+  inset: 1px 1px auto;
+  height: 46%;
+  border-radius: 10px 10px 8px 8px;
+  background: linear-gradient(180deg, rgba(255, 255, 255, 0.24), transparent);
+  pointer-events: none;
+  z-index: -1;
+}
+.dwrt-rail-item.is-active .dwrt-rail-item-title { font-weight: 700; }
+.dwrt-rail-item.is-active .dwrt-rail-item-icon { background: color-mix(in srgb, var(--dwrt-ink) 16%, transparent); color: var(--dwrt-ink); }
+.dwrt-rail-item:disabled, .dwrt-rail-item[aria-disabled="true"] { opacity: 0.5; cursor: not-allowed; }
+
+/* Compact nested row (tree children such as sub-folders): same states, smaller rhythm. */
+.dwrt-rail-subitem {
+  position: relative;
+  isolation: isolate;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  min-width: 0;
+  min-height: 32px;
+  margin: 0;
+  padding: 4px 10px;
+  border: 0;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--dwrt-text);
+  font: inherit;
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+}
+.dwrt-rail-subitem svg { flex: 0 0 auto; width: 15px; height: 15px; color: var(--dwrt-muted); }
+.dwrt-rail-subitem:not(.is-active):hover { background: color-mix(in srgb, var(--dwrt-ink) 8%, transparent); }
+.dwrt-rail-subitem.is-active {
+  background: var(--dwrt-glass-surface-raised);
+  box-shadow: inset 0 0 0 1px var(--dwrt-glass-edge-strong), 0 6px 14px rgba(0, 0, 0, 0.12);
+  color: var(--dwrt-ink);
+  font-weight: 600;
+}
+.dwrt-rail-subitem:focus-visible { outline: 2px solid var(--color-accent); outline-offset: -2px; }
+
+.dwrt-rail-empty { margin: 12px 6px; font-size: 12.5px; color: var(--dwrt-muted); text-align: center; }
+.dwrt-rail-empty[hidden] { display: none; }
+
+/* Optional footer (service/connection/volume status), pinned below the list. */
+.dwrt-rail-foot {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  margin: 8px -12px -12px;
+  padding: 10px 16px 12px;
+  border-top: 1px solid var(--dwrt-glass-edge);
+  font-size: 11.5px;
+  color: var(--dwrt-muted);
+}
+.dwrt-rail-foot[hidden], .dwrt-rail-foot:empty { display: none; }

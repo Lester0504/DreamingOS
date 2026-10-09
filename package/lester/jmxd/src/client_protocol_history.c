@@ -9,6 +9,8 @@
 #include <json-c/json.h>
 #include <sqlite3.h>
 
+#include "jmx_strbuf.h"
+
 #define PROTOCOL_HISTORY_PROC_PRIMARY "/proc/dreamingwrt/jmx/af_client_visit_list"
 #define PROTOCOL_HISTORY_PROC_LEGACY "/proc/net/af_client_visit_list"
 #define PROTOCOL_HISTORY_MAX_CLIENTS 256
@@ -179,8 +181,10 @@ static struct protocol_history_client *protocol_history_client_get(const char *m
            sizeof(protocol_history_clients[free_index]));
     protocol_history_clients[free_index].used = 1;
     protocol_history_clients[free_index].first_observed_at = now;
-    snprintf(protocol_history_clients[free_index].mac,
-             sizeof(protocol_history_clients[free_index].mac), "%s", mac);
+    /* Every mac reaching this table came through protocol_history_mac_normalize,
+     * which accepts exactly 17 characters, so it fits mac[18] with room for the
+     * NUL. The bound is invisible here because mac arrives as a pointer. */
+    JMX_STRBUF_COPY(protocol_history_clients[free_index].mac, mac);
     return &protocol_history_clients[free_index];
 }
 
@@ -1079,6 +1083,9 @@ struct json_object *jmx_client_protocol_history_query(const char *db_path,
         struct json_object *fallback_available = NULL;
 
         json_object_object_add(result, "fallback", fallback);
+        if (!db_path || !db_path[0])
+            json_object_object_add(result, "reason", json_object_new_string(
+                "ap_mode_no_local_audit"));
         if (json_object_object_get_ex(fallback, "available", &fallback_available) &&
             json_object_get_boolean(fallback_available))
             json_object_object_add(result, "reason", json_object_new_string(

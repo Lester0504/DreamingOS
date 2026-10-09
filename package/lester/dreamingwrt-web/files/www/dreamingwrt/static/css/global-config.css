@@ -1,4 +1,5 @@
 @import url('./network-interface-config.css?v=20260722-42');
+@import url('./work-mode.css?v=20260829-global-work-mode-tab-01');
 
 .console-stage.is-global-config {
   grid-template-rows: minmax(0, 1fr);
@@ -79,6 +80,64 @@
   justify-content: flex-end;
   gap: 9px;
 }
+
+/* 统计、筛选、列属于“所有端口”表格，和表格标题/批量操作保持同一工具栏，
+   页面头部只承载搜索与视图切换，避免窄桌面下控件互相覆盖。 */
+.global-port-table-toolbar-side {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.global-port-table-card > .dwrt-kit-table-toolbar {
+  min-width: 0;
+  align-items: center;
+  flex-wrap: wrap;
+}
+
+.global-port-table-actions {
+  min-width: 0;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.global-port-table-actions .policy-filter-button {
+  min-width: 38px;
+  min-height: 34px;
+  height: 34px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  border: 0;
+  border-radius: var(--app-radius-control, 10px);
+  padding: 0 10px;
+  color: var(--app-text-secondary);
+  background: rgba(8,14,26,.16);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,.09);
+  font: inherit;
+  font-size: 11px;
+  font-weight: 760;
+  cursor: pointer;
+}
+
+.global-port-table-actions .policy-filter-button:hover {
+  color: var(--app-text);
+  background: var(--dwrt-interactive-hover-bg);
+  box-shadow: inset 0 0 0 1px var(--dwrt-interactive-hover-border);
+}
+
+.global-port-table-actions .policy-filter-button.is-active {
+  color: #82baff;
+  background: rgba(47,132,255,.11);
+  box-shadow: inset 0 0 0 1px rgba(91,164,255,.19);
+}
+
+.global-port-table-actions .policy-filter-button svg { width: 15px; height: 15px; flex: 0 0 auto; }
 
 .global-page-actions .policy-filter-button,
 .global-page-actions .policy-create-button {
@@ -257,6 +316,26 @@
 
 .global-config-workbench.is-advanced {
   overflow: auto;
+}
+
+.global-config-workbench.is-work-mode {
+  overflow: hidden;
+}
+
+.global-work-mode-host,
+.global-work-mode-host .work-mode-route-host {
+  width: 100%;
+  height: 100%;
+  min-width: 0;
+  min-height: 0;
+}
+
+.global-work-mode-host {
+  overflow: hidden;
+}
+
+.global-work-mode-host .work-mode-page {
+  height: 100%;
 }
 
 .global-advanced-settings { min-width: 0; display: grid; align-content: start; gap: 12px; padding: 0 2px 2px; }

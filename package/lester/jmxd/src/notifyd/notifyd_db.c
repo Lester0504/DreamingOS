@@ -5,6 +5,54 @@
 
 static int notifyd_email_address_ok(const char *email);
 
+static const char *notifyd_storage_path(void)
+{
+    /* A changed assignment does not move an already-open SQLite handle. */
+    const char *path = g_notify_db ? sqlite3_db_filename(g_notify_db, "main") : NULL;
+
+    return path && path[0] ? path : NOTIFYD_DB_PATH;
+}
+
+struct notifyd_route_contract {
+    char channel_id[NOTIFYD_MAX_ID];
+    char min_severity[32];
+    struct json_object *options;
+};
+
+static int notifyd_global_mute_normalize(struct json_object *input,
+                                         struct json_object **normalized_out,
+                                         struct json_object **error_out);
+static int notifyd_global_mute_active(const struct notifyd_settings *settings,
+                                      int64_t now, const char **reason);
+
+static struct json_object *notifyd_route_error(const char *error, const char *feature,
+                                               const char *field, int action_index)
+{
+    struct json_object *resp = json_object_new_object();
+
+    json_object_object_add(resp, "ok", json_object_new_boolean(0));
+    json_object_object_add(resp, "error", json_object_new_string(error ? error : "invalid_route"));
+    if (feature && feature[0])
+        json_object_object_add(resp, "feature", json_object_new_string(feature));
+    if (field && field[0])
+        json_object_object_add(resp, "field", json_object_new_string(field));
+    if (action_index >= 0)
+        json_object_object_add(resp, "action_index", json_object_new_int(action_index));
+    return resp;
+}
+
+static int notifyd_severity_valid(const char *severity)
+{
+    return severity && (!strcmp(severity, "debug") || !strcmp(severity, "info") ||
+        !strcmp(severity, "notice") || !strcmp(severity, "warning") ||
+        !strcmp(severity, "error") || !strcmp(severity, "critical"));
+}
+
+static int notifyd_route_email_ok(const char *email)
+{
+    return notifyd_email_address_ok(email);
+}
+
 static int notifyd_exec(sqlite3 *db, const char *sql)
 {
     char *err = NULL;
@@ -91,101 +139,9 @@ static void notifyd_response_set_first_error(struct json_object *resp, const cha
     json_object_object_add(resp, "error", json_object_new_string(error));
 }
 
-struct notifyd_event_definition {
-    const char *id;
-    const char *category;
-    const char *label;
-    const char *producer;
-    const char *recovery_event;
-    /*
-     * Non-empty only on the half of a pair that clears the other. recovery_event
-     * is symmetric (both halves point at each other), so it cannot answer "is
-     * this the recovery?" -- the question min_severity handling depends on.
-     * Mirrors logd_notify_event_contract.recovers_event (logd_event.c).
-     */
-    const char *recovers_event;
-    const char *reason;
-    const char *default_severity;
-    int available;
-};
-
-static const struct notifyd_event_definition notifyd_event_definitions[] = {
-    { "SYSTEM_RESOURCE_THRESHOLD", "SYSTEM", "System Resource Threshold", "dreamingwrt.logd.collector.resource", "", "", "", "warning", 1 },
-    { "SYSTEM_LOG", "SYSTEM", "System Log", "dreamingwrt.logd", "", "", "", "notice", 1 },
-    { "CALLBACKS_SUPPRESSED", "SYSTEM", "Callbacks Suppressed", "dreamingwrt.logd", "", "", "", "warning", 1 },
-    { "PACKET_CAPTURE_STARTED", "SYSTEM", "Packet Capture Started", "dreamingwrt.logd", "", "", "", "notice", 1 },
-    { "PACKET_CAPTURE_STOPPED", "SYSTEM", "Packet Capture Stopped", "dreamingwrt.logd", "", "", "", "notice", 1 },
-    { "PACKET_CAPTURE_FINISHED", "SYSTEM", "Packet Capture Finished", "dreamingwrt.logd", "", "", "", "notice", 1 },
-    { "PACKET_CAPTURE_DELETED", "SYSTEM", "Packet Capture Deleted", "dreamingwrt.logd", "", "", "", "notice", 1 },
-    { "WAN_EVENT", "INTERNET_AND_WAN", "WAN Event", "dreamingwrt.logd.collector.system_log", "", "", "", "notice", 1 },
-    { "PPPOE_EVENT", "INTERNET_AND_WAN", "PPPoE Event", "dreamingwrt.logd.collector.system_log", "", "", "", "notice", 1 },
-    { "PORT_LINK_DOWN", "INTERNET_AND_WAN", "Port Link Down", "dreamingwrt.logd.collector.port", "PORT_LINK_UP", "", "", "warning", 1 },
-    { "PORT_LINK_UP", "INTERNET_AND_WAN", "Port Link Up", "dreamingwrt.logd.collector.port", "PORT_LINK_DOWN", "PORT_LINK_DOWN", "", "notice", 1 },
-    { "PORT_EVENT", "INTERNET_AND_WAN", "Port Event", "dreamingwrt.logd.collector.port", "", "", "", "notice", 1 },
-    { "CLIENT_CONNECTED_WIRED", "CLIENT_DEVICES", "Wired Client Connected", "dreamingwrt.logd.collector.dhcp_lease", "CLIENT_DISCONNECTED", "", "", "notice", 1 },
-    { "CLIENT_DISCONNECTED", "CLIENT_DEVICES", "Client Disconnected", "dreamingwrt.logd.collector.dhcp_lease", "CLIENT_CONNECTED_WIRED", "CLIENT_CONNECTED_WIRED", "", "notice", 1 },
-    { "DHCP_EVENT", "CLIENT_DEVICES", "DHCP Event", "dreamingwrt.logd.collector.dhcp_lease", "", "", "", "notice", 1 },
-    { "ADMIN_AUTH_EVENT", "ADMIN", "Admin Authentication Event", "dreamingwrt.logd.collector.system_log", "", "", "", "warning", 1 },
-
-    { "WAN_DOWN", "INTERNET_AND_WAN", "Internet Down", "dreamingwrt-core", "WAN_RESTORED", "", "", "warning", 1 },
-    { "WAN_RESTORED", "INTERNET_AND_WAN", "Internet Restored", "dreamingwrt-core", "WAN_DOWN", "WAN_DOWN", "", "notice", 1 },
-    { "WAN_FAILOVER_ACTIVE", "INTERNET_AND_WAN", "WAN Failover Active", "dreamingwrt.routed.health", "WAN_FAILBACK", "", "", "warning", 1 },
-    { "WAN_FAILBACK", "INTERNET_AND_WAN", "WAN Failback", "dreamingwrt.routed.health", "WAN_FAILOVER_ACTIVE", "WAN_FAILOVER_ACTIVE", "", "notice", 1 },
-    { "WAN_QUALITY_DEGRADED", "INTERNET_AND_WAN", "WAN Quality Degraded", "dreamingwrt.routed.health", "WAN_QUALITY_RECOVERED", "", "", "warning", 1 },
-    { "WAN_QUALITY_CRITICAL", "INTERNET_AND_WAN", "WAN Quality Critical", "dreamingwrt.routed.health", "WAN_QUALITY_RECOVERED", "", "", "critical", 1 },
-    { "WAN_PENALTY_RECOVERING", "INTERNET_AND_WAN", "WAN Penalty Recovering", "dreamingwrt.routed.health", "WAN_QUALITY_RECOVERED", "", "", "notice", 1 },
-    { "WAN_QUALITY_RECOVERED", "INTERNET_AND_WAN", "WAN Quality Recovered", "dreamingwrt.routed.health", "WAN_QUALITY_DEGRADED", "WAN_QUALITY_DEGRADED", "", "notice", 1 },
-    { "WAN_FLAPPING", "INTERNET_AND_WAN", "WAN Flapping", "dreamingwrt-core", "", "", "", "warning", 1 },
-    { "ISP_PACKET_LOSS", "INTERNET_AND_WAN", "ISP Packet Loss", "", "", "", "wan_sla_event_producer_pending", "warning", 0 },
-    { "ISP_HIGH_LATENCY", "INTERNET_AND_WAN", "ISP High Latency", "", "", "", "wan_sla_event_producer_pending", "warning", 0 },
-    { "DEVICE_OFFLINE", "DEVICES", "Infrastructure Device Offline", "", "DEVICE_RESTORED", "", "topology_history_not_connected_to_logd_notifyd", "warning", 0 },
-    { "DEVICE_RESTORED", "DEVICES", "Infrastructure Device Restored", "", "DEVICE_OFFLINE", "DEVICE_OFFLINE", "topology_history_not_connected_to_logd_notifyd", "notice", 0 },
-    { "PORT_TX_RX_ERRORS", "INTERNET_AND_WAN", "Port TX/RX Errors", "", "", "", "port_counter_delta_producer_pending", "warning", 0 },
-    { "PORT_DROPPED_TRAFFIC", "INTERNET_AND_WAN", "Port Dropped Traffic", "", "", "", "port_counter_delta_producer_pending", "warning", 0 },
-    { "DHCP_POOL_EXHAUSTED", "CLIENT_DEVICES", "DHCP Pool Exhausted", "dreamingwrt-core", "", "", "", "critical", 1 },
-    { "CLIENT_IP_CONFLICT", "CLIENT_DEVICES", "Client IP Conflict", "", "", "", "ip_conflict_producer_pending", "warning", 0 },
-    { "VPN_SITE_TO_SITE_DISCONNECTED", "VPN", "Site-to-Site VPN Disconnected", "", "VPN_SITE_TO_SITE_RESTORED", "", "vpn_state_producer_pending", "warning", 0 },
-    { "VPN_SITE_TO_SITE_RESTORED", "VPN", "Site-to-Site VPN Restored", "", "VPN_SITE_TO_SITE_DISCONNECTED", "VPN_SITE_TO_SITE_DISCONNECTED", "vpn_state_producer_pending", "notice", 0 },
-    { "SECURITY_DETECTION", "SECURITY", "Security Detection", "", "", "", "aegis_suricata_event_bridge_pending", "warning", 0 },
-    { "CONFIG_COMMIT_FAILED", "ADMIN", "Configuration Commit Failed", "", "", "", "config_transaction_event_producer_pending", "error", 0 },
-    { "APPLICATION_UPDATE_FAILED", "SYSTEM", "Application Update Failed", "", "", "", "otad_failure_event_producer_pending", "error", 0 },
-    { "IMPROPER_SHUTDOWN", "SYSTEM", "Improper Shutdown", "", "", "", "boot_marker_event_producer_pending", "warning", 0 },
-
-    /*
-     * dreamingproxy is an out-of-tree Go plugin that enqueues with category
-     * "PROXY". Delivery never consulted this table, so these events were being
-     * routed all along, but the catalog omission hid them from the notification
-     * routing UI: a user could not build a PROXY-scoped route, and info-severity
-     * events were dropped because the only live route is min_severity=warning.
-     * Severities below mirror the producer exactly (internal/service/
-     * notifications.go and egress_drift.go); recovery events are info because
-     * notify/manager.go hardcodes "info" when it resolves an active state.
-     */
-    { "PROXY_NODE_MASS_FAILURE", "PROXY", "Proxy Nodes Mass Failure", "dreamingproxy", "PROXY_NODE_MASS_RECOVERED", "", "", "warning", 1 },
-    { "PROXY_NODE_MASS_RECOVERED", "PROXY", "Proxy Nodes Recovered", "dreamingproxy", "PROXY_NODE_MASS_FAILURE", "PROXY_NODE_MASS_FAILURE", "", "info", 1 },
-    { "PROXY_CAPABILITY_EMPTY", "PROXY", "Policy Group Candidates Empty", "dreamingproxy", "PROXY_CAPABILITY_RECOVERED", "", "", "error", 1 },
-    { "PROXY_CAPABILITY_RECOVERED", "PROXY", "Policy Group Candidates Recovered", "dreamingproxy", "PROXY_CAPABILITY_EMPTY", "PROXY_CAPABILITY_EMPTY", "", "info", 1 },
-    { "PROXY_BINDING_OFFLINE", "PROXY", "Client Binding Offline", "dreamingproxy", "PROXY_BINDING_RESTORED", "", "", "critical", 1 },
-    { "PROXY_BINDING_RESTORED", "PROXY", "Client Binding Restored", "dreamingproxy", "PROXY_BINDING_OFFLINE", "PROXY_BINDING_OFFLINE", "", "info", 1 },
-    { "PROXY_ALL_WANS_DEGRADED", "PROXY", "All WAN Paths Degraded", "dreamingproxy", "PROXY_WAN_PATH_RECOVERED", "", "", "error", 1 },
-    { "PROXY_WAN_PATH_RECOVERED", "PROXY", "WAN Path Recovered", "dreamingproxy", "PROXY_ALL_WANS_DEGRADED", "PROXY_ALL_WANS_DEGRADED", "", "info", 1 },
-    { "PROXY_WAN_PATH_FLAPPING", "PROXY", "WAN Path Flapping", "dreamingproxy", "", "", "", "warning", 1 },
-    { "PROXY_CONFIG_APPLY_FAILED", "PROXY", "Proxy Config Apply Failed", "dreamingproxy", "", "", "", "error", 1 },
-    { "PROXY_CONFIG_ROLLED_BACK", "PROXY", "Proxy Config Rolled Back", "dreamingproxy", "", "", "", "warning", 1 },
-    { "PROXY_SUBSCRIPTION_UPDATE_FAILED", "PROXY", "Subscription Update Failed", "dreamingproxy", "PROXY_SUBSCRIPTION_UPDATE_RECOVERED", "", "", "warning", 1 },
-    { "PROXY_SUBSCRIPTION_UPDATE_RECOVERED", "PROXY", "Subscription Update Recovered", "dreamingproxy", "PROXY_SUBSCRIPTION_UPDATE_FAILED", "PROXY_SUBSCRIPTION_UPDATE_FAILED", "", "info", 1 },
-    { "PROXY_RULESET_UPDATE_FAILED", "PROXY", "Ruleset Update Failed", "dreamingproxy", "PROXY_RULESET_UPDATE_RECOVERED", "", "", "warning", 1 },
-    { "PROXY_RULESET_UPDATE_RECOVERED", "PROXY", "Ruleset Update Recovered", "dreamingproxy", "PROXY_RULESET_UPDATE_FAILED", "PROXY_RULESET_UPDATE_FAILED", "", "info", 1 },
-    { "PROXY_CORE_UNAVAILABLE", "PROXY", "Proxy Core Unavailable", "dreamingproxy", "PROXY_CORE_RECOVERED", "", "", "error", 1 },
-    { "PROXY_CORE_RECOVERED", "PROXY", "Proxy Core Recovered", "dreamingproxy", "PROXY_CORE_UNAVAILABLE", "PROXY_CORE_UNAVAILABLE", "", "info", 1 },
-    /*
-     * No recovery event by design: egress drift is a completed discrete change,
-     * so "recovered" would wrongly claim the previous exit came back. Severity
-     * is warning for operator_changed and info for unknown attribution, so the
-     * default here is the more common warning form.
-     */
-    { "PROXY_EGRESS_DRIFT", "PROXY", "Proxy Egress Address Drift", "dreamingproxy", "", "", "", "warning", 1 },
-};
+/* Catalog metadata, rendering keys, and recovery semantics come from the same
+ * definition table linked into logd and notifyd. This prevents the two daemons
+ * from accepting different event sets after an incremental update. */
 
 static void notifyd_event_ids_json(struct json_object *cap)
 {
@@ -193,8 +149,8 @@ static void notifyd_event_ids_json(struct json_object *cap)
     struct json_object *pending = json_object_new_array();
     size_t i;
 
-    for (i = 0; i < sizeof(notifyd_event_definitions) / sizeof(notifyd_event_definitions[0]); i++) {
-        const struct notifyd_event_definition *def = &notifyd_event_definitions[i];
+    for (i = 0; i < dw_event_definitions_count; i++) {
+        const struct dw_event_definition *def = &dw_event_definitions[i];
         json_object_array_add(def->available ? available : pending,
                               json_object_new_string(def->id));
     }
@@ -212,17 +168,9 @@ static void notifyd_event_ids_json(struct json_object *cap)
  * up yet is still a real catalog id, and rejecting it would turn "not collected
  * yet" into "rejected", which is a different and more confusing failure.
  */
-static const struct notifyd_event_definition *notifyd_event_definition_find(const char *id)
+static const struct dw_event_definition *notifyd_event_definition_find(const char *id)
 {
-    size_t i;
-
-    if (!id || !id[0])
-        return NULL;
-    for (i = 0; i < sizeof(notifyd_event_definitions) / sizeof(notifyd_event_definitions[0]); i++) {
-        if (!strcmp(notifyd_event_definitions[i].id, id))
-            return &notifyd_event_definitions[i];
-    }
-    return NULL;
+    return dw_event_definition_find(id);
 }
 
 struct json_object *notifyd_event_catalog_json(void)
@@ -249,21 +197,24 @@ struct json_object *notifyd_event_catalog_json(void)
         json_object_object_add(category, "label", json_object_new_string(categories[i].label));
         json_object_array_add(category_array, category);
     }
-    for (i = 0; i < sizeof(notifyd_event_definitions) / sizeof(notifyd_event_definitions[0]); i++) {
-        const struct notifyd_event_definition *def = &notifyd_event_definitions[i];
+    for (i = 0; i < dw_event_definitions_count; i++) {
+        const struct dw_event_definition *def = &dw_event_definitions[i];
         struct json_object *event = json_object_new_object();
 
         json_object_object_add(event, "id", json_object_new_string(def->id));
         json_object_object_add(event, "category", json_object_new_string(def->category));
-        json_object_object_add(event, "label", json_object_new_string(def->label));
+        json_object_object_add(event, "label", json_object_new_string(def->label_en));
+        json_object_object_add(event, "label_zh", json_object_new_string(def->label_zh));
+        json_object_object_add(event, "message_key", json_object_new_string(def->message_key));
+        json_object_object_add(event, "message_version", json_object_new_int((int)def->message_version));
         json_object_object_add(event, "available", json_object_new_boolean(def->available));
         json_object_object_add(event, "producer", json_object_new_string(def->producer));
         json_object_object_add(event, "recovery_event", json_object_new_string(def->recovery_event));
         json_object_object_add(event, "recovers_event", json_object_new_string(def->recovers_event));
         json_object_object_add(event, "severity_exempt", json_object_new_boolean(def->recovers_event[0] != 0));
         json_object_object_add(event, "default_severity", json_object_new_string(def->default_severity));
-        if (def->reason[0])
-            json_object_object_add(event, "reason", json_object_new_string(def->reason));
+        if (def->unavailable_reason[0])
+            json_object_object_add(event, "reason", json_object_new_string(def->unavailable_reason));
         json_object_array_add(event_array, event);
     }
     json_object_object_add(resp, "ok", json_object_new_boolean(1));
@@ -318,6 +269,9 @@ int notifyd_db_init(void)
         notifyd_exec(g_notify_config_db, "ALTER TABLE notifyd_settings ADD COLUMN smtp_username TEXT NOT NULL DEFAULT ''") != 0) goto fail;
     if (!notifyd_table_has_column(g_notify_config_db, "notifyd_settings", "smtp_password") &&
         notifyd_exec(g_notify_config_db, "ALTER TABLE notifyd_settings ADD COLUMN smtp_password TEXT NOT NULL DEFAULT ''") != 0) goto fail;
+    if (!notifyd_table_has_column(g_notify_config_db, "notifyd_settings", "mute_schedule_json") &&
+        notifyd_exec(g_notify_config_db,
+            "ALTER TABLE notifyd_settings ADD COLUMN mute_schedule_json TEXT NOT NULL DEFAULT '{\"enabled\":false}'") != 0) goto fail;
     if (notifyd_exec(g_notify_config_db,
         "INSERT OR IGNORE INTO notifyd_settings(id,enabled,default_channel_id,max_attempts,retry_base_s,retry_max_s,updated_at) "
         "VALUES(1,1,'local',3,60,3600,0)") != 0)
@@ -355,6 +309,27 @@ int notifyd_db_init(void)
     if (notifyd_exec(g_notify_config_db,
         "INSERT OR IGNORE INTO notifyd_routes(id,name,enabled,channel_id,min_severity,category,event,source,options_json,created_at,updated_at) "
         "VALUES('default-warning','Default warnings',1,'local','warning','','','','{}',0,0)") != 0)
+        goto fail;
+
+    /*
+     * Per-user notification preference. Separate from notifyd_settings on
+     * purpose: settings.enabled is the service switch and applies to every
+     * route and recipient, while this table only decides whether one user
+     * receives what a route already produced.
+     *
+     * Keyed by web_users.username, but without a foreign key: notifyd starts
+     * independently of webd, and web_users may not exist yet on a fresh unit.
+     * Existence is checked on write instead, where the directory is reachable
+     * and a rejection can be reported to the caller.
+     */
+    if (notifyd_exec(g_notify_config_db,
+        "CREATE TABLE IF NOT EXISTS notifyd_user_preferences ("
+        " username TEXT PRIMARY KEY,"
+        " muted INTEGER NOT NULL DEFAULT 0,"
+        " muted_until INTEGER NOT NULL DEFAULT 0,"
+        " channel_ids_json TEXT NOT NULL DEFAULT '[]',"
+        " created_at INTEGER NOT NULL DEFAULT 0,"
+        " updated_at INTEGER NOT NULL DEFAULT 0)") != 0)
         goto fail;
 
     if (notifyd_exec(g_notify_db,
@@ -400,6 +375,24 @@ int notifyd_db_init(void)
     if (!notifyd_table_has_column(g_notify_db, "notify_outbox", "count") &&
         notifyd_exec(g_notify_db, "ALTER TABLE notify_outbox ADD COLUMN count INTEGER NOT NULL DEFAULT 1") != 0)
         goto fail;
+    if (!notifyd_table_has_column(g_notify_db, "notify_outbox", "action_index") &&
+        notifyd_exec(g_notify_db, "ALTER TABLE notify_outbox ADD COLUMN action_index INTEGER NOT NULL DEFAULT 0") != 0)
+        goto fail;
+    if (!notifyd_table_has_column(g_notify_db, "notify_outbox", "dedupe_group") &&
+        notifyd_exec(g_notify_db, "ALTER TABLE notify_outbox ADD COLUMN dedupe_group TEXT NOT NULL DEFAULT ''") != 0)
+        goto fail;
+    if (!notifyd_table_has_column(g_notify_db, "notify_outbox", "delivery_options_json") &&
+        notifyd_exec(g_notify_db, "ALTER TABLE notify_outbox ADD COLUMN delivery_options_json TEXT NOT NULL DEFAULT '{}'") != 0)
+        goto fail;
+    if (!notifyd_table_has_column(g_notify_db, "notify_outbox", "producer_dedupe_key") &&
+        notifyd_exec(g_notify_db, "ALTER TABLE notify_outbox ADD COLUMN producer_dedupe_key TEXT NOT NULL DEFAULT ''") != 0)
+        goto fail;
+    if (!notifyd_table_has_column(g_notify_db, "notify_outbox", "route_dedupe_key") &&
+        notifyd_exec(g_notify_db, "ALTER TABLE notify_outbox ADD COLUMN route_dedupe_key TEXT NOT NULL DEFAULT ''") != 0)
+        goto fail;
+    if (!notifyd_table_has_column(g_notify_db, "notify_outbox", "last_warning") &&
+        notifyd_exec(g_notify_db, "ALTER TABLE notify_outbox ADD COLUMN last_warning TEXT NOT NULL DEFAULT ''") != 0)
+        goto fail;
     if (notifyd_exec(g_notify_db,
         "UPDATE notify_outbox SET first_seen=created_at WHERE first_seen=0") != 0 ||
         notifyd_exec(g_notify_db,
@@ -407,7 +400,49 @@ int notifyd_db_init(void)
         notifyd_exec(g_notify_db,
         "UPDATE notify_outbox SET count=1 WHERE count<1") != 0)
         goto fail;
+    if (notifyd_exec(g_notify_db,
+        "UPDATE notify_outbox SET producer_dedupe_key=dedupe_key "
+        "WHERE producer_dedupe_key='' AND dedupe_key<>''") != 0)
+        goto fail;
     if (notifyd_exec(g_notify_db, "CREATE INDEX IF NOT EXISTS idx_notify_outbox_dedupe ON notify_outbox(channel_id,route_id,dedupe_key,state)") != 0)
+        goto fail;
+    if (notifyd_exec(g_notify_db, "CREATE INDEX IF NOT EXISTS idx_notify_outbox_route_action_dedupe ON notify_outbox(channel_id,route_id,action_index,dedupe_group,route_dedupe_key,last_seen)") != 0 ||
+        notifyd_exec(g_notify_db, "CREATE INDEX IF NOT EXISTS idx_notify_outbox_producer_action_dedupe ON notify_outbox(channel_id,route_id,action_index,producer_dedupe_key,updated_at)") != 0)
+        goto fail;
+
+    if (notifyd_exec(g_notify_db,
+        "CREATE TABLE IF NOT EXISTS notify_route_suppressions ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " route_id TEXT NOT NULL,"
+        " ts INTEGER NOT NULL,"
+        " reason TEXT NOT NULL,"
+        " event TEXT NOT NULL DEFAULT '',"
+        " source TEXT NOT NULL DEFAULT '',"
+        " target TEXT NOT NULL DEFAULT '',"
+        " payload_json TEXT NOT NULL DEFAULT '{}')") != 0 ||
+        notifyd_exec(g_notify_db,
+        "CREATE INDEX IF NOT EXISTS idx_notify_route_suppressions_route_ts "
+        "ON notify_route_suppressions(route_id,ts DESC)") != 0)
+        goto fail;
+
+    if (notifyd_exec(g_notify_db,
+        "CREATE TABLE IF NOT EXISTS notify_route_triggers ("
+        " id INTEGER PRIMARY KEY AUTOINCREMENT,"
+        " route_id TEXT NOT NULL,"
+        " event TEXT NOT NULL DEFAULT '',"
+        " severity TEXT NOT NULL DEFAULT 'info',"
+        " source TEXT NOT NULL DEFAULT '',"
+        " triggered_at INTEGER NOT NULL,"
+        " result TEXT NOT NULL DEFAULT 'enqueued',"
+        " reason TEXT NOT NULL DEFAULT '',"
+        " dedupe_result TEXT NOT NULL DEFAULT 'not_applicable',"
+        " mute_result TEXT NOT NULL DEFAULT 'not_muted')") != 0 ||
+        notifyd_exec(g_notify_db,
+            "CREATE INDEX IF NOT EXISTS idx_notify_route_triggers_route_id "
+            "ON notify_route_triggers(route_id,id DESC)") != 0 ||
+        notifyd_exec(g_notify_db,
+            "CREATE INDEX IF NOT EXISTS idx_notify_route_triggers_time "
+            "ON notify_route_triggers(triggered_at DESC,id DESC)") != 0)
         goto fail;
 
     if (notifyd_exec(g_notify_db,
@@ -422,6 +457,21 @@ int notifyd_db_init(void)
         goto fail;
     if (!notifyd_table_has_column(g_notify_db, "notify_deliveries", "duration_ms") &&
         notifyd_exec(g_notify_db, "ALTER TABLE notify_deliveries ADD COLUMN duration_ms INTEGER NOT NULL DEFAULT 0") != 0)
+        goto fail;
+    if (!notifyd_table_has_column(g_notify_db, "notify_deliveries", "warning") &&
+        notifyd_exec(g_notify_db, "ALTER TABLE notify_deliveries ADD COLUMN warning TEXT NOT NULL DEFAULT ''") != 0)
+        goto fail;
+    /*
+     * `ok` stays two-valued for older readers, so suppression records ok=1 --
+     * it is not a failure. `outcome` is what tells delivered and suppressed
+     * apart, and `suppressed_recipients` counts the muted addresses that were
+     * skipped on an otherwise successful send.
+     */
+    if (!notifyd_table_has_column(g_notify_db, "notify_deliveries", "outcome") &&
+        notifyd_exec(g_notify_db, "ALTER TABLE notify_deliveries ADD COLUMN outcome TEXT NOT NULL DEFAULT ''") != 0)
+        goto fail;
+    if (!notifyd_table_has_column(g_notify_db, "notify_deliveries", "suppressed_recipients") &&
+        notifyd_exec(g_notify_db, "ALTER TABLE notify_deliveries ADD COLUMN suppressed_recipients INTEGER NOT NULL DEFAULT 0") != 0)
         goto fail;
     if (notifyd_exec(g_notify_db, "CREATE INDEX IF NOT EXISTS idx_notify_deliveries_outbox ON notify_deliveries(outbox_id,ts DESC)") != 0 ||
         notifyd_exec(g_notify_db, "INSERT OR IGNORE INTO notify_meta(key,value) VALUES('schema_version','1')") != 0)
@@ -457,8 +507,11 @@ int notifyd_settings_load(struct notifyd_settings *out)
     out->max_attempts = 3;
     out->retry_base_s = 60;
     out->retry_max_s = 3600;
+    snprintf(out->mute_schedule_json, sizeof(out->mute_schedule_json),
+             "%s", "{\"enabled\":false}");
     st = notifyd_config_prepare("SELECT enabled,default_channel_id,max_attempts,retry_base_s,retry_max_s,"
-                                "smtp_host,smtp_port,smtp_security,smtp_from,smtp_username,smtp_password "
+                                "smtp_host,smtp_port,smtp_security,smtp_from,smtp_username,smtp_password,"
+                                "mute_schedule_json "
                                 "FROM notifyd_settings WHERE id=1");
     if (!st)
         return -1;
@@ -475,6 +528,8 @@ int notifyd_settings_load(struct notifyd_settings *out)
         snprintf(out->smtp_from, sizeof(out->smtp_from), "%s", notifyd_sqlite_text(st, 8, ""));
         snprintf(out->smtp_username, sizeof(out->smtp_username), "%s", notifyd_sqlite_text(st, 9, ""));
         snprintf(out->smtp_password, sizeof(out->smtp_password), "%s", notifyd_sqlite_text(st, 10, ""));
+        snprintf(out->mute_schedule_json, sizeof(out->mute_schedule_json), "%s",
+                 notifyd_sqlite_text(st, 11, "{\"enabled\":false}"));
     }
     sqlite3_finalize(st);
     if (out->max_attempts < 1) out->max_attempts = 1;
@@ -497,6 +552,7 @@ struct json_object *notifyd_status_json(void)
     struct json_object *outbox = json_object_new_object();
     char last_error[NOTIFYD_MAX_TEXT] = "";
     int pending = 0, retry = 0, failed = 0, delivered = 0, channels = 0, routes = 0;
+    int suppressed_state = 0;
     int schema_version = 0;
     int64_t updated_at = 0;
     int ok = 1;
@@ -506,7 +562,7 @@ struct json_object *notifyd_status_json(void)
 
     memset(&storage_guard, 0, sizeof(storage_guard));
     jmx_storage_guard_get_stats(&storage_guard);
-    (void)jmx_storage_guard_check("/", &storage_guard.state);
+    (void)jmx_storage_guard_check(notifyd_storage_path(), &storage_guard.state);
 
     memset(&s, 0, sizeof(s));
     s.smtp_port = 465;
@@ -524,6 +580,7 @@ struct json_object *notifyd_status_json(void)
             else if (state && !strcmp(state, "retry")) retry = n;
             else if (state && !strcmp(state, "failed")) failed = n;
             else if (state && !strcmp(state, "delivered")) delivered = n;
+            else if (state && !strcmp(state, "suppressed")) suppressed_state = n;
         }
         if (rc != SQLITE_DONE) {
             ok = 0;
@@ -630,6 +687,11 @@ struct json_object *notifyd_status_json(void)
     json_object_object_add(resp, "retry", json_object_new_int(retry));
     json_object_object_add(resp, "failed", json_object_new_int(failed));
     json_object_object_add(resp, "delivered", json_object_new_int(delivered));
+    /*
+     * Kept out of `degraded` above: these rows were silenced by a user's own
+     * preference, which is an intended outcome rather than a service problem.
+     */
+    json_object_object_add(resp, "suppressed", json_object_new_int(suppressed_state));
     json_object_object_add(resp, "storage_pressure",
                            json_object_new_string(jmx_storage_pressure_name(storage_guard.state.pressure)));
     json_object_object_add(resp, "storage_reason", json_object_new_string(storage_guard.state.reason));
@@ -652,6 +714,7 @@ struct json_object *notifyd_status_json(void)
     json_object_object_add(outbox, "retry", json_object_new_int(retry));
     json_object_object_add(outbox, "failed", json_object_new_int(failed));
     json_object_object_add(outbox, "delivered", json_object_new_int(delivered));
+    json_object_object_add(outbox, "suppressed", json_object_new_int(suppressed_state));
     json_object_object_add(datasets, "outbox", outbox);
     json_object_object_add(datasets, "active_channels", json_object_new_int(channels));
     json_object_object_add(datasets, "active_routes", json_object_new_int(routes));
@@ -659,6 +722,10 @@ struct json_object *notifyd_status_json(void)
     {
         struct json_object *cap = json_object_new_object();
         struct json_object *types = json_object_new_array();
+        struct json_object *route_features = json_object_new_object();
+        struct json_object *action_types = json_object_new_array();
+        struct json_object *receiver_modes = json_object_new_array();
+        struct json_object *content_modes = json_object_new_array();
 
         json_object_array_add(types, json_object_new_string("noop"));
         json_object_array_add(types, json_object_new_string("webhook"));
@@ -679,9 +746,56 @@ struct json_object *notifyd_status_json(void)
         json_object_object_add(cap, "test_send", json_object_new_boolean(1));
         json_object_object_add(cap, "retry", json_object_new_boolean(1));
         json_object_object_add(cap, "event_catalog", json_object_new_boolean(1));
+        json_object_object_add(cap, "mute_schedule_supported", json_object_new_boolean(1));
+        json_object_object_add(cap, "route_trigger_summary", json_object_new_boolean(1));
+        json_object_object_add(cap, "trigger_timeline", json_object_new_boolean(1));
+        json_object_object_add(cap, "trigger_timeline_cursor", json_object_new_boolean(1));
         json_object_object_add(cap, "mobile_push", json_object_new_boolean(0));
         json_object_object_add(cap, "mobile_push_reason",
                                json_object_new_string("device_token_provider_not_configured"));
+        {
+            /*
+             * Personal mute. Advertised as its own capability so the frontend
+             * can enable the control without probing a write, and so the
+             * per-channel scope is discoverable: only channels that address a
+             * named user (email today) can be muted for one person without
+             * affecting the other recipients on the same channel.
+             */
+            struct json_object *mute = json_object_new_object();
+            struct json_object *addressable = json_object_new_array();
+
+            json_object_array_add(addressable, json_object_new_string("email"));
+            json_object_object_add(mute, "schema_version", json_object_new_int(1));
+            json_object_object_add(mute, "permanent", json_object_new_boolean(1));
+            json_object_object_add(mute, "scheduled", json_object_new_boolean(1));
+            json_object_object_add(mute, "per_channel", json_object_new_boolean(1));
+            json_object_object_add(mute, "max_duration_s",
+                                   json_object_new_int(NOTIFYD_USER_MUTE_MAX_DURATION_S));
+            json_object_object_add(mute, "max_channels",
+                                   json_object_new_int(NOTIFYD_MAX_PREF_CHANNELS));
+            json_object_object_add(mute, "revision_guard", json_object_new_boolean(1));
+            json_object_object_add(mute, "addressable_channel_types", addressable);
+            json_object_object_add(cap, "user_mute_preference", mute);
+            json_object_object_add(cap, "outbox_suppressed_state", json_object_new_boolean(1));
+        }
+        json_object_array_add(action_types, json_object_new_string("notify"));
+        json_object_array_add(receiver_modes, json_object_new_string("channel"));
+        json_object_array_add(receiver_modes, json_object_new_string("admins"));
+        json_object_array_add(receiver_modes, json_object_new_string("users"));
+        json_object_array_add(receiver_modes, json_object_new_string("emails"));
+        json_object_array_add(content_modes, json_object_new_string("default"));
+        json_object_array_add(content_modes, json_object_new_string("custom"));
+        json_object_object_add(route_features, "schema_version",
+                               json_object_new_int(NOTIFYD_ROUTE_SCHEMA_VERSION));
+        json_object_object_add(route_features, "schedule", json_object_new_boolean(1));
+        json_object_object_add(route_features, "multi_action", json_object_new_boolean(1));
+        json_object_object_add(route_features, "rule_receivers", json_object_new_boolean(1));
+        json_object_object_add(route_features, "custom_content", json_object_new_boolean(1));
+        json_object_object_add(route_features, "route_dedupe", json_object_new_boolean(1));
+        json_object_object_add(route_features, "action_types", action_types);
+        json_object_object_add(route_features, "receiver_modes", receiver_modes);
+        json_object_object_add(route_features, "content_modes", content_modes);
+        json_object_object_add(cap, "route_features", route_features);
         notifyd_event_ids_json(cap);
         json_object_object_add(resp, "capabilities", cap);
     }
@@ -718,6 +832,35 @@ struct json_object *notifyd_settings_json(void)
         json_object_object_add(smtp, "password_present", json_object_new_boolean(s.smtp_password[0]));
         json_object_object_add(resp, "smtp", smtp);
     }
+    {
+        struct json_object *stored_mute = notifyd_json_parse_or_object(s.mute_schedule_json);
+        struct json_object *mute = NULL;
+        struct json_object *mute_error = NULL;
+        struct json_object *capabilities = json_object_new_object();
+
+        if (!notifyd_global_mute_normalize(stored_mute, &mute, &mute_error)) {
+            if (mute_error)
+                json_object_put(mute_error);
+            mute = json_object_new_object();
+            json_object_object_add(mute, "enabled", json_object_new_boolean(0));
+            json_object_object_add(mute, "timezone", json_object_new_string("Asia/Shanghai"));
+            json_object_object_add(mute, "windows", json_object_new_array());
+        }
+        json_object_put(stored_mute);
+        json_object_object_add(resp, "mute_schedule", mute);
+        json_object_object_add(resp, "mute_schedule_supported", json_object_new_boolean(1));
+        json_object_object_add(resp, "mobile_push", json_object_new_boolean(0));
+        json_object_object_add(resp, "mobile_push_supported", json_object_new_boolean(0));
+        json_object_object_add(resp, "mobile_push_reason",
+                               json_object_new_string("device_token_provider_not_configured"));
+        json_object_object_add(capabilities, "mute_schedule_supported",
+                               json_object_new_boolean(1));
+        json_object_object_add(capabilities, "mobile_push_supported",
+                               json_object_new_boolean(0));
+        json_object_object_add(capabilities, "mobile_push_reason",
+                               json_object_new_string("device_token_provider_not_configured"));
+        json_object_object_add(resp, "capabilities", capabilities);
+    }
     memset(s.smtp_password, 0, sizeof(s.smtp_password));
     return resp;
 }
@@ -746,6 +889,10 @@ struct json_object *notifyd_settings_update(struct json_object *body)
     char channel_copy[sizeof(s.default_channel_id)];
     int ok;
     struct json_object *smtp = NULL;
+    struct json_object *mute_schedule = NULL;
+    struct json_object *normalized_mute = NULL;
+    struct json_object *feature_error = NULL;
+    struct json_object *mobile_push = NULL;
     const char *smtp_host, *smtp_security, *smtp_from, *smtp_username, *password_replace;
     int smtp_port, password_delete;
 
@@ -757,6 +904,18 @@ struct json_object *notifyd_settings_update(struct json_object *body)
     }
     if (!body || !json_object_is_type(body, json_type_object))
         body = NULL;
+    if (body && json_object_object_get_ex(body, "mobile_push", &mobile_push)) {
+        resp = json_object_new_object();
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "error", json_object_new_string("feature_unsupported"));
+        json_object_object_add(resp, "feature", json_object_new_string("mobile_push"));
+        json_object_object_add(resp, "reason",
+                               json_object_new_string("device_token_provider_not_configured"));
+        return resp;
+    }
+    if (body && json_object_object_get_ex(body, "mute_schedule", &mute_schedule) &&
+        !notifyd_global_mute_normalize(mute_schedule, &normalized_mute, &feature_error))
+        return feature_error;
     s.enabled = notifyd_json_bool(body, "enabled", s.enabled);
     channel = notifyd_json_str(body, "default_channel_id", s.default_channel_id);
     if (channel && channel[0] && notifyd_id_ok(channel)) {
@@ -788,11 +947,14 @@ struct json_object *notifyd_settings_update(struct json_object *body)
         resp = json_object_new_object();
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("invalid_settings"));
+        if (normalized_mute)
+            json_object_put(normalized_mute);
         return resp;
     }
     st = notifyd_config_prepare(
         "UPDATE notifyd_settings SET enabled=?1,default_channel_id=?2,max_attempts=?3,retry_base_s=?4,retry_max_s=?5,updated_at=?6,"
-        "smtp_host=?7,smtp_port=?8,smtp_security=?9,smtp_from=?10,smtp_username=?11,smtp_password=?12 WHERE id=1");
+        "smtp_host=?7,smtp_port=?8,smtp_security=?9,smtp_from=?10,smtp_username=?11,smtp_password=?12,"
+        "mute_schedule_json=?13 WHERE id=1");
     ok = 0;
     if (st) {
         sqlite3_bind_int(st, 1, s.enabled);
@@ -807,9 +969,15 @@ struct json_object *notifyd_settings_update(struct json_object *body)
         sqlite3_bind_text(st, 10, smtp_from, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 11, smtp_username, -1, SQLITE_TRANSIENT);
         sqlite3_bind_text(st, 12, password_delete ? "" : (password_replace ? password_replace : s.smtp_password), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 13,
+            normalized_mute ? json_object_to_json_string_ext(normalized_mute, JSON_C_TO_STRING_PLAIN) :
+                              s.mute_schedule_json,
+            -1, SQLITE_TRANSIENT);
         ok = sqlite3_step(st) == SQLITE_DONE;
         sqlite3_finalize(st);
     }
+    if (normalized_mute)
+        json_object_put(normalized_mute);
     resp = notifyd_settings_json();
     notifyd_response_set_ok(resp, ok);
     json_object_object_add(resp, "saved", json_object_new_boolean(ok));
@@ -1005,8 +1173,6 @@ static int notifyd_config_revision_matches(const char *sql, const char *id,
     int64_t value = 0;
 
     if (current) *current = 0;
-    if (expected < 0)
-        return 1;
     st = notifyd_config_prepare(sql);
     if (!st)
         return 0;
@@ -1015,7 +1181,7 @@ static int notifyd_config_revision_matches(const char *sql, const char *id,
         value = sqlite3_column_int64(st, 0);
     sqlite3_finalize(st);
     if (current) *current = value;
-    return value == expected;
+    return expected < 0 || value == expected;
 }
 
 static struct json_object *notifyd_channel_options_existing(const char *id)
@@ -1183,8 +1349,36 @@ struct json_object *notifyd_channels_delete(struct json_object *body)
         json_object_object_add(resp, "error", json_object_new_string("builtin_channel_protected"));
         return resp;
     }
-    st = notifyd_config_prepare("SELECT COUNT(*) FROM notifyd_routes WHERE channel_id=?1");
-    if (st) { sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT); if (sqlite3_step(st) == SQLITE_ROW) routes = sqlite3_column_int(st, 0); sqlite3_finalize(st); }
+    st = notifyd_config_prepare(
+        "SELECT channel_id,options_json FROM notifyd_routes");
+    if (st) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *top_channel = notifyd_sqlite_text(st, 0, "local");
+            struct json_object *stored_options;
+            struct json_object *actions = NULL;
+            size_t i;
+            int referenced = !strcmp(top_channel, id);
+
+            if (!referenced) {
+                stored_options = notifyd_json_parse_or_object(
+                    notifyd_sqlite_text(st, 1, "{}"));
+                if (json_object_object_get_ex(stored_options, "actions", &actions) &&
+                    actions && json_object_is_type(actions, json_type_array)) {
+                    for (i = 0; i < json_object_array_length(actions); i++) {
+                        struct json_object *action = json_object_array_get_idx(actions, i);
+                        if (!strcmp(notifyd_json_str(action, "channel_id", ""), id)) {
+                            referenced = 1;
+                            break;
+                        }
+                    }
+                }
+                json_object_put(stored_options);
+            }
+            if (referenced)
+                routes++;
+        }
+        sqlite3_finalize(st);
+    }
     st = notifyd_config_prepare("SELECT COUNT(*) FROM notifyd_settings WHERE id=1 AND default_channel_id=?1");
     if (st) { sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT); if (sqlite3_step(st) == SQLITE_ROW) is_default = sqlite3_column_int(st, 0); sqlite3_finalize(st); }
     st = notifyd_prepare("SELECT COUNT(*) FROM notify_outbox WHERE channel_id=?1 AND state IN ('pending','retry')");
@@ -1209,10 +1403,734 @@ struct json_object *notifyd_channels_delete(struct json_object *body)
     return resp;
 }
 
+static int notifyd_route_object_key_allowed(const char *key,
+                                            const char *const *allowed,
+                                            size_t allowed_count)
+{
+    size_t i;
+
+    for (i = 0; i < allowed_count; i++)
+        if (!strcmp(key, allowed[i]))
+            return 1;
+    return 0;
+}
+
+static int notifyd_route_object_keys_ok(struct json_object *object,
+                                        const char *const *allowed,
+                                        size_t allowed_count,
+                                        const char **bad_key)
+{
+    if (bad_key)
+        *bad_key = "";
+    if (!object || !json_object_is_type(object, json_type_object))
+        return 0;
+    json_object_object_foreach(object, key, value) {
+        (void)value;
+        if (!notifyd_route_object_key_allowed(key, allowed, allowed_count)) {
+            if (bad_key)
+                *bad_key = key;
+            return 0;
+        }
+    }
+    return 1;
+}
+
+static int notifyd_route_device_timezone(char *out, size_t out_len)
+{
+    sqlite3_stmt *st;
+
+    if (!out || out_len == 0)
+        return 0;
+    snprintf(out, out_len, "%s", "Asia/Shanghai");
+    st = notifyd_config_prepare("SELECT timezone FROM system_settings WHERE id=1");
+    if (!st)
+        return 1;
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *timezone = notifyd_sqlite_text(st, 0, "Asia/Shanghai");
+        if (timezone[0] && strlen(timezone) < out_len)
+            snprintf(out, out_len, "%s", timezone);
+    }
+    sqlite3_finalize(st);
+    return 1;
+}
+
+static int notifyd_route_timezone_ok(const char *timezone)
+{
+    char path[256];
+    struct stat st;
+    const unsigned char *p;
+
+    if (!timezone || !timezone[0] || strlen(timezone) > 96 || timezone[0] == '/' ||
+        strstr(timezone, "..") || strchr(timezone, '\\'))
+        return 0;
+    for (p = (const unsigned char *)timezone; *p; p++)
+        if (!(isalnum(*p) || *p == '_' || *p == '-' || *p == '+' || *p == '/'))
+            return 0;
+    snprintf(path, sizeof(path), "/usr/share/zoneinfo/%s", timezone);
+    return stat(path, &st) == 0 && S_ISREG(st.st_mode);
+}
+
+static int notifyd_route_hhmm(const char *value)
+{
+    int hour, minute;
+
+    if (!value || strlen(value) != 5 || value[2] != ':' ||
+        !isdigit((unsigned char)value[0]) || !isdigit((unsigned char)value[1]) ||
+        !isdigit((unsigned char)value[3]) || !isdigit((unsigned char)value[4]))
+        return -1;
+    hour = (value[0] - '0') * 10 + value[1] - '0';
+    minute = (value[3] - '0') * 10 + value[4] - '0';
+    if (hour > 23 || minute > 59)
+        return -1;
+    return hour * 60 + minute;
+}
+
+static int notifyd_route_template_ok(const char *text, size_t max_len)
+{
+    static const char *const variables[] = {
+        "event", "category", "severity", "source", "target", "detail", "title", "ts"
+    };
+    const char *p;
+
+    if (!text || !notifyd_text_ok(text, max_len) || strchr(text, '\r'))
+        return 0;
+    for (p = text; *p; p++) {
+        const char *end;
+        size_t len;
+        size_t i;
+        int known = 0;
+
+        if (*p == '}')
+            return 0;
+        if (*p != '{')
+            continue;
+        end = strchr(p + 1, '}');
+        if (!end || end == p + 1)
+            return 0;
+        len = (size_t)(end - p - 1);
+        for (i = 0; i < sizeof(variables) / sizeof(variables[0]); i++)
+            if (strlen(variables[i]) == len && !strncmp(p + 1, variables[i], len)) {
+                known = 1;
+                break;
+            }
+        if (!known)
+            return 0;
+        p = end;
+    }
+    return 1;
+}
+
+static int notifyd_route_subject_ok(const char *text)
+{
+    return notifyd_route_template_ok(text, NOTIFYD_MAX_TEMPLATE_SUBJECT) &&
+        !strchr(text, '\n') && !strchr(text, '\t');
+}
+
+static struct json_object *notifyd_route_options_clone(struct json_object *options)
+{
+    struct json_object *copy = NULL;
+    const char *serialized;
+
+    if (!options || !json_object_is_type(options, json_type_object))
+        return json_object_new_object();
+    serialized = json_object_to_json_string(options);
+    if (serialized)
+        copy = json_tokener_parse(serialized);
+    if (!copy || !json_object_is_type(copy, json_type_object)) {
+        if (copy)
+            json_object_put(copy);
+        copy = json_object_new_object();
+    }
+    return copy;
+}
+
+static struct json_object *notifyd_global_mute_error(const char *reason,
+                                                     const char *field)
+{
+    struct json_object *resp = json_object_new_object();
+
+    json_object_object_add(resp, "ok", json_object_new_boolean(0));
+    json_object_object_add(resp, "error", json_object_new_string("invalid_settings"));
+    json_object_object_add(resp, "feature", json_object_new_string("mute_schedule"));
+    json_object_object_add(resp, "reason",
+                           json_object_new_string(reason ? reason : "mute_schedule_invalid"));
+    if (field && field[0])
+        json_object_object_add(resp, "field", json_object_new_string(field));
+    return resp;
+}
+
+static int notifyd_global_mute_normalize(struct json_object *input,
+                                         struct json_object **normalized_out,
+                                         struct json_object **error_out)
+{
+    static const char *const mute_keys[] = { "enabled", "timezone", "windows" };
+    static const char *const window_keys[] = { "days", "start", "end" };
+    struct json_object *normalized = NULL, *windows = NULL, *value = NULL;
+    struct json_object *windows_copy = NULL;
+    const char *bad_key = "";
+    const char *timezone;
+    char device_timezone[128];
+    int enabled;
+    int ranges[7][NOTIFYD_MAX_ROUTE_WINDOWS][2];
+    int range_count[7] = {0};
+    size_t i, j;
+
+    if (normalized_out)
+        *normalized_out = NULL;
+    if (error_out)
+        *error_out = NULL;
+    if (!input || !json_object_is_type(input, json_type_object)) {
+        if (error_out)
+            *error_out = notifyd_global_mute_error("mute_schedule_object_required",
+                                                   "mute_schedule");
+        return 0;
+    }
+    if (!notifyd_route_object_keys_ok(input, mute_keys,
+            sizeof(mute_keys) / sizeof(mute_keys[0]), &bad_key)) {
+        if (error_out)
+            *error_out = notifyd_global_mute_error("mute_schedule_field_unsupported",
+                                                   bad_key);
+        return 0;
+    }
+    if (json_object_object_get_ex(input, "enabled", &value) &&
+        !json_object_is_type(value, json_type_boolean)) {
+        if (error_out)
+            *error_out = notifyd_global_mute_error("mute_schedule_enabled_invalid",
+                                                   "mute_schedule.enabled");
+        return 0;
+    }
+    enabled = notifyd_json_bool(input, "enabled", 0);
+    notifyd_route_device_timezone(device_timezone, sizeof(device_timezone));
+    timezone = notifyd_json_str(input, "timezone", device_timezone);
+    if ((json_object_object_get_ex(input, "timezone", &value) &&
+         !json_object_is_type(value, json_type_string)) ||
+        !notifyd_route_timezone_ok(timezone)) {
+        if (error_out)
+            *error_out = notifyd_global_mute_error("mute_schedule_timezone_invalid",
+                                                   "mute_schedule.timezone");
+        return 0;
+    }
+    normalized = json_object_new_object();
+    windows_copy = json_object_new_array();
+    if (!normalized || !windows_copy)
+        goto oom;
+    if (json_object_object_get_ex(input, "windows", &windows)) {
+        if (!windows || !json_object_is_type(windows, json_type_array) ||
+            json_object_array_length(windows) > NOTIFYD_MAX_ROUTE_WINDOWS) {
+            if (error_out)
+                *error_out = notifyd_global_mute_error("mute_schedule_windows_invalid",
+                                                       "mute_schedule.windows");
+            goto fail;
+        }
+    }
+    if (enabled && (!windows || json_object_array_length(windows) == 0)) {
+        if (error_out)
+            *error_out = notifyd_global_mute_error("mute_schedule_windows_required",
+                                                   "mute_schedule.windows");
+        goto fail;
+    }
+    for (i = 0; windows && i < json_object_array_length(windows); i++) {
+        struct json_object *window = json_object_array_get_idx(windows, i);
+        struct json_object *days = NULL;
+        int start, end;
+        char field[96];
+
+        if (!window || !json_object_is_type(window, json_type_object) ||
+            !notifyd_route_object_keys_ok(window, window_keys,
+                sizeof(window_keys) / sizeof(window_keys[0]), &bad_key)) {
+            snprintf(field, sizeof(field), "mute_schedule.windows[%zu]", i);
+            if (error_out)
+                *error_out = notifyd_global_mute_error("mute_schedule_window_invalid", field);
+            goto fail;
+        }
+        start = notifyd_route_hhmm(notifyd_json_str(window, "start", ""));
+        end = notifyd_route_hhmm(notifyd_json_str(window, "end", ""));
+        if (start < 0 || end <= start ||
+            !json_object_object_get_ex(window, "days", &days) || !days ||
+            !json_object_is_type(days, json_type_array) ||
+            json_object_array_length(days) == 0 || json_object_array_length(days) > 7) {
+            snprintf(field, sizeof(field), "mute_schedule.windows[%zu]", i);
+            if (error_out)
+                *error_out = notifyd_global_mute_error("mute_schedule_window_invalid", field);
+            goto fail;
+        }
+        for (j = 0; j < json_object_array_length(days); j++) {
+            struct json_object *day_value = json_object_array_get_idx(days, j);
+            int day;
+            int k;
+
+            if (!day_value || !json_object_is_type(day_value, json_type_int) ||
+                (day = json_object_get_int(day_value)) < 1 || day > 7) {
+                snprintf(field, sizeof(field), "mute_schedule.windows[%zu].days[%zu]", i, j);
+                if (error_out)
+                    *error_out = notifyd_global_mute_error("mute_schedule_day_invalid", field);
+                goto fail;
+            }
+            for (k = 0; k < range_count[day - 1]; k++)
+                if (start < ranges[day - 1][k][1] && end > ranges[day - 1][k][0]) {
+                    snprintf(field, sizeof(field), "mute_schedule.windows[%zu]", i);
+                    if (error_out)
+                        *error_out = notifyd_global_mute_error("mute_schedule_window_overlap", field);
+                    goto fail;
+                }
+            ranges[day - 1][range_count[day - 1]][0] = start;
+            ranges[day - 1][range_count[day - 1]][1] = end;
+            range_count[day - 1]++;
+        }
+        json_object_array_add(windows_copy, notifyd_route_options_clone(window));
+    }
+    json_object_object_add(normalized, "enabled", json_object_new_boolean(enabled));
+    json_object_object_add(normalized, "timezone", json_object_new_string(timezone));
+    json_object_object_add(normalized, "windows", windows_copy);
+    if (!notifyd_json_fits(normalized, NOTIFYD_MAX_JSON - 1)) {
+        if (error_out)
+            *error_out = notifyd_global_mute_error("mute_schedule_too_large",
+                                                   "mute_schedule");
+        json_object_put(normalized);
+        return 0;
+    }
+    if (normalized_out)
+        *normalized_out = normalized;
+    else
+        json_object_put(normalized);
+    return 1;
+
+oom:
+    if (error_out)
+        *error_out = notifyd_global_mute_error("allocation_failed", "mute_schedule");
+fail:
+    if (windows_copy)
+        json_object_put(windows_copy);
+    if (normalized)
+        json_object_put(normalized);
+    return 0;
+}
+
+static int notifyd_route_contract_build(struct json_object *input,
+                                        const char *top_channel,
+                                        const char *top_severity,
+                                        int top_channel_present,
+                                        int top_severity_present,
+                                        int strict,
+                                        struct notifyd_route_contract *out,
+                                        struct json_object **error_out)
+{
+    static const char *const option_keys[] = {
+        "schema_version", "schedule", "actions", "receivers", "content", "dedupe"
+    };
+    static const char *const schedule_keys[] = { "mode", "timezone", "windows" };
+    static const char *const window_keys[] = { "days", "start", "end" };
+    static const char *const action_keys[] = { "type", "channel_id", "min_severity" };
+    static const char *const receiver_keys[] = { "mode", "user_ids", "recipients" };
+    static const char *const content_keys[] = { "mode", "subject", "body" };
+    static const char *const dedupe_keys[] = { "enabled", "window_seconds", "key_fields" };
+    static const char *const dedupe_fields[] = { "event", "source", "target", "category", "severity" };
+    struct json_object *canonical = notifyd_route_options_clone(strict ? NULL : input);
+    struct json_object *schedule = NULL, *actions = NULL, *receivers = NULL;
+    struct json_object *content = NULL, *dedupe = NULL, *value = NULL;
+    struct json_object *normalized;
+    const char *bad_key = "";
+    char device_timezone[128];
+    size_t i, j;
+
+#define ROUTE_FAIL(code, feature_name, field_name, action_no) do { \
+    if (error_out) *error_out = notifyd_route_error((code), (feature_name), (field_name), (action_no)); \
+    json_object_put(canonical); \
+    return 0; \
+} while (0)
+
+    if (error_out)
+        *error_out = NULL;
+    if (!out)
+        ROUTE_FAIL("invalid_route", "", "options", -1);
+    memset(out, 0, sizeof(*out));
+    snprintf(out->channel_id, sizeof(out->channel_id), "%s",
+             top_channel && top_channel[0] ? top_channel : "local");
+    snprintf(out->min_severity, sizeof(out->min_severity), "%s",
+             top_severity && top_severity[0] ? top_severity : "warning");
+    if (strict && input && !json_object_is_type(input, json_type_object))
+        ROUTE_FAIL("invalid_route", "", "options", -1);
+    if (!input || !json_object_is_type(input, json_type_object))
+        input = NULL;
+    if (strict && input && !notifyd_route_object_keys_ok(input, option_keys,
+            sizeof(option_keys) / sizeof(option_keys[0]), &bad_key))
+        ROUTE_FAIL("route_feature_unsupported", bad_key, bad_key, -1);
+    if (input && json_object_object_get_ex(input, "schema_version", &value)) {
+        if (!json_object_is_type(value, json_type_int) ||
+            json_object_get_int(value) != NOTIFYD_ROUTE_SCHEMA_VERSION)
+            ROUTE_FAIL("route_feature_unsupported", "schema_version", "options.schema_version", -1);
+    }
+    json_object_object_add(canonical, "schema_version",
+                           json_object_new_int(NOTIFYD_ROUTE_SCHEMA_VERSION));
+
+    if (input)
+        json_object_object_get_ex(input, "schedule", &schedule);
+    normalized = json_object_new_object();
+    if (!schedule || !json_object_is_type(schedule, json_type_object)) {
+        if (strict && schedule)
+            ROUTE_FAIL("schedule_invalid", "schedule", "options.schedule", -1);
+        json_object_object_add(normalized, "mode", json_object_new_string("always"));
+    } else {
+        const char *mode = notifyd_json_str(schedule, "mode", "always");
+        if (json_object_object_get_ex(schedule, "mode", &value) &&
+            !json_object_is_type(value, json_type_string))
+            ROUTE_FAIL("schedule_invalid", "schedule", "options.schedule.mode", -1);
+        if (strict && !notifyd_route_object_keys_ok(schedule, schedule_keys,
+                sizeof(schedule_keys) / sizeof(schedule_keys[0]), &bad_key))
+            ROUTE_FAIL("schedule_invalid", "schedule", bad_key, -1);
+        if (strcmp(mode, "always") && strcmp(mode, "custom"))
+            ROUTE_FAIL("schedule_invalid", "schedule", "options.schedule.mode", -1);
+        json_object_object_add(normalized, "mode", json_object_new_string(mode));
+        if (!strcmp(mode, "custom")) {
+            struct json_object *windows = NULL;
+            const char *timezone = notifyd_json_str(schedule, "timezone", "");
+            int ranges[7][NOTIFYD_MAX_ROUTE_WINDOWS][2];
+            int range_count[7] = {0};
+
+            if (!timezone[0]) {
+                notifyd_route_device_timezone(device_timezone, sizeof(device_timezone));
+                timezone = device_timezone;
+            }
+            if (json_object_object_get_ex(schedule, "timezone", &value) &&
+                !json_object_is_type(value, json_type_string))
+                ROUTE_FAIL("schedule_invalid", "schedule", "options.schedule.timezone", -1);
+            if (!notifyd_route_timezone_ok(timezone))
+                ROUTE_FAIL("schedule_invalid", "schedule", "options.schedule.timezone", -1);
+            if (!json_object_object_get_ex(schedule, "windows", &windows) || !windows ||
+                !json_object_is_type(windows, json_type_array) ||
+                json_object_array_length(windows) == 0 ||
+                json_object_array_length(windows) > NOTIFYD_MAX_ROUTE_WINDOWS)
+                ROUTE_FAIL("schedule_window_invalid", "schedule", "options.schedule.windows", -1);
+            json_object_object_add(normalized, "timezone", json_object_new_string(timezone));
+            {
+                struct json_object *windows_copy = json_object_new_array();
+                for (i = 0; i < json_object_array_length(windows); i++) {
+                    struct json_object *window = json_object_array_get_idx(windows, i);
+                    struct json_object *days = NULL;
+                    int start, end;
+                    char field[96];
+
+                    if (!window || !json_object_is_type(window, json_type_object) ||
+                        (strict && !notifyd_route_object_keys_ok(window, window_keys,
+                            sizeof(window_keys) / sizeof(window_keys[0]), &bad_key))) {
+                        snprintf(field, sizeof(field), "options.schedule.windows[%zu]", i);
+                        ROUTE_FAIL("schedule_window_invalid", "schedule", field, -1);
+                    }
+                    start = notifyd_route_hhmm(notifyd_json_str(window, "start", ""));
+                    end = notifyd_route_hhmm(notifyd_json_str(window, "end", ""));
+                    if (start < 0 || end <= start ||
+                        !json_object_object_get_ex(window, "days", &days) || !days ||
+                        !json_object_is_type(days, json_type_array) ||
+                        json_object_array_length(days) == 0 || json_object_array_length(days) > 7) {
+                        snprintf(field, sizeof(field), "options.schedule.windows[%zu]", i);
+                        ROUTE_FAIL("schedule_window_invalid", "schedule", field, -1);
+                    }
+                    for (j = 0; j < json_object_array_length(days); j++) {
+                        struct json_object *day_value = json_object_array_get_idx(days, j);
+                        int day;
+                        int k;
+                        if (!day_value || !json_object_is_type(day_value, json_type_int) ||
+                            (day = json_object_get_int(day_value)) < 1 || day > 7) {
+                            snprintf(field, sizeof(field), "options.schedule.windows[%zu].days[%zu]", i, j);
+                            ROUTE_FAIL("schedule_window_invalid", "schedule", field, -1);
+                        }
+                        for (k = 0; k < range_count[day - 1]; k++)
+                            if (start < ranges[day - 1][k][1] && end > ranges[day - 1][k][0]) {
+                                snprintf(field, sizeof(field), "options.schedule.windows[%zu]", i);
+                                ROUTE_FAIL("schedule_window_invalid", "schedule", field, -1);
+                            }
+                        ranges[day - 1][range_count[day - 1]][0] = start;
+                        ranges[day - 1][range_count[day - 1]][1] = end;
+                        range_count[day - 1]++;
+                    }
+                    json_object_array_add(windows_copy, notifyd_route_options_clone(window));
+                }
+                json_object_object_add(normalized, "windows", windows_copy);
+            }
+        } else if (strict &&
+                   (json_object_object_get_ex(schedule, "timezone", &value) ||
+                    json_object_object_get_ex(schedule, "windows", &value))) {
+            ROUTE_FAIL("schedule_invalid", "schedule", "options.schedule", -1);
+        }
+    }
+    json_object_object_add(canonical, "schedule", normalized);
+
+    if (input)
+        json_object_object_get_ex(input, "actions", &actions);
+    normalized = json_object_new_array();
+    if (!actions) {
+        struct notifyd_channel channel;
+        struct json_object *action = json_object_new_object();
+
+        if (strict && (!notifyd_channel_get(out->channel_id, &channel) || !channel.enabled)) {
+            json_object_put(action);
+            ROUTE_FAIL("action_invalid", "multi_action", "channel_id", 0);
+        }
+        if (strict && strcmp(channel.type, "noop") && strcmp(channel.type, "webhook") &&
+            strcmp(channel.type, "email")) {
+            json_object_put(action);
+            ROUTE_FAIL("channel_incompatible", "multi_action", "channel_id", 0);
+        }
+        json_object_object_add(action, "type", json_object_new_string("notify"));
+        json_object_object_add(action, "channel_id", json_object_new_string(out->channel_id));
+        json_object_object_add(action, "min_severity", json_object_new_string(out->min_severity));
+        json_object_array_add(normalized, action);
+    } else {
+        if (!json_object_is_type(actions, json_type_array) ||
+            json_object_array_length(actions) == 0 ||
+            json_object_array_length(actions) > NOTIFYD_MAX_ROUTE_ACTIONS)
+            ROUTE_FAIL("action_invalid", "multi_action", "options.actions", -1);
+        for (i = 0; i < json_object_array_length(actions); i++) {
+            struct json_object *action = json_object_array_get_idx(actions, i);
+            struct notifyd_channel channel;
+            const char *type, *channel_id, *min_severity;
+            struct json_object *action_copy;
+
+            if (!action || !json_object_is_type(action, json_type_object) ||
+                (strict && !notifyd_route_object_keys_ok(action, action_keys,
+                    sizeof(action_keys) / sizeof(action_keys[0]), &bad_key)))
+                ROUTE_FAIL("action_invalid", "multi_action", "options.actions", (int)i);
+            type = notifyd_json_str(action, "type", "");
+            channel_id = notifyd_json_str(action, "channel_id", "");
+            min_severity = notifyd_json_str(action, "min_severity", "");
+            if (strcmp(type, "notify") || !notifyd_id_ok(channel_id) ||
+                !notifyd_severity_valid(min_severity))
+                ROUTE_FAIL("action_invalid", "multi_action", "options.actions", (int)i);
+            if (strict && (!notifyd_channel_get(channel_id, &channel) || !channel.enabled))
+                ROUTE_FAIL("action_invalid", "multi_action", "options.actions.channel_id", (int)i);
+            if (strict && strcmp(channel.type, "noop") && strcmp(channel.type, "webhook") &&
+                strcmp(channel.type, "email"))
+                ROUTE_FAIL("channel_incompatible", "multi_action", "options.actions.channel_id", (int)i);
+            for (j = 0; j < i; j++) {
+                struct json_object *previous = json_object_array_get_idx(normalized, j);
+                if (!strcmp(channel_id, notifyd_json_str(previous, "channel_id", "")))
+                    ROUTE_FAIL("duplicate_action", "multi_action", "options.actions.channel_id", (int)i);
+            }
+            if (i == 0) {
+                if ((top_channel_present && strcmp(out->channel_id, channel_id)) ||
+                    (top_severity_present && strcmp(out->min_severity, min_severity)))
+                    ROUTE_FAIL("route_action_conflict", "multi_action", "options.actions[0]", 0);
+                snprintf(out->channel_id, sizeof(out->channel_id), "%s", channel_id);
+                snprintf(out->min_severity, sizeof(out->min_severity), "%s", min_severity);
+            }
+            action_copy = json_object_new_object();
+            json_object_object_add(action_copy, "type", json_object_new_string("notify"));
+            json_object_object_add(action_copy, "channel_id", json_object_new_string(channel_id));
+            json_object_object_add(action_copy, "min_severity", json_object_new_string(min_severity));
+            json_object_array_add(normalized, action_copy);
+        }
+    }
+    json_object_object_add(canonical, "actions", normalized);
+
+    if (input)
+        json_object_object_get_ex(input, "receivers", &receivers);
+    normalized = json_object_new_object();
+    if (!receivers || !json_object_is_type(receivers, json_type_object)) {
+        if (strict && receivers)
+            ROUTE_FAIL("receiver_invalid", "rule_receivers", "options.receivers", -1);
+        json_object_object_add(normalized, "mode", json_object_new_string("channel"));
+    } else {
+        const char *mode = notifyd_json_str(receivers, "mode", "channel");
+        struct json_object *items = NULL;
+        int has_user_ids = json_object_object_get_ex(receivers, "user_ids", &value);
+        int has_recipients = json_object_object_get_ex(receivers, "recipients", &value);
+        if (json_object_object_get_ex(receivers, "mode", &value) &&
+            !json_object_is_type(value, json_type_string))
+            ROUTE_FAIL("receiver_invalid", "rule_receivers", "options.receivers.mode", -1);
+        if (strict && !notifyd_route_object_keys_ok(receivers, receiver_keys,
+                sizeof(receiver_keys) / sizeof(receiver_keys[0]), &bad_key))
+            ROUTE_FAIL("receiver_invalid", "rule_receivers", bad_key, -1);
+        if (strcmp(mode, "channel") && strcmp(mode, "admins") &&
+            strcmp(mode, "users") && strcmp(mode, "emails"))
+            ROUTE_FAIL("receiver_invalid", "rule_receivers", "options.receivers.mode", -1);
+        if (strict && ((!strcmp(mode, "users") && has_recipients) ||
+                       (!strcmp(mode, "emails") && has_user_ids) ||
+                       ((!strcmp(mode, "channel") || !strcmp(mode, "admins")) &&
+                        (has_user_ids || has_recipients))))
+            ROUTE_FAIL("receiver_invalid", "rule_receivers", "options.receivers", -1);
+        json_object_object_add(normalized, "mode", json_object_new_string(mode));
+        if (!strcmp(mode, "users")) {
+            struct json_object *copy = json_object_new_array();
+            if (!json_object_object_get_ex(receivers, "user_ids", &items) || !items ||
+                !json_object_is_type(items, json_type_array) ||
+                json_object_array_length(items) == 0 ||
+                json_object_array_length(items) > NOTIFYD_MAX_ROUTE_RECEIVERS)
+                ROUTE_FAIL("receiver_invalid", "rule_receivers", "options.receivers.user_ids", -1);
+            for (i = 0; i < json_object_array_length(items); i++) {
+                struct json_object *item = json_object_array_get_idx(items, i);
+                const char *id = item && json_object_is_type(item, json_type_string) ?
+                    json_object_get_string(item) : "";
+                if (!notifyd_id_ok(id))
+                    ROUTE_FAIL("receiver_invalid", "rule_receivers", "options.receivers.user_ids", -1);
+                for (j = 0; j < i; j++)
+                    if (!strcmp(id, json_object_get_string(json_object_array_get_idx(copy, j))))
+                        ROUTE_FAIL("receiver_invalid", "rule_receivers", "options.receivers.user_ids", -1);
+                json_object_array_add(copy, json_object_new_string(id));
+            }
+            json_object_object_add(normalized, "user_ids", copy);
+        } else if (!strcmp(mode, "emails")) {
+            struct json_object *copy = json_object_new_array();
+            if (!json_object_object_get_ex(receivers, "recipients", &items) || !items ||
+                !json_object_is_type(items, json_type_array) ||
+                json_object_array_length(items) == 0 ||
+                json_object_array_length(items) > NOTIFYD_MAX_ROUTE_RECEIVERS)
+                ROUTE_FAIL("receiver_invalid", "rule_receivers", "options.receivers.recipients", -1);
+            for (i = 0; i < json_object_array_length(items); i++) {
+                struct json_object *item = json_object_array_get_idx(items, i);
+                const char *email = item && json_object_is_type(item, json_type_string) ?
+                    json_object_get_string(item) : "";
+                if (!notifyd_route_email_ok(email))
+                    ROUTE_FAIL("receiver_invalid", "rule_receivers", "options.receivers.recipients", -1);
+                for (j = 0; j < i; j++)
+                    if (!strcasecmp(email, json_object_get_string(json_object_array_get_idx(copy, j))))
+                        ROUTE_FAIL("receiver_invalid", "rule_receivers", "options.receivers.recipients", -1);
+                json_object_array_add(copy, json_object_new_string(email));
+            }
+            json_object_object_add(normalized, "recipients", copy);
+        }
+    }
+    if (strcmp(notifyd_json_str(normalized, "mode", "channel"), "channel")) {
+        struct json_object *canonical_actions = NULL;
+        json_object_object_get_ex(canonical, "actions", &canonical_actions);
+        for (i = 0; canonical_actions && i < json_object_array_length(canonical_actions); i++) {
+            struct notifyd_channel channel;
+            struct json_object *action = json_object_array_get_idx(canonical_actions, i);
+            if (notifyd_channel_get(notifyd_json_str(action, "channel_id", ""), &channel) &&
+                strcmp(channel.type, "email"))
+                ROUTE_FAIL("receiver_mode_incompatible", "rule_receivers",
+                           "options.receivers.mode", (int)i);
+        }
+    }
+    json_object_object_add(canonical, "receivers", normalized);
+
+    if (input)
+        json_object_object_get_ex(input, "content", &content);
+    normalized = json_object_new_object();
+    if (!content || !json_object_is_type(content, json_type_object)) {
+        if (strict && content)
+            ROUTE_FAIL("content_template_invalid", "custom_content", "options.content", -1);
+        json_object_object_add(normalized, "mode", json_object_new_string("default"));
+    } else {
+        const char *mode = notifyd_json_str(content, "mode", "default");
+        int has_subject = json_object_object_get_ex(content, "subject", &value);
+        int has_body = json_object_object_get_ex(content, "body", &value);
+        if (json_object_object_get_ex(content, "mode", &value) &&
+            !json_object_is_type(value, json_type_string))
+            ROUTE_FAIL("content_template_invalid", "custom_content", "options.content.mode", -1);
+        if (strict && !notifyd_route_object_keys_ok(content, content_keys,
+                sizeof(content_keys) / sizeof(content_keys[0]), &bad_key))
+            ROUTE_FAIL("content_template_invalid", "custom_content", bad_key, -1);
+        if (strcmp(mode, "default") && strcmp(mode, "custom"))
+            ROUTE_FAIL("content_template_invalid", "custom_content", "options.content.mode", -1);
+        if (strict && !strcmp(mode, "default") && (has_subject || has_body))
+            ROUTE_FAIL("content_template_invalid", "custom_content", "options.content", -1);
+        json_object_object_add(normalized, "mode", json_object_new_string(mode));
+        if (!strcmp(mode, "custom")) {
+            const char *subject = notifyd_json_str(content, "subject", "");
+            const char *template_body = notifyd_json_str(content, "body", "");
+            if (!subject[0] || !template_body[0] ||
+                !notifyd_route_subject_ok(subject) ||
+                !notifyd_route_template_ok(template_body, NOTIFYD_MAX_TEMPLATE_BODY))
+                ROUTE_FAIL("content_template_invalid", "custom_content", "options.content", -1);
+            json_object_object_add(normalized, "subject", json_object_new_string(subject));
+            json_object_object_add(normalized, "body", json_object_new_string(template_body));
+        }
+    }
+    json_object_object_add(canonical, "content", normalized);
+
+    if (input)
+        json_object_object_get_ex(input, "dedupe", &dedupe);
+    normalized = json_object_new_object();
+    if (!dedupe || !json_object_is_type(dedupe, json_type_object)) {
+        if (strict && dedupe)
+            ROUTE_FAIL("dedupe_window_invalid", "route_dedupe", "options.dedupe", -1);
+        json_object_object_add(normalized, "enabled", json_object_new_boolean(0));
+        json_object_object_add(normalized, "window_seconds", json_object_new_int(0));
+    } else {
+        int enabled = notifyd_json_bool(dedupe, "enabled", 0);
+        int window = notifyd_json_int(dedupe, "window_seconds", 0);
+        struct json_object *fields = NULL;
+        struct json_object *copy = json_object_new_array();
+        if (json_object_object_get_ex(dedupe, "enabled", &value) &&
+            !json_object_is_type(value, json_type_boolean)) {
+            json_object_put(copy);
+            ROUTE_FAIL("dedupe_window_invalid", "route_dedupe", "options.dedupe.enabled", -1);
+        }
+        if (json_object_object_get_ex(dedupe, "window_seconds", &value) &&
+            !json_object_is_type(value, json_type_int)) {
+            json_object_put(copy);
+            ROUTE_FAIL("dedupe_window_invalid", "route_dedupe", "options.dedupe.window_seconds", -1);
+        }
+        if (strict && !notifyd_route_object_keys_ok(dedupe, dedupe_keys,
+                sizeof(dedupe_keys) / sizeof(dedupe_keys[0]), &bad_key))
+            ROUTE_FAIL("dedupe_key_invalid", "route_dedupe", bad_key, -1);
+        if (!enabled || window == 0) {
+            enabled = 0;
+            window = 0;
+        } else if (window < 1 || window > NOTIFYD_MAX_DEDUPE_WINDOW) {
+            json_object_put(copy);
+            ROUTE_FAIL("dedupe_window_invalid", "route_dedupe", "options.dedupe.window_seconds", -1);
+        }
+        if (enabled) {
+            if (!json_object_object_get_ex(dedupe, "key_fields", &fields) || !fields ||
+                !json_object_is_type(fields, json_type_array) ||
+                json_object_array_length(fields) == 0 ||
+                json_object_array_length(fields) > sizeof(dedupe_fields) / sizeof(dedupe_fields[0])) {
+                json_object_put(copy);
+                ROUTE_FAIL("dedupe_key_invalid", "route_dedupe", "options.dedupe.key_fields", -1);
+            }
+            for (i = 0; i < json_object_array_length(fields); i++) {
+                struct json_object *field_value = json_object_array_get_idx(fields, i);
+                const char *field = field_value && json_object_is_type(field_value, json_type_string) ?
+                    json_object_get_string(field_value) : "";
+                if (!notifyd_route_object_key_allowed(field, dedupe_fields,
+                        sizeof(dedupe_fields) / sizeof(dedupe_fields[0]))) {
+                    json_object_put(copy);
+                    ROUTE_FAIL("dedupe_key_invalid", "route_dedupe", "options.dedupe.key_fields", -1);
+                }
+                for (j = 0; j < i; j++)
+                    if (!strcmp(field, json_object_get_string(json_object_array_get_idx(copy, j)))) {
+                        json_object_put(copy);
+                        ROUTE_FAIL("dedupe_key_invalid", "route_dedupe", "options.dedupe.key_fields", -1);
+                    }
+                json_object_array_add(copy, json_object_new_string(field));
+            }
+        }
+        json_object_object_add(normalized, "enabled", json_object_new_boolean(enabled));
+        json_object_object_add(normalized, "window_seconds", json_object_new_int(window));
+        if (enabled)
+            json_object_object_add(normalized, "key_fields", copy);
+        else
+            json_object_put(copy);
+    }
+    json_object_object_add(canonical, "dedupe", normalized);
+
+    if (!notifyd_json_fits(canonical, NOTIFYD_MAX_JSON - 1))
+        ROUTE_FAIL("invalid_route", "", "options", -1);
+    out->options = canonical;
+    return 1;
+#undef ROUTE_FAIL
+}
+
+static void notifyd_route_contract_clear(struct notifyd_route_contract *contract)
+{
+    if (contract && contract->options) {
+        json_object_put(contract->options);
+        contract->options = NULL;
+    }
+}
+
 static void notifyd_route_row_json(struct json_object *arr, sqlite3_stmt *st)
 {
     const char *options_s = notifyd_sqlite_text(st, 8, "{}");
+    struct json_object *stored_options = notifyd_json_parse_or_object(options_s);
+    struct notifyd_route_contract contract;
     struct json_object *o = json_object_new_object();
+
+    memset(&contract, 0, sizeof(contract));
+    (void)notifyd_route_contract_build(stored_options,
+        notifyd_sqlite_text(st, 3, "local"),
+        notifyd_sqlite_text(st, 4, "warning"), 1, 1, 0, &contract, NULL);
 
     json_object_object_add(o, "id", json_object_new_string(notifyd_sqlite_text(st, 0, "")));
     json_object_object_add(o, "name", json_object_new_string(notifyd_sqlite_text(st, 1, "")));
@@ -1222,9 +2140,90 @@ static void notifyd_route_row_json(struct json_object *arr, sqlite3_stmt *st)
     json_object_object_add(o, "category", json_object_new_string(notifyd_sqlite_text(st, 5, "")));
     json_object_object_add(o, "event", json_object_new_string(notifyd_sqlite_text(st, 6, "")));
     json_object_object_add(o, "source", json_object_new_string(notifyd_sqlite_text(st, 7, "")));
-    json_object_object_add(o, "options", notifyd_json_parse_or_object(options_s));
+    json_object_object_add(o, "options", contract.options ?
+                           json_object_get(contract.options) : json_object_get(stored_options));
     json_object_object_add(o, "updated_at", json_object_new_int64(sqlite3_column_int64(st, 9)));
+    {
+        sqlite3_stmt *trigger = notifyd_prepare(
+            "SELECT COUNT(*),COALESCE(MAX(triggered_at),0) FROM notify_route_triggers "
+            "WHERE route_id=?1");
+        sqlite3_stmt *outbox = notifyd_prepare(
+            "SELECT COUNT(*) FROM notify_outbox WHERE route_id=?1");
+        sqlite3_stmt *deliveries = notifyd_prepare(
+            "SELECT COUNT(*) FROM notify_deliveries d JOIN notify_outbox o "
+            "ON o.id=d.outbox_id WHERE o.route_id=?1");
+        int64_t trigger_count = 0, last_triggered_at = 0;
+        int64_t outbox_count = 0, delivery_count = 0;
+        const char *route_id = notifyd_sqlite_text(st, 0, "");
+
+        if (trigger) {
+            sqlite3_bind_text(trigger, 1, route_id, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(trigger) == SQLITE_ROW) {
+                trigger_count = sqlite3_column_int64(trigger, 0);
+                last_triggered_at = sqlite3_column_int64(trigger, 1);
+            }
+            sqlite3_finalize(trigger);
+        }
+        if (outbox) {
+            sqlite3_bind_text(outbox, 1, route_id, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(outbox) == SQLITE_ROW)
+                outbox_count = sqlite3_column_int64(outbox, 0);
+            sqlite3_finalize(outbox);
+        }
+        if (deliveries) {
+            sqlite3_bind_text(deliveries, 1, route_id, -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(deliveries) == SQLITE_ROW)
+                delivery_count = sqlite3_column_int64(deliveries, 0);
+            sqlite3_finalize(deliveries);
+        }
+        json_object_object_add(o, "trigger_count", json_object_new_int64(trigger_count));
+        json_object_object_add(o, "last_triggered_at", json_object_new_int64(last_triggered_at));
+        json_object_object_add(o, "outbox_count", json_object_new_int64(outbox_count));
+        json_object_object_add(o, "delivery_count", json_object_new_int64(delivery_count));
+    }
+    {
+        sqlite3_stmt *suppression = notifyd_prepare(
+            "SELECT COUNT(*),COALESCE(MAX(ts),0) FROM notify_route_suppressions "
+            "WHERE route_id=?1");
+        sqlite3_stmt *last = notifyd_prepare(
+            "SELECT reason,event FROM notify_route_suppressions "
+            "WHERE route_id=?1 ORDER BY ts DESC,id DESC LIMIT 1");
+        int count = 0;
+        int64_t last_at = 0;
+
+        json_object_object_add(o, "last_suppression_reason",
+                               json_object_new_string(""));
+        json_object_object_add(o, "last_suppressed_event",
+                               json_object_new_string(""));
+
+        if (suppression) {
+            sqlite3_bind_text(suppression, 1, notifyd_sqlite_text(st, 0, ""),
+                              -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(suppression) == SQLITE_ROW) {
+                count = sqlite3_column_int(suppression, 0);
+                last_at = sqlite3_column_int64(suppression, 1);
+            }
+            sqlite3_finalize(suppression);
+        }
+        if (last) {
+            sqlite3_bind_text(last, 1, notifyd_sqlite_text(st, 0, ""),
+                              -1, SQLITE_TRANSIENT);
+            if (sqlite3_step(last) == SQLITE_ROW) {
+                json_object_object_add(o, "last_suppression_reason",
+                                       json_object_new_string(
+                                           notifyd_sqlite_text(last, 0, "")));
+                json_object_object_add(o, "last_suppressed_event",
+                                       json_object_new_string(
+                                           notifyd_sqlite_text(last, 1, "")));
+            }
+            sqlite3_finalize(last);
+        }
+        json_object_object_add(o, "suppression_count", json_object_new_int(count));
+        json_object_object_add(o, "last_suppressed_at", json_object_new_int64(last_at));
+    }
     json_object_array_add(arr, o);
+    notifyd_route_contract_clear(&contract);
+    json_object_put(stored_options);
 }
 
 struct json_object *notifyd_routes_json(void)
@@ -1257,12 +2256,15 @@ struct json_object *notifyd_routes_update(struct json_object *body)
     const char *id = notifyd_json_str(body, "id", "");
     const char *name = notifyd_json_str(body, "name", "");
     const char *channel = notifyd_json_str(body, "channel_id", "local");
-    const char *min_sev = notifyd_severity(notifyd_json_str(body, "min_severity", "warning"));
+    const char *min_sev = notifyd_json_str(body, "min_severity", "warning");
     const char *category = notifyd_json_str(body, "category", "");
     const char *event = notifyd_json_str(body, "event", "");
     const char *source = notifyd_json_str(body, "source", "");
     int enabled = notifyd_json_bool(body, "enabled", 1);
     struct json_object *options = NULL;
+    struct json_object *value = NULL;
+    struct json_object *error_resp = NULL;
+    struct notifyd_route_contract contract;
     const char *options_s;
     sqlite3_stmt *st;
     struct json_object *resp = json_object_new_object();
@@ -1271,25 +2273,59 @@ struct json_object *notifyd_routes_update(struct json_object *body)
     int64_t expected_updated_at = notifyd_json_i64(body, "expected_updated_at", -1);
     int64_t current_updated_at = 0;
 
+    int top_channel_present = body && json_object_object_get_ex(body, "channel_id", &value);
+    int top_severity_present = body && json_object_object_get_ex(body, "min_severity", &value);
+
+    memset(&contract, 0, sizeof(contract));
+    if (!body || !json_object_is_type(body, json_type_object)) {
+        json_object_put(resp);
+        return notifyd_route_error("invalid_route", "", "body", -1);
+    }
     json_object_object_get_ex(body, "options", &options);
     if (!id[0] || !notifyd_id_ok(id) || !notifyd_id_ok(channel) ||
         !notifyd_text_ok(name, 127) || !notifyd_text_ok(category, 64) ||
         !notifyd_text_ok(event, 128) || !notifyd_text_ok(source, 128) ||
-        !notifyd_json_fits(options, NOTIFYD_MAX_JSON - 1)) {
+        !notifyd_severity_valid(min_sev) || !notifyd_json_fits(options, NOTIFYD_MAX_JSON - 1)) {
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("invalid_route"));
         return resp;
     }
+    if (json_object_object_get_ex(body, "schedule", &value) ||
+        json_object_object_get_ex(body, "actions", &value) ||
+        json_object_object_get_ex(body, "receivers", &value) ||
+        json_object_object_get_ex(body, "content", &value) ||
+        json_object_object_get_ex(body, "dedupe", &value)) {
+        json_object_put(resp);
+        return notifyd_route_error("route_feature_unsupported", "options_required",
+                                   "options", -1);
+    }
+    if (!notifyd_route_contract_build(options, channel, min_sev,
+            top_channel_present, top_severity_present, 1, &contract, &error_resp)) {
+        json_object_put(resp);
+        return error_resp ? error_resp :
+            notifyd_route_error("invalid_route", "", "options", -1);
+    }
+    channel = contract.channel_id;
+    min_sev = contract.min_severity;
+    if (notifyd_exec(g_notify_config_db, "BEGIN IMMEDIATE") != 0) {
+        notifyd_route_contract_clear(&contract);
+        json_object_put(resp);
+        return notifyd_route_error("transaction_busy", "", "options", -1);
+    }
     if (!notifyd_config_revision_matches(
             "SELECT updated_at FROM notifyd_routes WHERE id=?1", id,
             expected_updated_at, &current_updated_at)) {
+        (void)notifyd_exec(g_notify_config_db, "ROLLBACK");
+        notifyd_route_contract_clear(&contract);
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("revision_conflict"));
         json_object_object_add(resp, "current_updated_at",
                                json_object_new_int64(current_updated_at));
         return resp;
     }
-    options_s = options ? json_object_to_json_string(options) : "{}";
+    if (now <= current_updated_at)
+        now = current_updated_at + 1;
+    options_s = json_object_to_json_string(contract.options);
     st = notifyd_config_prepare(
         "INSERT INTO notifyd_routes(id,name,enabled,channel_id,min_severity,category,event,source,options_json,created_at,updated_at) "
         "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?10) "
@@ -1310,10 +2346,21 @@ struct json_object *notifyd_routes_update(struct json_object *body)
         ok = sqlite3_step(st) == SQLITE_DONE;
         sqlite3_finalize(st);
     }
+    if (ok)
+        ok = notifyd_exec(g_notify_config_db, "COMMIT") == 0;
+    if (!ok)
+        (void)notifyd_exec(g_notify_config_db, "ROLLBACK");
     json_object_object_add(resp, "ok", json_object_new_boolean(ok));
     json_object_object_add(resp, "id", json_object_new_string(id));
+    if (ok) {
+        json_object_object_add(resp, "channel_id", json_object_new_string(channel));
+        json_object_object_add(resp, "min_severity", json_object_new_string(min_sev));
+        json_object_object_add(resp, "options", json_object_get(contract.options));
+        json_object_object_add(resp, "updated_at", json_object_new_int64(now));
+    }
     if (!ok)
         json_object_object_add(resp, "error", json_object_new_string("save_failed"));
+    notifyd_route_contract_clear(&contract);
     return resp;
 }
 
@@ -1344,6 +2391,465 @@ struct json_object *notifyd_routes_delete(struct json_object *body)
     json_object_object_add(resp, "id", json_object_new_string(id));
     if (!ok) json_object_object_add(resp, "error", json_object_new_string("route_not_found"));
     return resp;
+}
+
+/* ── Per-user notification preference ───────────────────────────────────────
+ *
+ * Scope: whether one authenticated user receives the notifications a route has
+ * already produced. Nothing here disables a route, a channel, or the notifyd
+ * service, and one user's mute never changes what another recipient of the same
+ * event receives.
+ *
+ * The identity always arrives from webd, which derives it from the session
+ * ("web:<username>") and overwrites whatever the client sent. notifyd still
+ * validates it: ubus is reachable by root-local callers as well.
+ */
+
+static struct json_object *notifyd_preference_error(const char *error,
+                                                    const char *field,
+                                                    const char *reason)
+{
+    struct json_object *resp = json_object_new_object();
+
+    json_object_object_add(resp, "ok", json_object_new_boolean(0));
+    json_object_object_add(resp, "error",
+                           json_object_new_string(error ? error :
+                               "notification_preference_invalid"));
+    if (field && field[0])
+        json_object_object_add(resp, "field", json_object_new_string(field));
+    if (reason && reason[0])
+        json_object_object_add(resp, "reason", json_object_new_string(reason));
+    return resp;
+}
+
+/*
+ * web_users.username, same character set webd enforces when it creates the
+ * account. Deliberately stricter than notifyd_token_ok(), which also admits
+ * ':' and '/' and would let an identity string such as "web:lester" through as
+ * if it were a username.
+ */
+static int notifyd_pref_username_ok(const char *username)
+{
+    const unsigned char *p;
+
+    if (!username || !username[0] || strlen(username) > 64)
+        return 0;
+    for (p = (const unsigned char *)username; *p; p++) {
+        if (!(isalnum(*p) || *p == '_' || *p == '-' || *p == '.'))
+            return 0;
+    }
+    return 1;
+}
+
+static int notifyd_pref_user_exists(const char *username, int *db_ok)
+{
+    sqlite3_stmt *st;
+    int found = 0;
+
+    if (db_ok) *db_ok = 0;
+    st = notifyd_config_prepare(
+        "SELECT 1 FROM web_users WHERE username=?1 AND status='enabled'");
+    if (!st)
+        return 0;
+    if (db_ok) *db_ok = 1;
+    sqlite3_bind_text(st, 1, username, -1, SQLITE_TRANSIENT);
+    found = sqlite3_step(st) == SQLITE_ROW;
+    sqlite3_finalize(st);
+    return found;
+}
+
+/*
+ * A mute may only name channels that can address one user. An email channel
+ * resolves per-recipient, so muting it silences that user alone; a webhook or a
+ * noop channel has a single destination shared by everyone the route notifies,
+ * so "mute it for me" would in fact mute it for all of them. Refused rather
+ * than silently widened.
+ */
+static int notifyd_pref_channel_addressable(const char *channel_id,
+                                            const char **reason)
+{
+    struct notifyd_channel channel;
+
+    if (!notifyd_channel_get(channel_id, &channel)) {
+        if (reason) *reason = "channel_not_found";
+        return 0;
+    }
+    if (strcmp(channel.type, "email")) {
+        if (reason) *reason = "channel_type_not_user_addressable";
+        return 0;
+    }
+    return 1;
+}
+
+static struct json_object *notifyd_pref_channels_normalize(
+    struct json_object *input, struct json_object **error_out)
+{
+    struct json_object *out = json_object_new_array();
+    size_t i, n;
+
+    if (error_out) *error_out = NULL;
+    if (!input || json_object_is_type(input, json_type_null))
+        return out;
+    if (!json_object_is_type(input, json_type_array)) {
+        json_object_put(out);
+        if (error_out)
+            *error_out = notifyd_preference_error("notification_preference_invalid",
+                                                  "channel_ids", "not_an_array");
+        return NULL;
+    }
+    n = json_object_array_length(input);
+    if (n > NOTIFYD_MAX_PREF_CHANNELS) {
+        json_object_put(out);
+        if (error_out)
+            *error_out = notifyd_preference_error("notification_preference_invalid",
+                                                  "channel_ids", "too_many_channels");
+        return NULL;
+    }
+    for (i = 0; i < n; i++) {
+        struct json_object *item = json_object_array_get_idx(input, i);
+        const char *channel_id;
+        const char *reason = "channel_invalid";
+        size_t j;
+        int duplicate = 0;
+
+        if (!item || !json_object_is_type(item, json_type_string)) {
+            json_object_put(out);
+            if (error_out)
+                *error_out = notifyd_preference_error(
+                    "notification_preference_channel_invalid",
+                    "channel_ids", "not_a_string");
+            return NULL;
+        }
+        channel_id = json_object_get_string(item);
+        if (!notifyd_id_ok(channel_id)) {
+            json_object_put(out);
+            if (error_out)
+                *error_out = notifyd_preference_error(
+                    "notification_preference_channel_invalid",
+                    "channel_ids", "channel_id_invalid");
+            return NULL;
+        }
+        if (!notifyd_pref_channel_addressable(channel_id, &reason)) {
+            json_object_put(out);
+            if (error_out)
+                *error_out = notifyd_preference_error(
+                    "notification_preference_channel_invalid",
+                    "channel_ids", reason);
+            return NULL;
+        }
+        for (j = 0; j < json_object_array_length(out); j++) {
+            if (!strcmp(json_object_get_string(json_object_array_get_idx(out, j)),
+                        channel_id)) {
+                duplicate = 1;
+                break;
+            }
+        }
+        if (!duplicate)
+            json_object_array_add(out, json_object_new_string(channel_id));
+    }
+    return out;
+}
+
+struct notifyd_user_preference {
+    char username[72];
+    int muted;
+    int64_t muted_until;
+    char channel_ids_json[NOTIFYD_MAX_JSON];
+    int64_t created_at;
+    int64_t updated_at;
+    int stored;
+};
+
+static int notifyd_pref_load(const char *username,
+                             struct notifyd_user_preference *out, int *db_ok)
+{
+    sqlite3_stmt *st;
+    int rc;
+
+    if (!out)
+        return 0;
+    memset(out, 0, sizeof(*out));
+    snprintf(out->username, sizeof(out->username), "%s", username ? username : "");
+    snprintf(out->channel_ids_json, sizeof(out->channel_ids_json), "%s", "[]");
+    if (db_ok) *db_ok = 0;
+    st = notifyd_config_prepare(
+        "SELECT muted,muted_until,channel_ids_json,created_at,updated_at "
+        "FROM notifyd_user_preferences WHERE username=?1");
+    if (!st)
+        return 0;
+    if (db_ok) *db_ok = 1;
+    sqlite3_bind_text(st, 1, username ? username : "", -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        out->muted = sqlite3_column_int(st, 0) ? 1 : 0;
+        out->muted_until = sqlite3_column_int64(st, 1);
+        snprintf(out->channel_ids_json, sizeof(out->channel_ids_json), "%s",
+                 notifyd_sqlite_text(st, 2, "[]"));
+        out->created_at = sqlite3_column_int64(st, 3);
+        out->updated_at = sqlite3_column_int64(st, 4);
+        out->stored = 1;
+    } else if (rc != SQLITE_DONE) {
+        if (db_ok) *db_ok = 0;
+    }
+    sqlite3_finalize(st);
+    return out->stored;
+}
+
+/*
+ * Effective mute at time `now`. An expired window reads as not muted without
+ * any row being rewritten, so recovery does not depend on a timer firing, on
+ * the browser staying open, or on the client's clock.
+ */
+static int notifyd_pref_mute_effective(const struct notifyd_user_preference *pref,
+                                       int64_t now)
+{
+    if (!pref || !pref->muted)
+        return 0;
+    if (pref->muted_until > 0 && pref->muted_until <= now)
+        return 0;
+    return 1;
+}
+
+static struct json_object *notifyd_pref_json(const struct notifyd_user_preference *pref)
+{
+    struct json_object *resp = json_object_new_object();
+    struct json_object *channels;
+    int64_t now = notifyd_now_s();
+    int effective;
+
+    channels = pref ? json_tokener_parse(pref->channel_ids_json) : NULL;
+    if (!channels || !json_object_is_type(channels, json_type_array)) {
+        if (channels) json_object_put(channels);
+        channels = json_object_new_array();
+    }
+    effective = notifyd_pref_mute_effective(pref, now);
+
+    json_object_object_add(resp, "ok", json_object_new_boolean(1));
+    json_object_object_add(resp, "schema_version", json_object_new_int(1));
+    json_object_object_add(resp, "username",
+                           json_object_new_string(pref ? pref->username : ""));
+    json_object_object_add(resp, "muted", json_object_new_boolean(effective));
+    /*
+     * `muted_stored` keeps the saved intent visible next to the effective
+     * answer: a lapsed timed mute reports muted=false with muted_stored=true,
+     * so the UI can say "expired" instead of "you never set this".
+     */
+    json_object_object_add(resp, "muted_stored",
+                           json_object_new_boolean(pref && pref->muted));
+    json_object_object_add(resp, "muted_until",
+                           json_object_new_int64(pref ? pref->muted_until : 0));
+    json_object_object_add(resp, "mute_mode", json_object_new_string(
+        !effective ? "off" : (pref->muted_until > 0 ? "until" : "permanent")));
+    json_object_object_add(resp, "expired", json_object_new_boolean(
+        pref && pref->muted && pref->muted_until > 0 && !effective));
+    json_object_object_add(resp, "channel_ids", channels);
+    json_object_object_add(resp, "scope", json_object_new_string(
+        json_object_array_length(channels) ? "channels" : "all_channels"));
+    json_object_object_add(resp, "stored",
+                           json_object_new_boolean(pref && pref->stored));
+    json_object_object_add(resp, "created_at",
+                           json_object_new_int64(pref ? pref->created_at : 0));
+    json_object_object_add(resp, "updated_at",
+                           json_object_new_int64(pref ? pref->updated_at : 0));
+    json_object_object_add(resp, "max_duration_s",
+                           json_object_new_int(NOTIFYD_USER_MUTE_MAX_DURATION_S));
+    json_object_object_add(resp, "now", json_object_new_int64(now));
+    json_object_object_add(resp, "source",
+                           json_object_new_string("config.db:notifyd_user_preferences"));
+    return resp;
+}
+
+struct json_object *notifyd_preferences_get(struct json_object *body)
+{
+    struct notifyd_user_preference pref;
+    const char *username = notifyd_json_str(body, "username", "");
+    struct json_object *resp;
+    int db_ok = 0;
+
+    if (!notifyd_pref_username_ok(username))
+        return notifyd_preference_error("notification_preference_forbidden",
+                                        "username", "session_identity_required");
+    notifyd_pref_load(username, &pref, &db_ok);
+    if (!db_ok)
+        return notifyd_preference_error("notification_preference_invalid",
+                                        "", "preferences_query_failed");
+    /*
+     * No row is a definite answer, not a missing one: the user has never set a
+     * preference, so they are not muted. Returned as ok:true with stored=false
+     * rather than a 404, which a client would otherwise have to interpret.
+     */
+    resp = notifyd_pref_json(&pref);
+    return resp;
+}
+
+struct json_object *notifyd_preferences_update(struct json_object *body)
+{
+    struct notifyd_user_preference pref;
+    struct json_object *resp;
+    struct json_object *channels_input = NULL;
+    struct json_object *channels = NULL;
+    struct json_object *channel_error = NULL;
+    const char *username = notifyd_json_str(body, "username", "");
+    const char *channels_s;
+    sqlite3_stmt *st;
+    int64_t expected_updated_at = notifyd_json_i64(body, "expected_updated_at", -1);
+    int64_t current_updated_at = 0;
+    int64_t now = notifyd_now_s();
+    int64_t muted_until;
+    int muted;
+    int db_ok = 0;
+    int user_db_ok = 0;
+    int ok = 0;
+
+    if (!body || !json_object_is_type(body, json_type_object))
+        return notifyd_preference_error("notification_preference_invalid", "body",
+                                        "object_required");
+    if (!notifyd_pref_username_ok(username))
+        return notifyd_preference_error("notification_preference_forbidden",
+                                        "username", "session_identity_required");
+    if (!notifyd_pref_user_exists(username, &user_db_ok)) {
+        return notifyd_preference_error("notification_preference_forbidden",
+                                        "username",
+                                        user_db_ok ? "user_not_eligible" :
+                                                     "user_directory_unavailable");
+    }
+    {
+        struct json_object *muted_o = NULL;
+
+        if (!json_object_object_get_ex(body, "muted", &muted_o) || !muted_o)
+            return notifyd_preference_error("notification_preference_invalid",
+                                            "muted", "field_required");
+        if (!json_object_is_type(muted_o, json_type_boolean))
+            return notifyd_preference_error("notification_preference_invalid",
+                                            "muted", "boolean_required");
+        muted = json_object_get_boolean(muted_o) ? 1 : 0;
+    }
+    muted_until = notifyd_json_i64(body, "muted_until", 0);
+    if (muted_until < 0)
+        return notifyd_preference_error("notification_preference_invalid",
+                                        "muted_until", "negative");
+    if (!muted) {
+        /*
+         * Unmuting clears the window instead of preserving it. Keeping a stale
+         * expiry would make a later "mute me" silently inherit a deadline the
+         * user did not choose this time.
+         */
+        muted_until = 0;
+    } else if (muted_until > 0) {
+        if (muted_until <= now)
+            return notifyd_preference_error("notification_preference_invalid",
+                                            "muted_until", "already_elapsed");
+        if (muted_until - now > NOTIFYD_USER_MUTE_MAX_DURATION_S)
+            return notifyd_preference_error("notification_preference_invalid",
+                                            "muted_until", "exceeds_max_duration");
+    }
+    if (json_object_object_get_ex(body, "channel_ids", &channels_input)) {
+        channels = notifyd_pref_channels_normalize(channels_input, &channel_error);
+        if (!channels)
+            return channel_error ? channel_error :
+                notifyd_preference_error("notification_preference_channel_invalid",
+                                         "channel_ids", "channel_invalid");
+    } else {
+        /* Omitted means "keep what is stored", so an unmute does not silently
+         * widen a channel-scoped mute back to every channel. */
+        struct notifyd_user_preference existing;
+
+        notifyd_pref_load(username, &existing, &db_ok);
+        channels = json_tokener_parse(existing.channel_ids_json);
+        if (!channels || !json_object_is_type(channels, json_type_array)) {
+            if (channels) json_object_put(channels);
+            channels = json_object_new_array();
+        }
+    }
+    channels_s = json_object_to_json_string(channels);
+    if (!channels_s || strlen(channels_s) >= NOTIFYD_MAX_JSON) {
+        json_object_put(channels);
+        return notifyd_preference_error("notification_preference_invalid",
+                                        "channel_ids", "too_large");
+    }
+
+    if (notifyd_exec(g_notify_config_db, "BEGIN IMMEDIATE") != 0) {
+        json_object_put(channels);
+        return notifyd_preference_error("notification_preference_invalid", "",
+                                        "transaction_busy");
+    }
+    if (!notifyd_config_revision_matches(
+            "SELECT updated_at FROM notifyd_user_preferences WHERE username=?1",
+            username, expected_updated_at, &current_updated_at)) {
+        (void)notifyd_exec(g_notify_config_db, "ROLLBACK");
+        json_object_put(channels);
+        resp = notifyd_preference_error("notification_preference_revision_conflict",
+                                        "expected_updated_at", "stale_revision");
+        json_object_object_add(resp, "current_updated_at",
+                               json_object_new_int64(current_updated_at));
+        return resp;
+    }
+    if (now <= current_updated_at)
+        now = current_updated_at + 1;
+    st = notifyd_config_prepare(
+        "INSERT INTO notifyd_user_preferences(username,muted,muted_until,channel_ids_json,created_at,updated_at) "
+        "VALUES(?1,?2,?3,?4,?5,?5) "
+        "ON CONFLICT(username) DO UPDATE SET muted=excluded.muted,"
+        "muted_until=excluded.muted_until,channel_ids_json=excluded.channel_ids_json,"
+        "updated_at=excluded.updated_at");
+    if (st) {
+        sqlite3_bind_text(st, 1, username, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int(st, 2, muted);
+        sqlite3_bind_int64(st, 3, muted_until);
+        sqlite3_bind_text(st, 4, channels_s, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 5, now);
+        ok = sqlite3_step(st) == SQLITE_DONE;
+        sqlite3_finalize(st);
+    }
+    if (ok)
+        ok = notifyd_exec(g_notify_config_db, "COMMIT") == 0;
+    if (!ok)
+        (void)notifyd_exec(g_notify_config_db, "ROLLBACK");
+    json_object_put(channels);
+    if (!ok)
+        return notifyd_preference_error("notification_preference_invalid", "",
+                                        "save_failed");
+    notifyd_pref_load(username, &pref, &db_ok);
+    if (!db_ok)
+        return notifyd_preference_error("notification_preference_invalid", "",
+                                        "preferences_query_failed");
+    resp = notifyd_pref_json(&pref);
+    json_object_object_add(resp, "saved", json_object_new_boolean(1));
+    return resp;
+}
+
+int notifyd_user_mute_active(const char *username, const char *channel_id)
+{
+    struct notifyd_user_preference pref;
+    struct json_object *channels;
+    size_t i, n;
+    int db_ok = 0;
+    int scoped_hit = 0;
+
+    if (!notifyd_pref_username_ok(username))
+        return 0;
+    if (!notifyd_pref_load(username, &pref, &db_ok) || !db_ok)
+        return 0;
+    if (!notifyd_pref_mute_effective(&pref, notifyd_now_s()))
+        return 0;
+    channels = json_tokener_parse(pref.channel_ids_json);
+    if (!channels || !json_object_is_type(channels, json_type_array)) {
+        if (channels) json_object_put(channels);
+        return 1;               /* no channel scope: mute applies everywhere */
+    }
+    n = json_object_array_length(channels);
+    if (n == 0) {
+        json_object_put(channels);
+        return 1;
+    }
+    for (i = 0; i < n && !scoped_hit; i++) {
+        const char *id = json_object_get_string(json_object_array_get_idx(channels, i));
+
+        if (id && channel_id && !strcmp(id, channel_id))
+            scoped_hit = 1;
+    }
+    json_object_put(channels);
+    return scoped_hit;
 }
 
 int notifyd_channel_get(const char *id, struct notifyd_channel *out)
@@ -1386,7 +2892,7 @@ int notifyd_channel_get(const char *id, struct notifyd_channel *out)
  */
 static int notifyd_event_is_recovery(const char *event_id)
 {
-    const struct notifyd_event_definition *def;
+    const struct dw_event_definition *def;
 
     if (!event_id || !event_id[0])
         return 0;
@@ -1396,24 +2902,423 @@ static int notifyd_event_is_recovery(const char *event_id)
 
 static int notifyd_route_matches(sqlite3_stmt *st, struct json_object *body)
 {
-    const char *min_sev = (const char *)sqlite3_column_text(st, 4);
     const char *category = (const char *)sqlite3_column_text(st, 5);
     const char *event = (const char *)sqlite3_column_text(st, 6);
     const char *source = (const char *)sqlite3_column_text(st, 7);
-    const char *ev_sev = notifyd_severity(notifyd_json_str(body, "severity", "info"));
     const char *ev_category = notifyd_json_str(body, "category", "");
     const char *ev_event = notifyd_json_str(body, "event", "");
     const char *ev_source = notifyd_json_str(body, "source", "");
 
-    if (notifyd_severity_rank(ev_sev) < notifyd_severity_rank(min_sev) &&
-        !notifyd_event_is_recovery(ev_event))
-        return 0;
     if (category && category[0] && strcmp(category, ev_category))
         return 0;
     if (event && event[0] && strcmp(event, ev_event))
         return 0;
     if (source && source[0] && strcmp(source, ev_source))
         return 0;
+    return 1;
+}
+
+static int notifyd_route_schedule_allows(struct json_object *options, int64_t now,
+                                         const char **reason)
+{
+    struct json_object *schedule = NULL, *windows = NULL;
+    const char *mode;
+    const char *timezone;
+    const char *previous_tz = getenv("TZ");
+    char *saved_tz = previous_tz ? strdup(previous_tz) : NULL;
+    struct tm local_tm;
+    time_t wall_time = (time_t)now;
+    int iso_day;
+    int minute;
+    size_t i, j;
+    int allowed = 0;
+
+    if (reason)
+        *reason = "schedule_outside_window";
+    if (!options || !json_object_object_get_ex(options, "schedule", &schedule) ||
+        !schedule || !json_object_is_type(schedule, json_type_object))
+        return 1;
+    mode = notifyd_json_str(schedule, "mode", "always");
+    if (!strcmp(mode, "always"))
+        return 1;
+    timezone = notifyd_json_str(schedule, "timezone", "Asia/Shanghai");
+    if (setenv("TZ", timezone, 1) != 0) {
+        free(saved_tz);
+        if (reason)
+            *reason = "schedule_timezone_unavailable";
+        return 0;
+    }
+    tzset();
+    if (!localtime_r(&wall_time, &local_tm)) {
+        if (saved_tz)
+            setenv("TZ", saved_tz, 1);
+        else
+            unsetenv("TZ");
+        tzset();
+        free(saved_tz);
+        if (reason)
+            *reason = "schedule_time_unavailable";
+        return 0;
+    }
+    iso_day = local_tm.tm_wday == 0 ? 7 : local_tm.tm_wday;
+    minute = local_tm.tm_hour * 60 + local_tm.tm_min;
+    if (json_object_object_get_ex(schedule, "windows", &windows) && windows &&
+        json_object_is_type(windows, json_type_array)) {
+        for (i = 0; i < json_object_array_length(windows) && !allowed; i++) {
+            struct json_object *window = json_object_array_get_idx(windows, i);
+            struct json_object *days = NULL;
+            int start = notifyd_route_hhmm(notifyd_json_str(window, "start", ""));
+            int end = notifyd_route_hhmm(notifyd_json_str(window, "end", ""));
+
+            if (start < 0 || end <= start || minute < start || minute >= end ||
+                !json_object_object_get_ex(window, "days", &days) || !days ||
+                !json_object_is_type(days, json_type_array))
+                continue;
+            for (j = 0; j < json_object_array_length(days); j++)
+                if (json_object_get_int(json_object_array_get_idx(days, j)) == iso_day) {
+                    allowed = 1;
+                    break;
+                }
+        }
+    }
+    if (saved_tz)
+        setenv("TZ", saved_tz, 1);
+    else
+        unsetenv("TZ");
+    tzset();
+    free(saved_tz);
+    return allowed;
+}
+
+static int notifyd_global_mute_active(const struct notifyd_settings *settings,
+                                      int64_t now, const char **reason)
+{
+    struct json_object *mute;
+    struct json_object *schedule;
+    struct json_object *options;
+    int active;
+    const char *evaluation_reason = "schedule_outside_window";
+
+    if (reason)
+        *reason = "global_mute_schedule_active";
+    if (!settings || !settings->mute_schedule_json[0])
+        return 0;
+    mute = notifyd_json_parse_or_object(settings->mute_schedule_json);
+    if (!notifyd_json_bool(mute, "enabled", 0)) {
+        json_object_put(mute);
+        return 0;
+    }
+    schedule = notifyd_route_options_clone(mute);
+    json_object_object_del(schedule, "enabled");
+    json_object_object_add(schedule, "mode", json_object_new_string("custom"));
+    options = json_object_new_object();
+    json_object_object_add(options, "schedule", schedule);
+    active = notifyd_route_schedule_allows(options, now, &evaluation_reason);
+    json_object_put(options);
+    json_object_put(mute);
+    if (active)
+        return 1;
+    if (strcmp(evaluation_reason, "schedule_outside_window")) {
+        if (reason)
+            *reason = "global_mute_schedule_unavailable";
+        return 1;
+    }
+    return 0;
+}
+
+static int notifyd_route_eligible_actions(struct json_object *options,
+                                          struct json_object *body)
+{
+    struct json_object *actions = NULL;
+    size_t i;
+    int eligible = 0;
+    const char *severity = notifyd_json_str(body, "severity", "info");
+    const char *event = notifyd_json_str(body, "event", "");
+
+    if (!options || !json_object_object_get_ex(options, "actions", &actions) ||
+        !actions || !json_object_is_type(actions, json_type_array))
+        return 0;
+    for (i = 0; i < json_object_array_length(actions); i++) {
+        struct json_object *action = json_object_array_get_idx(actions, i);
+        const char *minimum = notifyd_json_str(action, "min_severity", "warning");
+
+        if (notifyd_severity_rank(severity) >= notifyd_severity_rank(minimum) ||
+            notifyd_event_is_recovery(event))
+            eligible++;
+    }
+    return eligible;
+}
+
+static void notifyd_route_trigger_record(const char *route_id,
+                                         struct json_object *body,
+                                         const char *result,
+                                         const char *reason,
+                                         const char *dedupe_result,
+                                         const char *mute_result)
+{
+    static unsigned int prune_counter;
+    sqlite3_stmt *st = notifyd_prepare(
+        "INSERT INTO notify_route_triggers(route_id,event,severity,source,triggered_at,"
+        "result,reason,dedupe_result,mute_result) VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9)");
+
+    if (!st)
+        return;
+    sqlite3_bind_text(st, 1, route_id ? route_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, notifyd_json_str(body, "event", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, notifyd_json_str(body, "severity", "info"), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, notifyd_json_str(body, "source", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 5, notifyd_now_s());
+    sqlite3_bind_text(st, 6, result ? result : "unknown", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, reason ? reason : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, dedupe_result ? dedupe_result : "not_applicable", -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 9, mute_result ? mute_result : "not_muted", -1,
+                      SQLITE_TRANSIENT);
+    (void)sqlite3_step(st);
+    sqlite3_finalize(st);
+    if ((++prune_counter & 255U) == 0U)
+        (void)notifyd_exec(g_notify_db,
+            "DELETE FROM notify_route_triggers WHERE id IN ("
+            "SELECT id FROM notify_route_triggers ORDER BY id DESC LIMIT -1 OFFSET 20000)");
+}
+
+static void notifyd_route_suppression_record(const char *route_id,
+                                             struct json_object *body,
+                                             const char *reason)
+{
+    sqlite3_stmt *st;
+    const char *payload = body ? json_object_to_json_string(body) : "{}";
+
+    st = notifyd_prepare(
+        "INSERT INTO notify_route_suppressions(route_id,ts,reason,event,source,target,payload_json) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7)");
+    if (!st)
+        return;
+    sqlite3_bind_text(st, 1, route_id ? route_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, notifyd_now_s());
+    sqlite3_bind_text(st, 3, reason ? reason : "schedule_outside_window", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, notifyd_json_str(body, "event", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, notifyd_json_str(body, "source", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, notifyd_json_str(body, "target", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, payload ? payload : "{}", -1, SQLITE_TRANSIENT);
+    (void)sqlite3_step(st);
+    sqlite3_finalize(st);
+    (void)notifyd_exec(g_notify_db,
+        "DELETE FROM notify_route_suppressions WHERE id IN ("
+        "SELECT id FROM notify_route_suppressions ORDER BY ts DESC,id DESC LIMIT -1 OFFSET 5000)");
+}
+
+static const char *notifyd_route_template_value(struct json_object *body,
+                                                const char *key,
+                                                char *buffer, size_t buffer_len)
+{
+    struct json_object *value = NULL;
+
+    if (!strcmp(key, "ts")) {
+        snprintf(buffer, buffer_len, "%lld",
+                 (long long)notifyd_json_i64(body, "ts", notifyd_now_s()));
+        return buffer;
+    }
+    if (body && json_object_object_get_ex(body, key, &value) && value) {
+        if (json_object_is_type(value, json_type_string))
+            return json_object_get_string(value);
+        snprintf(buffer, buffer_len, "%s", json_object_to_json_string(value));
+        return buffer;
+    }
+    if (!strcmp(key, "detail"))
+        return notifyd_json_str(body, "message", "");
+    return "";
+}
+
+static char *notifyd_route_template_render(const char *template_text,
+                                           struct json_object *body,
+                                           size_t max_len)
+{
+    char *out;
+    size_t used = 0;
+    const char *p;
+
+    out = calloc(1, max_len + 1);
+    if (!out)
+        return NULL;
+    for (p = template_text ? template_text : ""; *p;) {
+        if (*p == '{') {
+            const char *end = strchr(p + 1, '}');
+            char key[32];
+            char value_buffer[4096];
+            const char *value;
+            size_t key_len;
+            size_t value_len;
+
+            if (!end || (key_len = (size_t)(end - p - 1)) == 0 || key_len >= sizeof(key))
+                goto fail;
+            memcpy(key, p + 1, key_len);
+            key[key_len] = '\0';
+            value = notifyd_route_template_value(body, key, value_buffer, sizeof(value_buffer));
+            value_len = strlen(value ? value : "");
+            if (used + value_len > max_len)
+                goto fail;
+            memcpy(out + used, value ? value : "", value_len);
+            used += value_len;
+            p = end + 1;
+        } else {
+            if (used + 1 > max_len)
+                goto fail;
+            out[used++] = *p++;
+        }
+    }
+    out[used] = '\0';
+    return out;
+fail:
+    free(out);
+    return NULL;
+}
+
+static struct json_object *notifyd_route_payload_render(struct json_object *body,
+                                                        struct json_object *options,
+                                                        int action_index,
+                                                        char *error, size_t error_len)
+{
+    struct json_object *payload = notifyd_route_options_clone(body);
+    struct json_object *content = NULL;
+    struct json_object *metadata = json_object_new_object();
+    const char *mode = "default";
+
+    if (json_object_object_get_ex(options, "content", &content) && content &&
+        json_object_is_type(content, json_type_object))
+        mode = notifyd_json_str(content, "mode", "default");
+    if (!strcmp(mode, "default")) {
+        const char *locale = notifyd_json_str(content, "locale",
+                             notifyd_json_str(body, "locale", "zh-CN"));
+
+        if (!dw_event_payload_present(payload, locale)) {
+            json_object_put(metadata);
+            json_object_put(payload);
+            snprintf(error, error_len, "%s", "content_render_failed");
+            return NULL;
+        }
+    } else if (!strcmp(mode, "custom")) {
+        char *title = notifyd_route_template_render(
+            notifyd_json_str(content, "subject", ""), body, NOTIFYD_MAX_TEMPLATE_SUBJECT);
+        char *message = notifyd_route_template_render(
+            notifyd_json_str(content, "body", ""), body, NOTIFYD_MAX_TEMPLATE_BODY);
+        struct json_object *rendered = json_object_new_object();
+
+        if (!title || !message) {
+            free(title);
+            free(message);
+            json_object_put(rendered);
+            json_object_put(metadata);
+            json_object_put(payload);
+            snprintf(error, error_len, "%s", "content_render_failed");
+            return NULL;
+        }
+        json_object_object_add(payload, "title", json_object_new_string(title));
+        json_object_object_add(payload, "message", json_object_new_string(message));
+        json_object_object_add(rendered, "title", json_object_new_string(title));
+        json_object_object_add(rendered, "body", json_object_new_string(message));
+        json_object_object_add(payload, "rendered_content", rendered);
+        free(title);
+        free(message);
+    }
+    json_object_object_add(metadata, "schema_version",
+                           json_object_new_int(NOTIFYD_ROUTE_SCHEMA_VERSION));
+    json_object_object_add(metadata, "action_index", json_object_new_int(action_index));
+    json_object_object_add(metadata, "content_mode", json_object_new_string(mode));
+    json_object_object_add(payload, "notify_route", metadata);
+    if (!notifyd_json_fits(payload, NOTIFYD_MAX_JSON - 1)) {
+        json_object_put(payload);
+        snprintf(error, error_len, "%s", "content_render_failed");
+        return NULL;
+    }
+    if (error && error_len)
+        error[0] = '\0';
+    return payload;
+}
+
+static uint64_t notifyd_route_dedupe_hash_part(uint64_t hash,
+                                               const char *field,
+                                               const char *value)
+{
+    const unsigned char *p;
+
+    for (p = (const unsigned char *)(field ? field : ""); *p; p++) {
+        hash ^= *p;
+        hash *= UINT64_C(1099511628211);
+    }
+    hash ^= UINT64_C(0xff);
+    hash *= UINT64_C(1099511628211);
+    for (p = (const unsigned char *)(value ? value : "unknown"); *p; p++) {
+        hash ^= *p;
+        hash *= UINT64_C(1099511628211);
+    }
+    hash ^= 0;
+    hash *= UINT64_C(1099511628211);
+    return hash;
+}
+
+static int notifyd_route_dedupe_contract(struct json_object *options,
+                                         struct json_object *body,
+                                         char *key, size_t key_len,
+                                         char *group, size_t group_len,
+                                         int *window_seconds)
+{
+    struct json_object *dedupe = NULL, *fields = NULL;
+    const struct dw_event_definition *definition;
+    const char *event;
+    const char *pair_event;
+    size_t i;
+    uint64_t key_hash = UINT64_C(14695981039346656037);
+    uint64_t group_hash = UINT64_C(14695981039346656037);
+
+    if (key && key_len)
+        key[0] = '\0';
+    if (group && group_len)
+        group[0] = '\0';
+    if (window_seconds)
+        *window_seconds = 0;
+    if (!options || !json_object_object_get_ex(options, "dedupe", &dedupe) || !dedupe ||
+        !json_object_is_type(dedupe, json_type_object) ||
+        !notifyd_json_bool(dedupe, "enabled", 0))
+        return 0;
+    if (window_seconds)
+        *window_seconds = notifyd_json_int(dedupe, "window_seconds", 0);
+    if (!json_object_object_get_ex(dedupe, "key_fields", &fields) || !fields ||
+        !json_object_is_type(fields, json_type_array))
+        return 0;
+    event = notifyd_json_str(body, "event", "unknown");
+    if (!event[0])
+        event = "unknown";
+    definition = notifyd_event_definition_find(event);
+    /*
+     * Use the recovery event as the family key. This keeps a simple pair
+     * together and also covers several alarms cleared by one recovery event,
+     * such as WAN_QUALITY_DEGRADED/WAN_QUALITY_CRITICAL ->
+     * WAN_QUALITY_RECOVERED.
+     */
+    if (definition && definition->recovers_event[0])
+        pair_event = event;
+    else if (definition && definition->recovery_event[0])
+        pair_event = definition->recovery_event;
+    else
+        pair_event = event;
+    group_hash = notifyd_route_dedupe_hash_part(group_hash, "event_pair", pair_event);
+    for (i = 0; i < json_object_array_length(fields); i++) {
+        const char *field = json_object_get_string(json_object_array_get_idx(fields, i));
+        const char *value = notifyd_json_str(body, field, "unknown");
+
+        if (!value || !value[0])
+            value = "unknown";
+        key_hash = notifyd_route_dedupe_hash_part(key_hash, field, value);
+        if (strcmp(field, "event") && strcmp(field, "severity"))
+            group_hash = notifyd_route_dedupe_hash_part(group_hash, field, value);
+    }
+    if (snprintf(key, key_len, "v1-%016" PRIx64, key_hash) >= (int)key_len ||
+        snprintf(group, group_len, "g1-%016" PRIx64, group_hash) >= (int)group_len) {
+        key[0] = '\0';
+        group[0] = '\0';
+        return 0;
+    }
     return 1;
 }
 
@@ -1428,88 +3333,135 @@ static const char *notifyd_dedupe_key(struct json_object *body)
 }
 
 static int notifyd_coalesce_outbox(const char *channel_id, const char *route_id,
-                                   struct json_object *body, int max_attempts,
+                                   int action_index, struct json_object *body,
+                                   const char *delivery_options_json,
+                                   const char *producer_dedupe_key,
+                                   const char *route_dedupe_key,
+                                   const char *dedupe_group,
+                                   int dedupe_window_seconds, int max_attempts,
                                    char *out_id, size_t out_id_len)
 {
     sqlite3_stmt *st;
-    const char *dedupe_key = notifyd_dedupe_key(body);
     const char *payload = body ? json_object_to_json_string(body) : "{}";
     int64_t now = notifyd_now_s();
+    int64_t route_floor = now - (dedupe_window_seconds > 0 ? dedupe_window_seconds : 0);
+    char candidate_id[NOTIFYD_MAX_ID] = "";
+    int match_mode = 0;
     int rc;
 
-    if (!dedupe_key[0])
+    if ((!producer_dedupe_key || !producer_dedupe_key[0]) &&
+        (!route_dedupe_key || !route_dedupe_key[0]))
         return 0;
     st = notifyd_prepare(
-        "UPDATE notify_outbox SET "
-        " updated_at=?1,next_attempt_at=?1,event_id=?2,severity=?3,category=?4,event=?5,"
-        " source=?6,title=?7,payload_json=?8,state='pending',attempts=0,"
-        " max_attempts=?9,last_seen=?1,count=count+1,last_error='',last_http_status=0 "
-        "WHERE channel_id=?10 AND route_id=?11 AND state IN ('pending','retry','failed','delivered') "
-        "AND dedupe_key=?12");
+        "SELECT id,CASE WHEN (?5<>'' AND route_dedupe_key=?5 AND dedupe_group=?7 AND last_seen>=?6) "
+        "THEN 2 ELSE 1 END FROM notify_outbox "
+        "WHERE channel_id=?1 AND route_id=?2 AND action_index=?3 "
+        "AND state IN ('pending','retry','failed','delivered') AND ("
+        " (?4<>'' AND producer_dedupe_key=?4) OR "
+        " (?5<>'' AND route_dedupe_key=?5 AND dedupe_group=?7 AND last_seen>=?6)) "
+        "ORDER BY CASE WHEN (?5<>'' AND route_dedupe_key=?5 AND dedupe_group=?7 AND last_seen>=?6) "
+        "THEN 0 ELSE 1 END,updated_at DESC,id DESC LIMIT 1");
+    if (!st)
+        return 0;
+    sqlite3_bind_text(st, 1, channel_id ? channel_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, route_id ? route_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, action_index);
+    sqlite3_bind_text(st, 4, producer_dedupe_key ? producer_dedupe_key : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, route_dedupe_key ? route_dedupe_key : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 6, route_floor);
+    sqlite3_bind_text(st, 7, dedupe_group ? dedupe_group : "", -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(st);
+    if (rc == SQLITE_ROW) {
+        snprintf(candidate_id, sizeof(candidate_id), "%s", notifyd_sqlite_text(st, 0, ""));
+        match_mode = sqlite3_column_int(st, 1);
+    }
+    sqlite3_finalize(st);
+    if (rc != SQLITE_ROW || !candidate_id[0] || (match_mode != 1 && match_mode != 2))
+        return 0;
+    st = notifyd_prepare(
+        "UPDATE notify_outbox SET updated_at=?1,"
+        "next_attempt_at=CASE WHEN ?2=1 THEN ?1 ELSE next_attempt_at END,"
+        "event_id=?3,severity=?4,category=?5,event=?6,source=?7,title=?8,"
+        "payload_json=?9,state=CASE WHEN ?2=1 THEN 'pending' ELSE state END,"
+        "attempts=CASE WHEN ?2=1 THEN 0 ELSE attempts END,"
+        "max_attempts=CASE WHEN ?2=1 THEN ?10 ELSE max_attempts END,"
+        "last_seen=?1,count=count+1,"
+        "last_error=CASE WHEN ?2=1 THEN '' ELSE last_error END,"
+        "last_warning=CASE WHEN ?2=1 THEN '' ELSE last_warning END,"
+        "last_http_status=CASE WHEN ?2=1 THEN 0 ELSE last_http_status END,"
+        "delivery_options_json=?11,dedupe_group=?12,"
+        "dedupe_key=CASE WHEN ?2=1 THEN ?13 ELSE dedupe_key END,"
+        "producer_dedupe_key=CASE WHEN ?2=1 THEN ?14 ELSE producer_dedupe_key END,"
+        "route_dedupe_key=?15 WHERE id=?16");
     if (!st)
         return 0;
     sqlite3_bind_int64(st, 1, now);
-    sqlite3_bind_text(st, 2, notifyd_json_str(body, "id", notifyd_json_str(body, "event_id", "")), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 3, notifyd_severity(notifyd_json_str(body, "severity", "info")), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 4, notifyd_json_str(body, "category", ""), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 5, notifyd_json_str(body, "event", ""), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 6, notifyd_json_str(body, "source", ""), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 7, notifyd_json_str(body, "title", ""), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 8, payload ? payload : "{}", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_int(st, 9, max_attempts);
-    sqlite3_bind_text(st, 10, channel_id ? channel_id : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 11, route_id ? route_id : "", -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 12, dedupe_key, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 2, match_mode);
+    sqlite3_bind_text(st, 3, notifyd_json_str(body, "id", notifyd_json_str(body, "event_id", "")), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, notifyd_severity(notifyd_json_str(body, "severity", "info")), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, notifyd_json_str(body, "category", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, notifyd_json_str(body, "event", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 7, notifyd_json_str(body, "source", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, notifyd_json_str(body, "title", ""), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 9, payload ? payload : "{}", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 10, max_attempts);
+    sqlite3_bind_text(st, 11, delivery_options_json ? delivery_options_json : "{}", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 12, dedupe_group ? dedupe_group : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 13, producer_dedupe_key ? producer_dedupe_key : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 14, producer_dedupe_key ? producer_dedupe_key : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 15, route_dedupe_key ? route_dedupe_key : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 16, candidate_id, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(st);
     sqlite3_finalize(st);
-    if (rc != SQLITE_DONE || sqlite3_changes(g_notify_db) <= 0)
+    if (rc != SQLITE_DONE || sqlite3_changes(g_notify_db) != 1)
         return 0;
-    if (out_id && out_id_len > 0) {
-        st = notifyd_prepare(
-            "SELECT id FROM notify_outbox "
-            "WHERE channel_id=?1 AND route_id=?2 AND state IN ('pending','retry','failed','delivered') "
-            "AND dedupe_key=?3 "
-            "ORDER BY updated_at DESC LIMIT 1");
-        if (st) {
-            sqlite3_bind_text(st, 1, channel_id ? channel_id : "", -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 2, route_id ? route_id : "", -1, SQLITE_TRANSIENT);
-            sqlite3_bind_text(st, 3, dedupe_key, -1, SQLITE_TRANSIENT);
-            if (sqlite3_step(st) == SQLITE_ROW)
-                snprintf(out_id, out_id_len, "%s", notifyd_sqlite_text(st, 0, ""));
-            sqlite3_finalize(st);
-        }
-    }
-    return 1;
+    if (out_id && out_id_len > 0)
+        snprintf(out_id, out_id_len, "%s", candidate_id);
+    return match_mode;
 }
 
-static int notifyd_insert_outbox(const char *channel_id, const char *route_id,
-                                 struct json_object *body, int max_attempts,
-                                 char *out_id, size_t out_id_len)
+static int notifyd_insert_outbox_ex(const char *channel_id, const char *route_id,
+                                    int action_index, struct json_object *body,
+                                    struct json_object *delivery_options,
+                                    const char *producer_dedupe_key,
+                                    const char *route_dedupe_key,
+                                    const char *dedupe_group,
+                                    int dedupe_window_seconds, int max_attempts,
+                                    char *out_id, size_t out_id_len)
 {
     sqlite3_stmt *st;
     char id[NOTIFYD_MAX_ID];
     const char *payload = body ? json_object_to_json_string(body) : "{}";
+    const char *delivery_options_json = delivery_options ?
+        json_object_to_json_string(delivery_options) : "{}";
     int64_t now = notifyd_now_s();
     int ok = 0;
     const char *severity = notifyd_severity(notifyd_json_str(body, "severity", "info"));
+    /* The persistent outbox must leave the critical recovery reserve intact. */
     enum jmx_storage_write_priority priority = !strcmp(severity, "critical") ?
-        JMX_STORAGE_WRITE_EMERGENCY : (!strcmp(severity, "warning") || !strcmp(severity, "error") ?
+        JMX_STORAGE_WRITE_IMPORTANT : (!strcmp(severity, "warning") || !strcmp(severity, "error") ?
         JMX_STORAGE_WRITE_IMPORTANT : JMX_STORAGE_WRITE_BULK);
 
-    if (!jmx_storage_guard_allow("/", priority, NULL)) {
+    if (!jmx_storage_guard_allow(notifyd_storage_path(), priority, NULL)) {
         g_notify_storage_suppressed++;
         g_notify_storage_last_suppressed_at = now;
         return 0;
     }
 
-    if (notifyd_coalesce_outbox(channel_id, route_id, body, max_attempts, out_id, out_id_len))
-        return 1;
+    {
+        int coalesced = notifyd_coalesce_outbox(channel_id, route_id, action_index, body,
+            delivery_options_json, producer_dedupe_key, route_dedupe_key,
+            dedupe_group, dedupe_window_seconds,
+            max_attempts, out_id, out_id_len);
+        if (coalesced)
+            return coalesced;
+    }
     notifyd_make_id("ntf", id, sizeof(id));
     if (out_id && out_id_len > 0)
         snprintf(out_id, out_id_len, "%s", id);
     st = notifyd_prepare(
-        "INSERT INTO notify_outbox(id,created_at,updated_at,next_attempt_at,channel_id,route_id,event_id,severity,category,event,source,title,payload_json,state,attempts,max_attempts,dedupe_key,first_seen,last_seen,count) "
-        "VALUES(?1,?2,?2,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'pending',0,?12,?13,?2,?2,1)");
+        "INSERT INTO notify_outbox(id,created_at,updated_at,next_attempt_at,channel_id,route_id,event_id,severity,category,event,source,title,payload_json,state,attempts,max_attempts,dedupe_key,first_seen,last_seen,count,action_index,dedupe_group,delivery_options_json,producer_dedupe_key,route_dedupe_key) "
+        "VALUES(?1,?2,?2,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,'pending',0,?12,?13,?2,?2,1,?14,?15,?16,?17,?18)");
     if (!st)
         return 0;
     sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
@@ -1524,12 +3476,48 @@ static int notifyd_insert_outbox(const char *channel_id, const char *route_id,
     sqlite3_bind_text(st, 10, notifyd_json_str(body, "title", ""), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 11, payload ? payload : "{}", -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 12, max_attempts);
-    sqlite3_bind_text(st, 13, notifyd_dedupe_key(body), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 13, producer_dedupe_key ? producer_dedupe_key : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 14, action_index);
+    sqlite3_bind_text(st, 15, dedupe_group ? dedupe_group : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 16, delivery_options_json ? delivery_options_json : "{}", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 17, producer_dedupe_key ? producer_dedupe_key : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 18, route_dedupe_key ? route_dedupe_key : "", -1, SQLITE_TRANSIENT);
     ok = sqlite3_step(st) == SQLITE_DONE;
     sqlite3_finalize(st);
     if (ok)
         notifyd_prune_if_needed();
     return ok;
+}
+
+static int notifyd_insert_outbox(const char *channel_id, const char *route_id,
+                                 struct json_object *body, int max_attempts,
+                                 char *out_id, size_t out_id_len)
+{
+    const char *dedupe_key = notifyd_dedupe_key(body);
+
+    return notifyd_insert_outbox_ex(channel_id, route_id, 0, body, NULL,
+                                    dedupe_key, "", dedupe_key, 0, max_attempts,
+                                    out_id, out_id_len);
+}
+
+static void notifyd_route_recovery_clear(const char *route_id, int action_index,
+                                         const char *dedupe_group)
+{
+    sqlite3_stmt *st;
+
+    if (!route_id || !route_id[0] || !dedupe_group || !dedupe_group[0])
+        return;
+    st = notifyd_prepare(
+        "UPDATE notify_outbox SET route_dedupe_key='',updated_at=?1 "
+        "WHERE route_id=?2 AND action_index=?3 AND dedupe_group=?4");
+    if (!st)
+        return;
+    sqlite3_bind_int64(st, 1, notifyd_now_s());
+    sqlite3_bind_text(st, 2, route_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 3, action_index);
+    sqlite3_bind_text(st, 4, dedupe_group, -1, SQLITE_TRANSIENT);
+    (void)sqlite3_step(st);
+    sqlite3_finalize(st);
 }
 
 int notifyd_prune_if_needed(void)
@@ -1540,7 +3528,7 @@ int notifyd_prune_if_needed(void)
 
     st = notifyd_prepare(
         "DELETE FROM notify_outbox "
-        "WHERE state IN ('delivered','failed') AND updated_at<?1");
+        "WHERE state IN ('delivered','failed','suppressed') AND updated_at<?1");
     if (!st)
         return -1;
     sqlite3_bind_int64(st, 1, now - NOTIFYD_OUTBOX_DONE_RETENTION_SEC);
@@ -1582,6 +3570,17 @@ int notifyd_prune_if_needed(void)
     if (rc != SQLITE_DONE)
         return -1;
 
+    st = notifyd_prepare(
+        "DELETE FROM notify_route_triggers WHERE id IN ("
+        " SELECT id FROM notify_route_triggers ORDER BY id DESC LIMIT -1 OFFSET ?1)");
+    if (!st)
+        return -1;
+    sqlite3_bind_int(st, 1, NOTIFYD_DELIVERIES_MAX_ROWS);
+    rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc != SQLITE_DONE)
+        return -1;
+
     notifyd_exec(g_notify_db, "PRAGMA wal_checkpoint(PASSIVE)");
     return 0;
 }
@@ -1591,11 +3590,15 @@ struct json_object *notifyd_enqueue_event(struct json_object *body)
     struct notifyd_settings s;
     sqlite3_stmt *st;
     struct json_object *resp = json_object_new_object();
-    int enqueued = 0, matched = 0;
+    int enqueued = 0, deduped = 0, matched = 0;
+    int matched_routes = 0, suppressed = 0, render_failed = 0;
+    const char *last_suppression_reason = "";
+    struct json_object *render_failed_actions = json_object_new_array();
     int route_query_ok = 1;
     int rc;
 
     if (notifyd_settings_load(&s) != 0) {
+        json_object_put(render_failed_actions);
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("settings_load_failed"));
         return resp;
@@ -1604,9 +3607,11 @@ struct json_object *notifyd_enqueue_event(struct json_object *body)
         json_object_object_add(resp, "ok", json_object_new_boolean(1));
         json_object_object_add(resp, "enabled", json_object_new_boolean(0));
         json_object_object_add(resp, "enqueued", json_object_new_int(0));
+        json_object_put(render_failed_actions);
         return resp;
     }
     if (!body || !notifyd_json_fits(body, NOTIFYD_MAX_JSON - 1)) {
+        json_object_put(render_failed_actions);
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("invalid_payload"));
         return resp;
@@ -1621,11 +3626,13 @@ struct json_object *notifyd_enqueue_event(struct json_object *body)
         const char *event_id = notifyd_json_str(body, "event", "");
 
         if (!event_id[0]) {
+            json_object_put(render_failed_actions);
             json_object_object_add(resp, "ok", json_object_new_boolean(0));
             json_object_object_add(resp, "error", json_object_new_string("event_required"));
             return resp;
         }
         if (!notifyd_event_definition_find(event_id)) {
+            json_object_put(render_failed_actions);
             json_object_object_add(resp, "ok", json_object_new_boolean(0));
             json_object_object_add(resp, "error", json_object_new_string("event_unknown"));
             json_object_object_add(resp, "event", json_object_new_string(event_id));
@@ -1636,13 +3643,136 @@ struct json_object *notifyd_enqueue_event(struct json_object *body)
     if (st) {
         while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
             const char *route_id = (const char *)sqlite3_column_text(st, 0);
-            const char *channel = (const char *)sqlite3_column_text(st, 3);
+            const char *top_channel = notifyd_sqlite_text(st, 3, "local");
+            const char *top_severity = notifyd_sqlite_text(st, 4, "warning");
+            struct json_object *stored_options;
+            struct json_object *actions = NULL, *receivers = NULL;
+            struct notifyd_route_contract contract;
+            const char *schedule_reason = "schedule_outside_window";
+            const char *global_mute_reason = "global_mute_schedule_active";
+            int eligible_actions;
+            int route_enqueued_before = enqueued;
+            int route_deduped_before = deduped;
+            int route_render_failed_before = render_failed;
+            size_t action_index;
+
             if (!notifyd_route_matches(st, body))
                 continue;
-            matched++;
-            if (channel && channel[0] && notifyd_insert_outbox(channel, route_id, body,
-                                                               s.max_attempts, NULL, 0))
-                enqueued++;
+            stored_options = notifyd_json_parse_or_object(notifyd_sqlite_text(st, 8, "{}"));
+            memset(&contract, 0, sizeof(contract));
+            if (!notifyd_route_contract_build(stored_options, top_channel, top_severity,
+                    1, 1, 0, &contract, NULL) || !contract.options) {
+                json_object_put(stored_options);
+                route_query_ok = 0;
+                break;
+            }
+            eligible_actions = notifyd_route_eligible_actions(contract.options, body);
+            if (eligible_actions == 0) {
+                notifyd_route_contract_clear(&contract);
+                json_object_put(stored_options);
+                continue;
+            }
+            matched_routes++;
+            if (!notifyd_route_schedule_allows(contract.options, notifyd_now_s(),
+                                                &schedule_reason)) {
+                suppressed++;
+                last_suppression_reason = schedule_reason ? schedule_reason :
+                    "schedule_outside_window";
+                notifyd_route_suppression_record(route_id, body, schedule_reason);
+                notifyd_route_trigger_record(route_id, body, "muted", schedule_reason,
+                                             "not_applicable", "route_schedule");
+                notifyd_route_contract_clear(&contract);
+                json_object_put(stored_options);
+                continue;
+            }
+            if (notifyd_global_mute_active(&s, notifyd_now_s(), &global_mute_reason)) {
+                suppressed++;
+                last_suppression_reason = global_mute_reason;
+                notifyd_route_trigger_record(route_id, body, "muted", global_mute_reason,
+                                             "not_applicable", "global_schedule");
+                notifyd_route_contract_clear(&contract);
+                json_object_put(stored_options);
+                continue;
+            }
+            json_object_object_get_ex(contract.options, "actions", &actions);
+            json_object_object_get_ex(contract.options, "receivers", &receivers);
+            for (action_index = 0; actions && action_index < json_object_array_length(actions);
+                 action_index++) {
+                struct json_object *action = json_object_array_get_idx(actions, action_index);
+                const char *channel = notifyd_json_str(action, "channel_id", "");
+                const char *min_severity = notifyd_json_str(action, "min_severity", "warning");
+                const char *producer_key = notifyd_dedupe_key(body);
+                const char *effective_producer_key = producer_key;
+                char route_key[1024] = "";
+                char dedupe_group[1024] = "";
+                char render_error[64] = "";
+                int dedupe_window = 0;
+                struct json_object *payload;
+                struct json_object *delivery_options = json_object_new_object();
+
+                if (notifyd_severity_rank(notifyd_json_str(body, "severity", "info")) <
+                        notifyd_severity_rank(min_severity) &&
+                    !notifyd_event_is_recovery(notifyd_json_str(body, "event", ""))) {
+                    json_object_put(delivery_options);
+                    continue;
+                }
+                matched++;
+                payload = notifyd_route_payload_render(body, contract.options,
+                    (int)action_index, render_error, sizeof(render_error));
+                if (!payload) {
+                    struct json_object *failure = json_object_new_object();
+                    render_failed++;
+                    json_object_object_add(failure, "route_id",
+                                           json_object_new_string(route_id ? route_id : ""));
+                    json_object_object_add(failure, "action_index",
+                                           json_object_new_int((int)action_index));
+                    json_object_object_add(failure, "error",
+                                           json_object_new_string(render_error[0] ?
+                                               render_error : "content_render_failed"));
+                    json_object_array_add(render_failed_actions, failure);
+                    json_object_put(delivery_options);
+                    continue;
+                }
+                if (receivers)
+                    json_object_object_add(delivery_options, "receivers", json_object_get(receivers));
+                (void)notifyd_route_dedupe_contract(contract.options, body,
+                    route_key, sizeof(route_key), dedupe_group, sizeof(dedupe_group),
+                    &dedupe_window);
+                if (notifyd_event_is_recovery(notifyd_json_str(body, "event", ""))) {
+                    notifyd_route_recovery_clear(route_id, (int)action_index, dedupe_group);
+                    if (route_key[0])
+                        effective_producer_key = "";
+                }
+                if (channel[0]) {
+                    int insert_result = notifyd_insert_outbox_ex(channel, route_id,
+                        (int)action_index, payload, delivery_options,
+                        effective_producer_key, route_key, dedupe_group,
+                        dedupe_window, s.max_attempts, NULL, 0);
+                    if (insert_result == 2)
+                        deduped++;
+                    else if (insert_result == 1)
+                        enqueued++;
+                }
+                json_object_put(delivery_options);
+                json_object_put(payload);
+            }
+            if (deduped > route_deduped_before && enqueued == route_enqueued_before)
+                notifyd_route_trigger_record(route_id, body, "deduped", "route_or_producer_dedupe",
+                                             "deduped", "not_muted");
+            else if (enqueued > route_enqueued_before)
+                notifyd_route_trigger_record(route_id, body, "enqueued", "",
+                                             deduped > route_deduped_before ? "partial" : "not_deduped",
+                                             "not_muted");
+            else if (render_failed > route_render_failed_before)
+                notifyd_route_trigger_record(route_id, body, "render_failed",
+                                             "content_render_failed", "not_applicable",
+                                             "not_muted");
+            else
+                notifyd_route_trigger_record(route_id, body, "enqueue_failed",
+                                             "outbox_insert_failed", "not_applicable",
+                                             "not_muted");
+            notifyd_route_contract_clear(&contract);
+            json_object_put(stored_options);
         }
         if (rc != SQLITE_DONE)
             route_query_ok = 0;
@@ -1653,7 +3783,10 @@ struct json_object *notifyd_enqueue_event(struct json_object *body)
     if (!route_query_ok) {
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "matched", json_object_new_int(matched));
+        json_object_object_add(resp, "matched_routes", json_object_new_int(matched_routes));
         json_object_object_add(resp, "enqueued", json_object_new_int(enqueued));
+        json_object_object_add(resp, "deduped", json_object_new_int(deduped));
+        json_object_object_add(resp, "render_failures", render_failed_actions);
         json_object_object_add(resp, "error", json_object_new_string("routes_query_failed"));
         return resp;
     }
@@ -1662,20 +3795,159 @@ struct json_object *notifyd_enqueue_event(struct json_object *body)
      * fallback reintroduces the drop whenever no route matched at all, e.g.
      * every route disabled or scoped elsewhere.
      */
-    if (!matched && s.default_channel_id[0] &&
+    if (!matched_routes && !suppressed && s.default_channel_id[0] &&
         (notifyd_severity_rank(notifyd_json_str(body, "severity", "info")) >= notifyd_severity_rank("warning") ||
          notifyd_event_is_recovery(notifyd_json_str(body, "event", "")))) {
-        matched = 1;
-        if (notifyd_insert_outbox(s.default_channel_id, "default", body, s.max_attempts, NULL, 0))
+        if (notifyd_global_mute_active(&s, notifyd_now_s(), NULL)) {
+            suppressed++;
+            last_suppression_reason = "global_mute_schedule_active";
+            notifyd_route_trigger_record("default", body, "muted",
+                                         "global_mute_schedule_active", "not_applicable",
+                                         "global_schedule");
+        } else {
+            struct json_object *payload = notifyd_route_options_clone(body);
+            int inserted = payload && dw_event_payload_present(
+                payload, notifyd_json_str(body, "locale", "zh-CN")) &&
+                notifyd_insert_outbox(s.default_channel_id, "default", payload,
+                                      s.max_attempts, NULL, 0);
+
+            if (payload)
+                json_object_put(payload);
+            if (inserted) {
+            matched = 1;
             enqueued = 1;
+            notifyd_route_trigger_record("default", body, "enqueued", "",
+                                         "not_deduped", "not_muted");
+            } else {
+                matched = 1;
+                notifyd_route_trigger_record("default", body, "enqueue_failed",
+                                             "outbox_insert_failed", "not_applicable",
+                                             "not_muted");
+            }
+        }
     }
-    json_object_object_add(resp, "ok", json_object_new_boolean(!matched || enqueued == matched));
+    json_object_object_add(resp, "ok", json_object_new_boolean(
+        !matched || enqueued + deduped == matched));
     json_object_object_add(resp, "matched", json_object_new_int(matched));
+    json_object_object_add(resp, "matched_routes", json_object_new_int(matched_routes));
     json_object_object_add(resp, "enqueued", json_object_new_int(enqueued));
-    if (matched && enqueued == 0)
-        json_object_object_add(resp, "error", json_object_new_string("enqueue_failed"));
-    else if (matched && enqueued < matched)
+    json_object_object_add(resp, "deduped", json_object_new_int(deduped));
+    json_object_object_add(resp, "suppressed", json_object_new_int(suppressed));
+    json_object_object_add(resp, "render_failed", json_object_new_int(render_failed));
+    json_object_object_add(resp, "render_failures", render_failed_actions);
+    if (suppressed)
+        json_object_object_add(resp, "suppression_reason",
+                               json_object_new_string(last_suppression_reason[0] ?
+                                   last_suppression_reason : "schedule_outside_window"));
+    if (matched && enqueued + deduped == 0 && !suppressed)
+        json_object_object_add(resp, "error", json_object_new_string(
+            render_failed ? "content_render_failed" : "enqueue_failed"));
+    else if (matched && enqueued + deduped < matched)
         json_object_object_add(resp, "error", json_object_new_string("partial_enqueue_failed"));
+    return resp;
+}
+
+struct json_object *notifyd_triggers_json(struct json_object *body)
+{
+    const char *route_id = notifyd_json_str(body, "route_id", "");
+    const char *cursor = notifyd_json_str(body, "cursor", "");
+    int limit = notifyd_json_int(body, "limit", NOTIFYD_DEFAULT_LIMIT);
+    int64_t cursor_id = INT64_MAX;
+    sqlite3_stmt *st;
+    struct json_object *resp = json_object_new_object();
+    struct json_object *items = json_object_new_array();
+    int rc = SQLITE_DONE;
+    int returned = 0;
+    int has_more = 0;
+    int64_t last_id = 0;
+
+    if (limit <= 0 || limit > NOTIFYD_MAX_LIMIT)
+        limit = NOTIFYD_DEFAULT_LIMIT;
+    if (route_id[0] && !notifyd_id_ok(route_id)) {
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "error", json_object_new_string("invalid_route_id"));
+        json_object_object_add(resp, "items", items);
+        return resp;
+    }
+    if (cursor[0]) {
+        char *end = NULL;
+
+        errno = 0;
+        cursor_id = strtoll(cursor, &end, 10);
+        if (errno || !end || *end || cursor_id <= 0) {
+            json_object_object_add(resp, "ok", json_object_new_boolean(0));
+            json_object_object_add(resp, "error", json_object_new_string("invalid_cursor"));
+            json_object_object_add(resp, "items", items);
+            return resp;
+        }
+    }
+    st = notifyd_prepare(
+        "SELECT id,route_id,event,severity,source,triggered_at,result,reason,"
+        "dedupe_result,mute_result FROM notify_route_triggers "
+        "WHERE (?1='' OR route_id=?1) AND (?2=0 OR id<?2) "
+        "ORDER BY id DESC LIMIT ?3");
+    if (!st) {
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "error", json_object_new_string("triggers_query_failed"));
+        json_object_object_add(resp, "items", items);
+        return resp;
+    }
+    sqlite3_bind_text(st, 1, route_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 2, cursor[0] ? cursor_id : 0);
+    sqlite3_bind_int(st, 3, limit + 1);
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        struct json_object *item;
+
+        if (returned == limit) {
+            has_more = 1;
+            break;
+        }
+        item = json_object_new_object();
+        last_id = sqlite3_column_int64(st, 0);
+        json_object_object_add(item, "id", json_object_new_int64(last_id));
+        json_object_object_add(item, "route_id",
+                               json_object_new_string(notifyd_sqlite_text(st, 1, "")));
+        json_object_object_add(item, "event",
+                               json_object_new_string(notifyd_sqlite_text(st, 2, "")));
+        json_object_object_add(item, "severity",
+                               json_object_new_string(notifyd_sqlite_text(st, 3, "info")));
+        json_object_object_add(item, "source",
+                               json_object_new_string(notifyd_sqlite_text(st, 4, "")));
+        json_object_object_add(item, "triggered_at",
+                               json_object_new_int64(sqlite3_column_int64(st, 5)));
+        json_object_object_add(item, "result",
+                               json_object_new_string(notifyd_sqlite_text(st, 6, "")));
+        json_object_object_add(item, "reason",
+                               json_object_new_string(notifyd_sqlite_text(st, 7, "")));
+        json_object_object_add(item, "dedupe_result",
+                               json_object_new_string(notifyd_sqlite_text(st, 8, "not_applicable")));
+        json_object_object_add(item, "mute_result",
+                               json_object_new_string(notifyd_sqlite_text(st, 9, "not_muted")));
+        json_object_array_add(items, item);
+        returned++;
+    }
+    if (rc != SQLITE_DONE && !has_more) {
+        sqlite3_finalize(st);
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "error", json_object_new_string("triggers_query_failed"));
+        json_object_object_add(resp, "items", items);
+        return resp;
+    }
+    sqlite3_finalize(st);
+    json_object_object_add(resp, "ok", json_object_new_boolean(1));
+    json_object_object_add(resp, "items", items);
+    json_object_object_add(resp, "route_id", json_object_new_string(route_id));
+    json_object_object_add(resp, "cursor", json_object_new_string(cursor));
+    json_object_object_add(resp, "limit", json_object_new_int(limit));
+    json_object_object_add(resp, "has_more", json_object_new_boolean(has_more));
+    if (has_more && last_id > 0) {
+        char next_cursor[32];
+        snprintf(next_cursor, sizeof(next_cursor), "%lld", (long long)last_id);
+        json_object_object_add(resp, "next_cursor", json_object_new_string(next_cursor));
+    } else {
+        json_object_object_add(resp, "next_cursor", json_object_new_string(""));
+    }
+    json_object_object_add(resp, "order", json_object_new_string("id_desc"));
     return resp;
 }
 
@@ -1685,6 +3957,7 @@ struct json_object *notifyd_enqueue_direct(struct json_object *body)
     struct notifyd_channel channel;
     struct json_object *resp = json_object_new_object();
     const char *channel_id = notifyd_json_str(body, "channel_id", "");
+    struct json_object *payload = NULL;
     char outbox_id[NOTIFYD_MAX_ID] = {0};
     int ok;
 
@@ -1711,8 +3984,28 @@ struct json_object *notifyd_enqueue_direct(struct json_object *body)
         json_object_object_add(resp, "error", json_object_new_string("invalid_payload"));
         return resp;
     }
-    ok = notifyd_insert_outbox(channel_id, notifyd_json_str(body, "route_id", "direct"),
-                               body, s.max_attempts, outbox_id, sizeof(outbox_id));
+    payload = json_tokener_parse(json_object_to_json_string_ext(body,
+                                                                JSON_C_TO_STRING_PLAIN));
+    if (!payload || !json_object_is_type(payload, json_type_object)) {
+        if (payload)
+            json_object_put(payload);
+        json_object_object_add(resp, "ok", json_object_new_boolean(0));
+        json_object_object_add(resp, "error", json_object_new_string("invalid_payload"));
+        return resp;
+    }
+    {
+        const char *event_id = notifyd_json_str(payload, "event", "");
+        const char *title = notifyd_json_str(payload, "title", "");
+        const char *message = notifyd_json_str(payload, "message", "");
+
+        if (event_id[0] && !title[0] && !message[0] &&
+            dw_event_definition_find(event_id))
+            dw_event_payload_present(payload,
+                notifyd_json_str(payload, "locale", "zh-CN"));
+    }
+    ok = notifyd_insert_outbox(channel_id, notifyd_json_str(payload, "route_id", "direct"),
+                               payload, s.max_attempts, outbox_id, sizeof(outbox_id));
+    json_object_put(payload);
     json_object_object_add(resp, "ok", json_object_new_boolean(ok));
     json_object_object_add(resp, "enqueued", json_object_new_int(ok ? 1 : 0));
     if (ok && outbox_id[0])
@@ -1892,6 +4185,9 @@ static void notifyd_outbox_row_json(struct json_object *arr, sqlite3_stmt *st)
     json_object_object_add(o, "first_seen", json_object_new_int64(sqlite3_column_int64(st, 18)));
     json_object_object_add(o, "last_seen", json_object_new_int64(sqlite3_column_int64(st, 19)));
     json_object_object_add(o, "count", json_object_new_int(sqlite3_column_int(st, 20)));
+    json_object_object_add(o, "action_index", json_object_new_int(sqlite3_column_int(st, 21)));
+    json_object_object_add(o, "last_warning", json_object_new_string(
+        notifyd_sqlite_text(st, 22, "")));
     json_object_object_add(o, "browser_interrupt", json_object_new_boolean(browser_interrupt));
     json_object_object_add(o, "interrupt_reason", json_object_new_string(interrupt_reason));
     json_object_array_add(arr, o);
@@ -1924,7 +4220,8 @@ struct json_object *notifyd_outbox_list(struct json_object *body)
     if (limit <= 0 || limit > NOTIFYD_MAX_LIMIT)
         limit = NOTIFYD_DEFAULT_LIMIT;
     if (state[0] && strcmp(state, "pending") && strcmp(state, "retry") &&
-        strcmp(state, "failed") && strcmp(state, "delivered")) {
+        strcmp(state, "failed") && strcmp(state, "delivered") &&
+        strcmp(state, "suppressed")) {
         json_object_object_add(resp, "ok", json_object_new_boolean(0));
         json_object_object_add(resp, "error", json_object_new_string("invalid_state"));
         json_object_object_add(resp, "items", arr);
@@ -1989,7 +4286,7 @@ struct json_object *notifyd_outbox_list(struct json_object *body)
         sqlite3_finalize(count_st);
     }
     st = notifyd_prepare(
-        "SELECT id,created_at,updated_at,next_attempt_at,channel_id,route_id,event_id,severity,category,event,source,title,payload_json,state,attempts,max_attempts,last_error,last_http_status,first_seen,last_seen,count "
+        "SELECT id,created_at,updated_at,next_attempt_at,channel_id,route_id,event_id,severity,category,event,source,title,payload_json,state,attempts,max_attempts,last_error,last_http_status,first_seen,last_seen,count,action_index,last_warning "
         "FROM notify_outbox WHERE (?1='' OR state=?1) AND "
         "(?2='' OR title LIKE ?2 ESCAPE '\\' OR event LIKE ?2 ESCAPE '\\' OR category LIKE ?2 ESCAPE '\\' OR source LIKE ?2 ESCAPE '\\' OR channel_id LIKE ?2 ESCAPE '\\' OR route_id LIKE ?2 ESCAPE '\\') AND "
         "(?3=0 OR last_seen>=?3) AND "
@@ -2072,7 +4369,7 @@ struct json_object *notifyd_outbox_get(struct json_object *body)
         return resp;
     }
     st = notifyd_prepare(
-        "SELECT id,created_at,updated_at,next_attempt_at,channel_id,route_id,event_id,severity,category,event,source,title,payload_json,state,attempts,max_attempts,last_error,last_http_status,first_seen,last_seen,count "
+        "SELECT id,created_at,updated_at,next_attempt_at,channel_id,route_id,event_id,severity,category,event,source,title,payload_json,state,attempts,max_attempts,last_error,last_http_status,first_seen,last_seen,count,action_index,last_warning "
         "FROM notify_outbox WHERE id=?1");
     if (st) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
@@ -2088,17 +4385,31 @@ struct json_object *notifyd_outbox_get(struct json_object *body)
         return resp;
     }
     st = notifyd_prepare(
-        "SELECT id,ts,ok,http_status,error,duration_ms FROM notify_deliveries WHERE outbox_id=?1 ORDER BY ts DESC,id DESC");
+        "SELECT id,ts,ok,http_status,error,duration_ms,warning,outcome,suppressed_recipients "
+        "FROM notify_deliveries WHERE outbox_id=?1 ORDER BY ts DESC,id DESC");
     if (st) {
         sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
         while (sqlite3_step(st) == SQLITE_ROW) {
             struct json_object *attempt = json_object_new_object();
+            const char *outcome = notifyd_sqlite_text(st, 7, "");
+
             json_object_object_add(attempt, "id", json_object_new_int64(sqlite3_column_int64(st, 0)));
             json_object_object_add(attempt, "ts", json_object_new_int64(sqlite3_column_int64(st, 1)));
             json_object_object_add(attempt, "ok", json_object_new_boolean(sqlite3_column_int(st, 2)));
             json_object_object_add(attempt, "http_status", json_object_new_int(sqlite3_column_int(st, 3)));
             json_object_object_add(attempt, "error", json_object_new_string(notifyd_sqlite_text(st, 4, "")));
             json_object_object_add(attempt, "duration_ms", json_object_new_int(sqlite3_column_int(st, 5)));
+            json_object_object_add(attempt, "warning", json_object_new_string(
+                notifyd_sqlite_text(st, 6, "")));
+            /* Rows written before the suppression outcome existed have an empty
+             * `outcome`; derive it from `ok` so old attempts still classify. */
+            json_object_object_add(attempt, "outcome", json_object_new_string(
+                outcome[0] ? outcome :
+                (sqlite3_column_int(st, 2) ? "delivered" : "failed")));
+            json_object_object_add(attempt, "suppressed",
+                json_object_new_boolean(!strcmp(outcome, "suppressed")));
+            json_object_object_add(attempt, "suppressed_recipients",
+                json_object_new_int(sqlite3_column_int(st, 8)));
             json_object_array_add(attempts, attempt);
         }
         sqlite3_finalize(st);
@@ -2124,7 +4435,7 @@ struct json_object *notifyd_outbox_retry(struct json_object *body)
         json_object_object_add(resp, "error", json_object_new_string("invalid_id"));
         return resp;
     }
-    st = notifyd_prepare("UPDATE notify_outbox SET state='pending',next_attempt_at=?1,updated_at=?1,last_error='' WHERE id=?2");
+    st = notifyd_prepare("UPDATE notify_outbox SET state='pending',next_attempt_at=?1,updated_at=?1,last_error='',last_warning='' WHERE id=?2");
     if (st) {
         sqlite3_bind_int64(st, 1, notifyd_now_s());
         sqlite3_bind_text(st, 2, id, -1, SQLITE_TRANSIENT);
@@ -2139,19 +4450,22 @@ struct json_object *notifyd_outbox_retry(struct json_object *body)
 }
 
 int notifyd_delivery_record(const char *outbox_id, const char *channel_id,
-                            int ok, long http_status, const char *error,
-                            int duration_ms)
+                            int outcome, long http_status, const char *error,
+                            int duration_ms, int suppressed_recipients)
 {
     sqlite3_stmt *st;
+    int suppressed = outcome == NOTIFYD_DELIVERY_SUPPRESSED;
+    int ok = outcome != NOTIFYD_DELIVERY_FAILED;
     int rc = 0;
 
-    if (!jmx_storage_guard_allow("/", JMX_STORAGE_WRITE_BULK, NULL)) {
+    if (!jmx_storage_guard_allow(notifyd_storage_path(), JMX_STORAGE_WRITE_BULK, NULL)) {
         g_notify_storage_suppressed++;
         g_notify_storage_last_suppressed_at = notifyd_now_s();
         return 0;
     }
     st = notifyd_prepare(
-        "INSERT INTO notify_deliveries(outbox_id,channel_id,ts,ok,http_status,error,duration_ms) VALUES(?1,?2,?3,?4,?5,?6,?7)");
+        "INSERT INTO notify_deliveries(outbox_id,channel_id,ts,ok,http_status,error,duration_ms,warning,outcome,suppressed_recipients) "
+        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8,?9,?10)");
     if (!st)
         return 0;
     sqlite3_bind_text(st, 1, outbox_id ? outbox_id : "", -1, SQLITE_TRANSIENT);
@@ -2159,31 +4473,46 @@ int notifyd_delivery_record(const char *outbox_id, const char *channel_id,
     sqlite3_bind_int64(st, 3, notifyd_now_s());
     sqlite3_bind_int(st, 4, ok);
     sqlite3_bind_int(st, 5, (int)http_status);
-    sqlite3_bind_text(st, 6, error ? error : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 6, !ok && error ? error : "", -1, SQLITE_TRANSIENT);
     sqlite3_bind_int(st, 7, duration_ms < 0 ? 0 : duration_ms);
+    sqlite3_bind_text(st, 8, ok && error ? error : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 9,
+                      suppressed ? "suppressed" : (ok ? "delivered" : "failed"),
+                      -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 10, suppressed_recipients < 0 ? 0 : suppressed_recipients);
     rc = sqlite3_step(st) == SQLITE_DONE;
     sqlite3_finalize(st);
     return rc;
 }
 
 int notifyd_mark_delivery_result(const struct notifyd_outbox_item *item,
-                                 int ok, long http_status, const char *error,
-                                 int duration_ms)
+                                 int outcome, long http_status, const char *error,
+                                 int duration_ms, int suppressed_recipients)
 {
     struct notifyd_settings s;
     sqlite3_stmt *st;
+    int suppressed = outcome == NOTIFYD_DELIVERY_SUPPRESSED;
+    int ok = outcome != NOTIFYD_DELIVERY_FAILED;
     int attempts;
     int64_t now = notifyd_now_s();
     int64_t next = now;
     const char *state;
+    char warning[256];
     int rc = 0;
 
     if (!item)
         return 0;
     if (notifyd_settings_load(&s) != 0)
         return 0;
-    attempts = item->attempts + 1;
-    if (ok) {
+    /*
+     * A suppressed send never touched a transport, so it must not consume an
+     * attempt: were the user to unmute and retry the row, an exhausted counter
+     * would push it straight to `failed`.
+     */
+    attempts = suppressed ? item->attempts : item->attempts + 1;
+    if (suppressed) {
+        state = "suppressed";
+    } else if (ok) {
         state = "delivered";
     } else if (attempts >= item->max_attempts) {
         state = "failed";
@@ -2199,19 +4528,42 @@ int notifyd_mark_delivery_result(const struct notifyd_outbox_item *item,
         next = now + delay;
         state = "retry";
     }
+    /*
+     * Suppression detail rides in `last_warning`, never `last_error`: status
+     * counts non-empty `last_error` rows as delivery faults, and a mute the
+     * user asked for is not one. Only the count is recorded -- putting the
+     * muted address here would leak one user's email into another's view.
+     */
+    warning[0] = '\0';
+    if (suppressed) {
+        snprintf(warning, sizeof(warning), "%s",
+                 error && error[0] ? error : "preference_suppressed_all_recipients");
+    } else if (ok && suppressed_recipients > 0 && error && error[0]) {
+        snprintf(warning, sizeof(warning), "%s;preference_suppressed_recipients:%d",
+                 error, suppressed_recipients);
+    } else if (ok && suppressed_recipients > 0) {
+        snprintf(warning, sizeof(warning), "preference_suppressed_recipients:%d",
+                 suppressed_recipients);
+    } else if (ok && error) {
+        snprintf(warning, sizeof(warning), "%s", error);
+    }
     st = notifyd_prepare(
-        "UPDATE notify_outbox SET state=?1,attempts=?2,next_attempt_at=?3,updated_at=?4,last_error=?5,last_http_status=?6 WHERE id=?7");
+        "UPDATE notify_outbox SET state=?1,attempts=?2,next_attempt_at=?3,updated_at=?4,"
+        "last_error=?5,last_http_status=?6,last_warning=?7 WHERE id=?8");
     if (st) {
         sqlite3_bind_text(st, 1, state, -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 2, attempts);
         sqlite3_bind_int64(st, 3, next);
         sqlite3_bind_int64(st, 4, now);
-        sqlite3_bind_text(st, 5, error ? error : "", -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 5, !ok && error ? error : "", -1, SQLITE_TRANSIENT);
         sqlite3_bind_int(st, 6, (int)http_status);
-        sqlite3_bind_text(st, 7, item->id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 7, warning, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 8, item->id, -1, SQLITE_TRANSIENT);
         rc = sqlite3_step(st) == SQLITE_DONE;
         sqlite3_finalize(st);
     }
-    notifyd_delivery_record(item->id, item->channel_id, ok, http_status, error, duration_ms);
+    notifyd_delivery_record(item->id, item->channel_id, outcome, http_status,
+                            suppressed ? warning : error, duration_ms,
+                            suppressed_recipients);
     return rc;
 }

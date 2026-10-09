@@ -35,6 +35,8 @@
 
 #include "apd_radio_job_journal.h"
 #include "apd_config_executor.h"
+#include "apd_ble.h"
+#include "apd_ble_db.h"
 
 #define APD_DB_PATH "/etc/dreamingwrt/apd.db"
 #define APD_CONTRACT_VERSION "ap-control.v1"
@@ -69,6 +71,9 @@
 #ifndef APD_UBUS_SOCKET_PATH
 #define APD_UBUS_SOCKET_PATH NULL
 #endif
+
+int apd_reassoc_block_worker(int fd);
+int apd_reassoc_block_release(const char *station_mac);
 
 struct apd_backend_ops {
     const char *name;
@@ -197,6 +202,9 @@ int apd_db_pairing_verify_challenge(const char *request_id,
 int apd_db_pairing_reset(const char *request_id);
 int apd_db_pairing_clear(void);
 
+int apd_ble_db_init(void);
+int apd_ble_db_recover(void);
+
 int apd_enrollment_csr_create(unsigned char *csr_der, size_t csr_der_size,
                               size_t *csr_der_len,
                               unsigned char csr_sha256[SHA256_DIGEST_LENGTH]);
@@ -207,7 +215,12 @@ int apd_enrollment_transcript_sign_v1(
     const struct apd_enrollment_transcript_v1 *input,
     unsigned char signature[APD_ED25519_SIGNATURE_LEN]);
 const char *apd_credentials_pki_dir(void);
+int apd_credentials_rotation_install(const char *task_id, const char *certificate_id,
+    const unsigned char *der, size_t der_len, const char *trust_pem, size_t trust_len);
+int apd_credentials_rotation_trust_commit(const char *trust_pem, size_t length);
+int apd_credentials_trust_fingerprint(unsigned char out[32]);
 int apd_credentials_bootstrap_load(struct apd_bootstrap_config *out);
+int apd_credentials_bootstrap_store(const struct apd_bootstrap_config *config);
 int apd_credentials_certificate_store(
     const struct apd_credentials_certificate_input *input,
     struct apd_enrollment_metadata *out);
@@ -251,12 +264,25 @@ void apd_credentials_metadata_cleanse(struct apd_enrollment_metadata *metadata);
 
 const struct apd_backend_ops *apd_backend(void);
 const struct apd_backend_ops *apd_backend_openwrt(void);
+const struct apd_backend_ops *apd_backend_mac80211(void);
+int apd_backend_mac80211_detect(void);
 int apd_backend_device_model_collect(struct apd_device_model *out);
 int apd_backend_neighbor_scan(const char *radio_id, struct json_object **out);
 int apd_backend_survey_scan(const char *radio_id, struct json_object **out);
+/*
+ * Attaches an `iw phy` channel catalogue to each radio, scoped by band.
+ *
+ * Needed by the mac80211 backend, whose radios all share one wiphy and so
+ * cannot be matched by the per-wiphy name the openwrt backend uses. Without a
+ * catalogue the controller refuses every radio write with
+ * channel_catalog_missing.
+ */
+void apd_collect_channel_catalogs_by_band(struct json_object *radios,
+                                          int64_t observed_at);
 struct json_object *apd_backend_disabled(const char *operation,
                                          const char *reason);
 
+struct json_object *apd_local_error(const char *operation, const char *reason);
 struct json_object *apd_capabilities_json(void);
 struct json_object *apd_status_json(void);
 struct json_object *apd_snapshot_json(void);
@@ -265,16 +291,26 @@ struct json_object *apd_pairing_status_json(void);
 struct json_object *apd_write_disabled_json(const char *operation,
                                             const char *reason);
 struct json_object *apd_unpair_json(int confirmed);
+struct json_object *apd_txpower_mode_json(void);
+struct json_object *apd_txpower_mode_set_json(const char *mode,
+                                              int confirmed);
+int apd_txpower_mode_restore_persisted(void);
+int apd_txpower_mode_restore_start(void);
+void apd_txpower_mode_restore_stop(void);
 int apd_protocol_init(void);
 void apd_protocol_close(void);
 
 int apd_transport_start(void);
 void apd_transport_stop(void);
 int apd_transport_connected(void);
+int apd_transport_audit_ready(void);
+void apd_transport_wake(void);
 int apd_transport_adopted(void);
 const char *apd_transport_reason(void);
 
 int apd_ubus_start(void);
 void apd_ubus_stop(void);
+/* Item 6: subscribe to hostapd key-mismatch (SAE + PSK auth failures). */
+int apd_hostapd_keymismatch_subscribe_start(struct ubus_context *ctx);
 
 #endif

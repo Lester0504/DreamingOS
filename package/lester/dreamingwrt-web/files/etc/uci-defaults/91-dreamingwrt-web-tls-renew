@@ -1,0 +1,34 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Install the daily renewal cron for the console TLS certificate.
+#
+# The console cert is deliberately short-lived (<=398 days; see
+# dreamingwrt-web-tls-cert) so Apple's SecPolicyCreateSSL 398-day cap -- and the
+# equivalent Safari/Chrome web-PKI rule -- accept it. A short-lived cert MUST be
+# renewed automatically, or the HTTPS console (and WebAuthn, which requires a
+# valid cert) goes dark the moment it lapses. crond is the platform's periodic
+# mechanism, and the `renew` subcommand is a cheap no-op until the cert enters
+# its renewal window, so a daily run is safe and self-healing (it also repairs
+# SAN drift after a LAN-subnet or hostname change).
+
+set -u
+
+CRON="/etc/crontabs/root"
+TOOL="/usr/libexec/dreamingwrt/dreamingwrt-web-tls-cert"
+MARK="$TOOL renew"
+LINE="17 3 * * * $TOOL renew >/dev/null 2>&1"
+
+mkdir -p /etc/crontabs
+
+if ! grep -qF "$MARK" "$CRON" 2>/dev/null; then
+	printf '%s\n' "# DreamingWrt: renew the short-lived console TLS certificate before it expires" >> "$CRON"
+	printf '%s\n' "$LINE" >> "$CRON"
+	# Nudge crond to re-read the table if it is already running; harmless if not.
+	if [ -x /etc/init.d/cron ]; then
+		/etc/init.d/cron reload >/dev/null 2>&1 || \
+			/etc/init.d/cron restart >/dev/null 2>&1 || true
+	fi
+fi
+
+exit 0

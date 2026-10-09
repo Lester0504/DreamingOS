@@ -22,6 +22,13 @@
   display: none;
 }
 
+@media (max-width: 640px) {
+  /* Keep the table inside the mobile shell's padded content area. */
+  html:not([data-desktop-embedded="true"]) .console-stage.is-log-center {
+    height: 100% !important;
+  }
+}
+
 .log-center-shell {
   --log-filter-width: clamp(288px, 18vw, 332px);
   width: 100%;
@@ -584,7 +591,7 @@
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-rows: auto auto minmax(0, 1fr) auto;
+  grid-template-rows: auto minmax(0, 1fr) auto;
   border-radius: var(--app-radius-card, 24px);
   height: 100%;
   max-height: 100%;
@@ -1049,135 +1056,77 @@ html[data-theme-resolved="light"] .log-detail-raw pre {
   background: rgba(241,246,252,0.76);
 }
 
-@media (max-width: 980px) {
-  .console-stage.is-log-center {
-    padding: var(--app-page-gutter-block, 12px) var(--app-page-gutter-inline, 12px);
-    height: auto;
-    min-height: var(--app-stage-height);
-    overflow: auto;
-  }
-
-  .log-center-shell,
-  .log-center-shell.is-drawer-open {
-    height: auto;
-    /* Same trap as insights: the stage is already viewport-minus-footer-strip,
-       so a raw 100dvh here overflows it by the strip height. The stage above
-       correctly uses the token; keep the shell consistent with it. */
-    min-height: var(--app-stage-height);
-    grid-template-columns: minmax(0, 1fr);
-  }
-
-  .log-center-filter {
-    height: auto;
-    max-height: 58dvh;
-    border-radius: var(--app-radius-card, 20px);
-  }
-
-  .log-center-main {
-    padding-block: 0;
-  }
-
-  .log-center-table-card {
-    min-height: 60dvh;
-    border-radius: var(--app-radius-card, 20px);
-  }
-
-  .log-settings-grid,
-  .log-settings-summary,
-  .log-settings-switches {
-    grid-template-columns: minmax(0, 1fr);
-  }
-
+/* Log workbench: geometry follows the app container, not the browser window. */
+.route-log-center-host { container-type: inline-size; container-name: log-app; }
+.log-center-shell { padding:0; gap:0; grid-template-columns:minmax(0,1fr); grid-template-rows:auto minmax(0,1fr); position:relative; }
+.log-center-shell.is-desktop { grid-template-columns:240px minmax(0,1fr); grid-template-rows:minmax(0,1fr); }
+.log-center-shell > [data-log-filter-host], .log-center-shell > [data-log-drawer-host] { display:contents; }
+.log-center-main { grid-template-rows:minmax(0,1fr); padding:0; }
+.log-center-mode-tabs.dwrt-kit-tabs { margin:8px 12px; }
+.log-center-table-card { min-height:0; height:100%; grid-template-rows:auto minmax(0,1fr) auto; border-radius:0; }
+.log-center-shell.is-desktop .log-center-table-card, .log-center-shell.is-desktop .log-settings-card { background:transparent; box-shadow:none; backdrop-filter:none; -webkit-backdrop-filter:none; border:0; }
+.log-center-toolbar { min-width:0; flex-wrap:wrap; gap:8px; padding:12px; }
+.log-center-toolbar-actions { gap:6px; justify-content:flex-start; }
+.log-center-toolbar .dwrt-kit-table-title { min-width:0; }
+.log-center-search.dwrt-kit-expand-search { --dwrt-search-expanded-width:min(240px,40cqw); }
+.log-center-table-scroll { min-width:0; min-height:0; overflow:auto; }
+.log-center-table, .log-center-table-card.is-audit-mode .log-center-table { width:100%; min-width:0; table-layout:fixed; }
+.log-center-table th:nth-child(1) { width:36px; }
+.log-center-table th:nth-child(2) { width:13%; }
+.log-center-table th:nth-child(3) { width:17%; }
+.log-center-table th:nth-child(5) { width:12%; }
+.log-center-table th:nth-child(6) { width:16%; }
+.log-center-table td { overflow-wrap:anywhere; vertical-align:top; padding:12px 8px; white-space:normal; }
+.log-center-table td.num { white-space:normal; font-variant-numeric:tabular-nums; }
+.log-center-table .log-table-desc-cell { display:table-cell; max-width:none; min-width:0; }
+.log-table-desc { display:block; white-space:normal; overflow-wrap:anywhere; line-height:1.5; }
+.log-table-desc-toggle { margin-top:5px; }
+.log-detail-trigger { color:inherit; background:transparent; border:0; padding:0; text-align:left; font:inherit; font-weight:600; cursor:pointer; overflow-wrap:anywhere; }
+.log-detail-trigger:focus-visible { outline:2px solid var(--color-accent); outline-offset:2px; }
+.log-center-table td small { display:block; margin-top:4px; color:var(--dwrt-muted); }
+.log-audit-category { padding:0; border:0; background:transparent; white-space:normal; }
+.log-center-pagination { min-width:0; flex-wrap:wrap; gap:8px; padding:10px 12px; }
+.log-center-pagination > span { margin-right:auto; }
+/* The console's shared AI launcher occupies the lower-right corner. */
+html:not([data-desktop-embedded="true"]) .log-center-pagination { padding-inline-end:92px; }
+.log-center-notice { max-width:none; white-space:normal; color:var(--dwrt-ink); }
+.log-center-notice[hidden] { display:none; }
+.log-center-filter { height:100%; padding:0; display:grid; grid-template-rows:minmax(0,1fr) auto; border-radius:0; }
+.log-filter-sheet .log-filter-scroll { padding:16px var(--dwrt-kit-sheet-padding-x,20px); overflow:auto; }
+.log-filter-select { display:grid; gap:8px; margin:12px 0; }
+.log-filter-select select { width:100%; min-width:0; height:36px; font:inherit; color:var(--dwrt-ink); background:var(--dwrt-glass-surface); border:1px solid var(--dwrt-glass-edge); border-radius:var(--app-radius-control); }
+.log-filter-sheet .log-filter-footer { padding:12px 20px; }
+.log-filter-sheet .log-center-severity-strip { flex-wrap:wrap; }
+.log-integration { font-size:12px; line-height:1.5; color:var(--dwrt-muted); }
+.log-center-drawer .log-drawer-scroll { padding:16px var(--dwrt-kit-sheet-padding-x,20px) 28px; }
+.log-center-shell .log-filter-sheet, .log-center-shell .log-center-drawer { max-width:100%; }
+.log-compact .log-center-shell.is-desktop { grid-template-columns:64px minmax(0,1fr); }
+.log-compact .log-center-rail { --dwrt-rail-width:64px; padding-inline:6px; }
+.log-compact .log-center-rail .dwrt-rail-item-text { display:none; }
+.log-compact .log-center-rail .dwrt-rail-item { justify-content:center; padding-inline:4px; }
+@container log-app (max-width: 900px) {
+  .log-center-table thead { position:absolute; width:1px; height:1px; overflow:hidden; clip-path:inset(50%); }
+  .log-center-table tbody { display:block; }
+  .log-center-table tbody tr { position:relative; display:grid; grid-template-columns:minmax(0,1fr) auto; gap:6px 12px; padding:12px 14px; border-bottom:1px solid var(--dwrt-glass-edge); }
+  .log-center-table tbody td { display:block; width:auto; height:auto; padding:0; border:0; min-width:0; }
+  .log-center-table .log-table-select-cell { position:absolute; top:12px; right:12px; }
+  .log-center-table td:nth-child(2) { grid-column:1; grid-row:1; padding-right:26px; }
+  .log-center-table td:nth-child(3) { grid-column:1/-1; grid-row:2; padding-right:26px; }
+  .log-center-table .log-table-desc-cell { display:block; grid-column:1/-1; grid-row:3; }
+  .log-center-table td:nth-child(5) { grid-column:1; grid-row:4; }
+  .log-center-table td:nth-child(6) { grid-column:2; grid-row:4; text-align:right; font-size:11px; }
+  .log-settings-grid,.log-settings-summary,.log-settings-switches { grid-template-columns:minmax(0,1fr); }
+  .log-center-table td small { display:inline; margin-left:6px; }
+}
+@container log-app (max-width: 440px) {
+  .log-center-toolbar .dwrt-kit-table-title > span { display:none; }
+  .log-center-toolbar-actions { width:100%; }
+  .log-center-pagination { font-size:11px; }
+  .log-center-pagination > span { width:100%; }
+  .log-center-page-buttons { margin-left:auto; }
 }
 
-@media (max-width: 600px) {
-  .log-center-table-card.is-audit-mode .log-center-table-scroll {
-    overflow-x: hidden;
-  }
+.log-filter-summary { display:contents; }
+.log-filter-summary button { max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; padding:5px 8px; color:var(--dwrt-ink); background:var(--dwrt-glass-surface); border:1px solid var(--dwrt-glass-edge); border-radius:var(--app-radius-compact); font:inherit; font-size:12px; }
 
-  .log-center-table-card.is-audit-mode .log-center-table {
-    width: 100%;
-    min-width: 0;
-  }
-
-  .log-center-table-card.is-audit-mode .log-center-table thead {
-    position: absolute;
-    width: 1px;
-    height: 1px;
-    overflow: hidden;
-    clip: rect(0 0 0 0);
-    white-space: nowrap;
-  }
-
-  .log-center-table-card.is-audit-mode .log-center-table tbody,
-  .log-center-table-card.is-audit-mode .log-center-table tr,
-  .log-center-table-card.is-audit-mode .log-center-table td {
-    display: block;
-    width: 100%;
-  }
-
-  .log-center-table-card.is-audit-mode .log-audit-row {
-    position: relative;
-    display: grid;
-    grid-template-columns: minmax(0, 1fr) auto;
-    gap: 7px 12px;
-    padding: 14px 12px;
-    border-bottom: 1px solid rgba(255,255,255,0.10);
-  }
-
-  .log-center-table-card.is-audit-mode .log-audit-row td {
-    min-width: 0;
-    padding: 0;
-    border: 0;
-  }
-
-  .log-center-table-card.is-audit-mode .log-table-select-cell {
-    position: absolute;
-    top: 12px;
-    right: 10px;
-    width: 20px;
-  }
-
-  .log-center-table-card.is-audit-mode .log-audit-row td:nth-child(2) {
-    grid-column: 2;
-    grid-row: 1;
-    padding-right: 28px;
-  }
-
-  .log-center-table-card.is-audit-mode .log-audit-row td:nth-child(3) {
-    grid-column: 1;
-    grid-row: 1;
-  }
-
-  .log-center-table-card.is-audit-mode .log-audit-row td:nth-child(4) {
-    grid-column: 1 / -1;
-    grid-row: 2;
-  }
-
-  .log-center-table-card.is-audit-mode .log-audit-row td:nth-child(5) {
-    grid-column: 1;
-    grid-row: 3;
-  }
-
-  .log-center-table-card.is-audit-mode .log-audit-row td:nth-child(6) {
-    grid-column: 2;
-    grid-row: 3;
-    align-self: center;
-    font-size: 11px;
-  }
-
-  .log-center-table-card.is-audit-mode .log-center-toolbar,
-  .log-center-table-card.is-audit-mode .log-center-toolbar-actions,
-  .log-center-pagination {
-    flex-wrap: wrap;
-  }
-
-  .log-center-table-card.is-audit-mode .log-center-toolbar-actions {
-    width: 100%;
-  }
-
-  .log-audit-primary-detail dl div,
-  .log-detail-section dl div {
-    grid-template-columns: minmax(82px, 0.6fr) minmax(0, 1fr);
-  }
-}
+.log-center-table-card.has-ai-result { grid-template-rows:auto auto minmax(0,1fr) auto; }

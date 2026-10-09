@@ -36,6 +36,7 @@ int apd_db_identity_get(struct apd_node_identity *out);
 EVP_PKEY *apd_identity_key_open(void);
 #else
 #include "apd_internal.h"
+#include "apd_bootstrap_write.h"
 #include <arpa/inet.h>
 #include <limits.h>
 #include <openssl/bn.h>
@@ -43,6 +44,9 @@ EVP_PKEY *apd_identity_key_open(void);
 #include <openssl/x509_vfy.h>
 #include <openssl/x509v3.h>
 #endif
+
+#include <json-c/json.h>
+#include "apd_bootstrap_write.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -197,8 +201,25 @@ static int apd_credentials_path(char *out, size_t out_size,
 const char *apd_credentials_pki_dir(void)
 {
     const char *configured = getenv("DREAMINGWRT_APD_PKI_DIR");
-
-    return configured && configured[0] ? configured : APD_CREDENTIALS_PKI_DIR;
+    const char *root = configured && configured[0] ? configured : APD_CREDENTIALS_PKI_DIR;
+    static _Thread_local char selected[PATH_MAX];
+    char path[PATH_MAX], marker[37] = {0};
+    struct stat st;
+    int fd;
+    if (snprintf(path, sizeof(path), "%s/active.rotation", root) >= (int)sizeof(path)) return "/invalid-apd-pki";
+    fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0) return errno == ENOENT ? root : "/invalid-apd-pki";
+    if (fstat(fd, &st) || !S_ISREG(st.st_mode) || st.st_uid != geteuid() ||
+        (st.st_mode & 0777) != 0600 || st.st_nlink != 1 || st.st_size != 36 || read(fd, marker, 36) != 36) {
+        close(fd); return "/invalid-apd-pki";
+    }
+    close(fd);
+    for (int i = 0; i < 36; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) { if (marker[i] != '-') return "/invalid-apd-pki"; }
+        else if (!((marker[i] >= '0' && marker[i] <= '9') || (marker[i] >= 'a' && marker[i] <= 'f'))) return "/invalid-apd-pki";
+    }
+    if (snprintf(selected, sizeof(selected), "%s/rotation-%s", root, marker) >= (int)sizeof(selected)) return "/invalid-apd-pki";
+    return selected;
 }
 
 void apd_credentials_bootstrap_cleanse(struct apd_bootstrap_config *config)
@@ -927,6 +948,56 @@ int apd_credentials_bootstrap_load(struct apd_bootstrap_config *out)
     if (apd_credentials_lock_open(&lock) != 0)
         return -1;
     rc = apd_credentials_bootstrap_load_locked(&lock, out);
+    apd_credentials_lock_close(&lock);
+    return rc;
+}
+
+int apd_credentials_bootstrap_store(const struct apd_bootstrap_config *config)
+{
+    struct apd_credentials_lock lock;
+    struct json_object *root = NULL;
+    char path[PATH_MAX];
+    int rc = -1;
+
+    if (!config || !config->controller_host[0] || !config->token_id[0] ||
+        !config->token[0])
+        return -1;
+    if (apd_credentials_lock_open(&lock) != 0)
+        return -1;
+    if (apd_credentials_path(path, sizeof(path), lock.directory,
+                             APD_CREDENTIALS_BOOTSTRAP_FILE) != 0)
+        goto done;
+    if (mkdir(lock.directory, 0700) != 0 && errno != EEXIST)
+        goto done;
+
+    root = json_object_new_object();
+    if (!root)
+        goto done;
+    json_object_object_add(root, "version", json_object_new_int(config->version > 0 ? config->version : 1));
+    json_object_object_add(root, "controller_host",
+                           json_object_new_string(config->controller_host));
+    json_object_object_add(root, "controller_port",
+                           json_object_new_int(config->controller_port));
+    if (config->controller_id_present && config->controller_id[0])
+        json_object_object_add(root, "controller_id",
+                               json_object_new_string(config->controller_id));
+    json_object_object_add(root, "token_id",
+                           json_object_new_string(config->token_id));
+    json_object_object_add(root, "token",
+                           json_object_new_string(config->token));
+    json_object_object_add(root, "site_id",
+                           json_object_new_string(config->site_id[0] ?
+                                                  config->site_id : "default"));
+    json_object_object_add(root, "hardware_digest",
+                           json_object_new_string(config->hardware_digest));
+    json_object_object_add(root, "ca_cert_pem_path",
+                           json_object_new_string(config->ca_cert_pem_path[0] ?
+                                                  config->ca_cert_pem_path :
+                                                  "/etc/dreamingwrt/apd-pki/controller-ca.pem"));
+
+    rc = apd_bootstrap_write_json(root, path);
+done:
+    json_object_put(root);
     apd_credentials_lock_close(&lock);
     return rc;
 }
@@ -1840,4 +1911,89 @@ int apd_credentials_unpair(struct apd_credentials_unpair_report *out)
 done:
     apd_credentials_lock_close(&lock);
     return rc;
+}
+
+/* The node's private key remains in its original local identity keystore.
+ * Rotation slots contain only validated public material. The active marker is
+ * committed last, making interrupted preparation invisible at next startup. */
+int apd_credentials_rotation_install(const char *task_id, const char *certificate_id,
+    const unsigned char *der, size_t der_len, const char *trust_pem, size_t trust_len)
+{
+    struct apd_credentials_lock lock;
+    struct apd_enrollment_metadata current, candidate;
+    const char *configured = getenv("DREAMINGWRT_APD_PKI_DIR");
+    const char *root = configured && configured[0] ? configured : APD_CREDENTIALS_PKI_DIR;
+    char slot[PATH_MAX], ca_path[PATH_MAX], previous[37] = "base";
+    unsigned char encoded[APD_CREDENTIALS_JSON_MAX]; size_t encoded_len = 0;
+    struct stat st;
+    int rc = -1;
+    memset(&current, 0, sizeof(current)); memset(&candidate, 0, sizeof(candidate));
+    if (!apd_credentials_uuid(task_id) || !apd_credentials_uuid(certificate_id) ||
+        !trust_pem || !trust_len || trust_len > APD_CREDENTIALS_CERT_MAX ||
+        !der || !der_len || der_len > APD_CREDENTIALS_CERT_MAX ||
+        apd_credentials_lock_open(&lock)) return -1;
+    if (apd_credentials_validate_locked(&lock, &current) || strcmp(current.state, "adopted") ||
+        lstat(root, &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0777) != 0700 ||
+        snprintf(slot, sizeof(slot), "%s/rotation-%s", root, task_id) >= (int)sizeof(slot) ||
+        snprintf(ca_path, sizeof(ca_path), "%s/%s", slot, APD_CREDENTIALS_CA_FILE) >= (int)sizeof(ca_path)) goto done;
+    if (!strcmp(current.certificate_id, certificate_id)) { rc = 0; goto done; }
+    if (mkdir(slot, 0700) && errno != EEXIST) goto done;
+    if (lstat(slot, &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() || (st.st_mode & 0777) != 0700) goto done;
+    if (apd_credentials_atomic_write(slot, APD_CREDENTIALS_CA_FILE, (const unsigned char *)trust_pem, trust_len)) goto done;
+    candidate = current;
+    if (apd_credentials_certificate_validate(der, der_len, ca_path, &candidate) ||
+        strcmp(candidate.ap_id, current.ap_id)) goto done;
+    snprintf(candidate.certificate_id, sizeof(candidate.certificate_id), "%s", certificate_id);
+    if (apd_credentials_metadata_encode(&candidate, encoded, sizeof(encoded), &encoded_len) ||
+        apd_credentials_atomic_write(slot, APD_CREDENTIALS_CERT_FILE, der, der_len) ||
+        apd_credentials_atomic_write(slot, APD_CREDENTIALS_METADATA_FILE, encoded, encoded_len) ||
+        apd_credentials_parent_sync(slot)) goto done;
+#ifdef APD_CREDENTIALS_TEST_STANDALONE
+    if (getenv("APD_CREDENTIALS_TEST_ROTATION_INTERRUPT")) goto done;
+#endif
+    if (strncmp(lock.directory, root, strlen(root)) == 0 &&
+        !strncmp(lock.directory + strlen(root), "/rotation-", 10))
+        snprintf(previous, sizeof(previous), "%s", lock.directory + strlen(root) + 10);
+    if (apd_credentials_atomic_write(root, "previous.rotation", (const unsigned char *)previous, strlen(previous)) ||
+        apd_credentials_atomic_write(root, "active.rotation", (const unsigned char *)task_id, 36)) goto done;
+    rc = 0;
+done:
+    apd_credentials_lock_close(&lock);
+    OPENSSL_cleanse(encoded, sizeof(encoded));
+    apd_credentials_metadata_cleanse(&current); apd_credentials_metadata_cleanse(&candidate);
+    return rc;
+}
+
+int apd_credentials_rotation_trust_commit(const char *trust_pem, size_t length)
+{
+    struct apd_credentials_lock lock;
+    struct apd_enrollment_metadata current, verified;
+    unsigned char *der = NULL; size_t der_len = 0;
+    char path[PATH_MAX], pending[PATH_MAX];
+    int rc = -1;
+    if (!trust_pem || !length || length > APD_CREDENTIALS_CERT_MAX || apd_credentials_lock_open(&lock)) return -1;
+    if (apd_credentials_validate_locked(&lock, &current) ||
+        apd_credentials_path(path, sizeof(path), lock.directory, APD_CREDENTIALS_CERT_FILE) ||
+        apd_credentials_read_binary_secure(path, APD_CREDENTIALS_CERT_MAX, &der, &der_len) ||
+        apd_credentials_path(pending, sizeof(pending), lock.directory, "trust-next.pem") ||
+        apd_credentials_atomic_write(lock.directory, "trust-next.pem", (const unsigned char *)trust_pem, length)) goto done;
+    verified = current;
+    if (apd_credentials_certificate_validate(der, der_len, pending, &verified) ||
+        strcmp(current.ca_fingerprint, verified.ca_fingerprint) ||
+        apd_credentials_atomic_write(lock.directory, APD_CREDENTIALS_CA_FILE, (const unsigned char *)trust_pem, length)) goto done;
+    if (unlink(pending) || apd_credentials_parent_sync(lock.directory)) goto done;
+    rc = 0;
+done:
+    free(der); apd_credentials_lock_close(&lock); return rc;
+}
+
+int apd_credentials_trust_fingerprint(unsigned char out[32])
+{
+    struct apd_enrollment_metadata metadata;
+    unsigned char *pem = NULL; size_t length = 0;
+    int rc = -1;
+    if (apd_credentials_validate_startup(&metadata) ||
+        apd_credentials_read_secure(metadata.ca_cert_pem_path, APD_CREDENTIALS_CERT_MAX, &pem, &length)) return -1;
+    if (SHA256(pem, length, out)) rc = 0;
+    free(pem); apd_credentials_metadata_cleanse(&metadata); return rc;
 }

@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 /* DreamingWrt SQLite control-plane database, phase 1: client identity. */
 #include "jmx_db.h"
+#include "jmx_metrics_store.h"
 #include "jmx_huginn.h"
 #include "jmx_dhcp_sniff.h"
 #include "jmx_network.h"
@@ -29,11 +30,16 @@
 #include "jmx_signature_db.h"
 #include "jmx_storage_guard.h"
 #include "jmx_system_data_path.h"
+#include "jmx_observability.h"
+#include "dw_api_ac_stations.h"
 
 extern struct list_head client_list;
 
 static sqlite3 *g_db = NULL;
-static const char *g_db_path = JMX_DB_PATH_DEFAULT;
+/* Worker-local read handle.  Read-only worker paths must not borrow the
+ * uloop-owned connection or traverse runtime client state. */
+static __thread sqlite3 *g_db_worker;
+static __thread int g_db_worker_mode;
 static int g_fingerprint_catalog_changed = 0;
 
 #define FINGERPRINT_CATALOG_VERSION 4
@@ -57,8 +63,9 @@ static int db_exec(const char *sql)
 {
     char *err = NULL;
     int rc;
-    if (!g_db) return -1;
-    rc = sqlite3_exec(g_db, sql, NULL, NULL, &err);
+    sqlite3 *db = g_db_worker ? g_db_worker : g_db;
+    if (!db) return -1;
+    rc = sqlite3_exec(db, sql, NULL, NULL, &err);
     if (rc != SQLITE_OK) {
         LOG_ERROR("sqlite exec failed rc=%d err=%s sql=%s\n", rc, err ? err : "", sql ? sql : "");
         sqlite3_free(err);
@@ -1046,7 +1053,7 @@ static int db_value_is_oui_only_signal(const char *key, const char *source)
  * as it would for a missing file. The platform has no SVG rasteriser, so it
  * needs to know the format before fetching rather than after failing.
  *
- * Fingerprint rows are always PNG (all 33986 web_image/best_image values are
+ * Fingerprint rows are always PNG (all 33988 web_image/best_image values are
  * generated as .../<engine>/<id>/257x257.png), so only user uploads can be
  * vector: webd accepts png/jpeg/webp/gif/svg+xml.
  */
@@ -1591,9 +1598,11 @@ static void db_normalize_catalog_image(char *out, size_t out_len, const char *im
 
 static int db_prepare(sqlite3_stmt **st, const char *sql)
 {
-    int rc = sqlite3_prepare_v2(g_db, sql, -1, st, NULL);
+    sqlite3 *db = g_db_worker ? g_db_worker : g_db;
+    int rc = sqlite3_prepare_v2(db, sql, -1, st, NULL);
     if (rc != SQLITE_OK) {
-        LOG_ERROR("sqlite prepare failed rc=%d err=%s sql=%s\n", rc, sqlite3_errmsg(g_db), sql);
+        LOG_ERROR("sqlite prepare failed rc=%d err=%s sql=%s\n", rc,
+                  db ? sqlite3_errmsg(db) : "no handle", sql);
         return -1;
     }
     return 0;
@@ -1601,9 +1610,11 @@ static int db_prepare(sqlite3_stmt **st, const char *sql)
 
 static int db_step_done(sqlite3_stmt *st)
 {
+    sqlite3 *db = g_db_worker ? g_db_worker : g_db;
     int rc = sqlite3_step(st);
     if (rc != SQLITE_DONE) {
-        LOG_ERROR("sqlite step failed rc=%d err=%s\n", rc, sqlite3_errmsg(g_db));
+        LOG_ERROR("sqlite step failed rc=%d err=%s\n", rc,
+                  db ? sqlite3_errmsg(db) : "no handle");
         return -1;
     }
     return 0;
@@ -1968,6 +1979,35 @@ static void db_json_add_signal(struct json_object *arr, const char *source, cons
     json_object_array_add(arr, o);
 }
 
+/* Each operation leases the verified identity snapshot. All signals/clients
+ * in that operation share it; the next lease rechecks authority and keys. */
+struct db_signature_read_session {
+    sqlite3 *db;
+    int attempted;
+};
+
+static sqlite3 *db_signature_read_get(struct db_signature_read_session *session)
+{
+    if (!session->attempted) {
+        char path[512];
+        session->attempted = 1;
+        if (db_signature_db_path(path, sizeof(path)) == 0 &&
+            jmx_signature_db_acquire_path(path, &session->db) != SQLITE_OK) {
+            session->db = NULL;
+        }
+    }
+    return session->db;
+}
+
+static void db_signature_read_close(struct db_signature_read_session *session)
+{
+    if (session->db)
+        jmx_signature_db_release_path(session->db);
+    session->db = NULL;
+}
+
+static int db_apply_identity_aggregator_with_signature(
+    const char *mac, struct db_signature_read_session *signature);
 static int db_apply_identity_aggregator(const char *mac);
 
 static int db_insert_candidate(const char *mac, int engine, int device_id, const char *device_name, const char *vendor_name, const char *source, int score, struct json_object *evidence)
@@ -1977,6 +2017,15 @@ static int db_insert_candidate(const char *mac, int engine, int device_id, const
     const char *ej = evidence ? json_object_to_json_string(evidence) : "[]";
     /* Keep only latest 3 candidates per mac (prevent unbounded growth) */
     (void)mac; (void)engine; (void)device_id; (void)device_name; (void)vendor_name; (void)source; (void)score; (void)ej; (void)ts; return 0; /* candidates removed */
+}
+
+
+static int db_apply_identity_aggregator(const char *mac)
+{
+    struct db_signature_read_session signature = {0};
+    int rc = db_apply_identity_aggregator_with_signature(mac, &signature);
+    db_signature_read_close(&signature);
+    return rc;
 }
 
 static const char *db_type_from_vendor(const char *vendor)
@@ -2329,12 +2378,14 @@ static void db_refresh_all_client_fingerprints(void)
 {
     sqlite3_stmt *st = NULL;
     int count = 0;
+    struct db_signature_read_session signature = {0};
     if (db_prepare(&st, "SELECT mac FROM clients ORDER BY last_seen DESC LIMIT 512") != 0) return;
     while (sqlite3_step(st) == SQLITE_ROW) {
         const char *mac = (const char *)sqlite3_column_text(st, 0);
-        if (mac && mac[0] && db_apply_identity_aggregator(mac) == 0) count++;
+        if (mac && mac[0] && db_apply_identity_aggregator_with_signature(mac, &signature) == 0) count++;
     }
     sqlite3_finalize(st);
+    db_signature_read_close(&signature);
     LOG_INFO("refreshed %d client fingerprints after catalog update\n", count);
 }
 
@@ -2354,6 +2405,8 @@ void db_startup_sig_match(void)
 {
     /* One-time signature DB model matching at startup */
     sqlite3_stmt *st = NULL;
+    sqlite3 *sdb = NULL;
+    sqlite3_stmt *rst = NULL;
     char signature_path[512];
     int matched = 0;
     if (db_signature_db_path(signature_path, sizeof(signature_path)) != 0)
@@ -2370,24 +2423,27 @@ void db_startup_sig_match(void)
         const char *match_name = hn && hn[0] ? hn : (dn && dn[0] ? dn : NULL);
         if (!match_name || !match_name[0]) continue;
 
-        sqlite3 *sdb = NULL;
-        sqlite3_stmt *rst = NULL;
-        if (sqlite3_open_v2(signature_path, &sdb, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) continue;
-        if (sqlite3_prepare_v2(sdb,
-            "SELECT COALESCE(v.name,''), COALESCE(t.name,''), r.model, r.pattern, r.confidence "
-            "FROM device_fingerprint_rule r "
-            "LEFT JOIN device_vendor v ON v.vendor_id=r.vendor_id "
-            "LEFT JOIN device_type t ON t.type_id=r.type_id "
-            "WHERE r.enabled=1 AND r.match_type='hostname' AND ( "
-            "  (?1 = r.pattern) OR "
-            "  (?1 LIKE r.pattern||'%') OR "
-            "  (length(r.pattern) >= 4 AND ?1 LIKE '%'||r.pattern||'%') "
-            ") "
-            "ORDER BY r.confidence DESC, length(r.pattern) DESC LIMIT 1",
-            -1, &rst, NULL) != SQLITE_OK) {
-            sqlite3_close(sdb);
-            continue;
+        /* A sealed corpus decrypts the whole database on open. Keep one
+         * read snapshot for this batch instead of decrypting per client. */
+        if (!sdb) {
+            if (jmx_signature_db_acquire_path(signature_path, &sdb) != SQLITE_OK)
+                break;
+            if (sqlite3_prepare_v2(sdb,
+                "SELECT COALESCE(v.name,''), COALESCE(t.name,''), r.model, r.pattern, r.confidence "
+                "FROM device_fingerprint_rule r "
+                "LEFT JOIN device_vendor v ON v.vendor_id=r.vendor_id "
+                "LEFT JOIN device_type t ON t.type_id=r.type_id "
+                "WHERE r.enabled=1 AND r.match_type='hostname' AND ( "
+                "  (?1 = r.pattern) OR "
+                "  (?1 LIKE r.pattern||'%') OR "
+                "  (length(r.pattern) >= 4 AND ?1 LIKE '%'||r.pattern||'%') "
+                ") "
+                "ORDER BY r.confidence DESC, length(r.pattern) DESC LIMIT 1",
+                -1, &rst, NULL) != SQLITE_OK)
+                break;
         }
+        sqlite3_reset(rst);
+        sqlite3_clear_bindings(rst);
         sqlite3_bind_text(rst, 1, match_name, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(rst) == SQLITE_ROW) {
             const char *r_vendor = (const char *)sqlite3_column_text(rst, 0);
@@ -2435,16 +2491,17 @@ void db_startup_sig_match(void)
                     mac, match_name, r_model, mapped_type, r_conf);
             }
         }
-        sqlite3_finalize(rst);
-        sqlite3_close(sdb);
     }
+    sqlite3_finalize(rst);
+    if (sdb) jmx_signature_db_release_path(sdb);
     sqlite3_finalize(st);
     if (matched > 0) LOG_ERROR("startup_sig: matched %d clients\n", matched);
 }
 
 
 
-static int db_apply_identity_aggregator(const char *mac)
+static int db_apply_identity_aggregator_with_signature(
+    const char *mac, struct db_signature_read_session *signature)
 {
     /* Only reader of client_identity_overrides: a stored user correction wins
      * over detected fingerprint evidence. It is keyed by mac rather than
@@ -2550,8 +2607,9 @@ static int db_apply_identity_aggregator(const char *mac)
                         FILE *rt = fopen("/proc/net/route", "r");
                         if (rt) {
                             char rl[256];
-                            fgets(rl, sizeof(rl), rt); /* skip header */
-                            while (fgets(rl, sizeof(rl), rt)) {
+                            /* Skip the header; no header means no routes. */
+                            int rt_ready = fgets(rl, sizeof(rl), rt) != NULL;
+                            while (rt_ready && fgets(rl, sizeof(rl), rt)) {
                                 char iface[32], dest[16], gw[16];
                                 unsigned long gw_raw = 0;
                                 if (sscanf(rl, "%31s %15s %15s", iface, dest, gw) >= 3) {
@@ -2582,6 +2640,7 @@ static int db_apply_identity_aggregator(const char *mac)
         /* Signature DB model matching: match hostname/mdns model against fingerprint rules */
         {
             sqlite3_stmt *sig_st = NULL;
+            sqlite3_stmt *rule_st = NULL;
             /* Get hostname and mdns model signals */
             if (db_prepare(&sig_st, "SELECT key, value FROM client_identity_signals WHERE mac=?1 AND key IN ('hostname','dhcp_hostname','model','modelName','friendlyName','useragent','server') ORDER BY confidence DESC LIMIT 16") == 0) {
                 sqlite3_bind_text(sig_st, 1, mac, -1, SQLITE_TRANSIENT);
@@ -2596,12 +2655,9 @@ static int db_apply_identity_aggregator(const char *mac)
                     else if (!strcmp(sig_key, "server")) match_type = "user_agent";
 
                     /* Query signature DB for matching rules */
-                    sqlite3 *sdb = NULL;
-                    sqlite3_stmt *rule_st = NULL;
+                    sqlite3 *sdb = db_signature_read_get(signature);
                     LOG_ERROR("sig_match: key=%s val=%s type=%s\n", sig_key ? sig_key : "", sig_val ? sig_val : "", match_type ? match_type : "");
-                    char signature_path[512];
-                    if (db_signature_db_path(signature_path, sizeof(signature_path)) == 0 &&
-                        sqlite3_open_v2(signature_path, &sdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                    if (sdb) {
                         /* Use LIKE pattern matching for hostname, exact for user_agent */
                         const char *sql = "SELECT COALESCE(v.name,''), COALESCE(t.name,''), r.model, r.pattern, r.confidence "
                             "FROM device_fingerprint_rule r "
@@ -2614,7 +2670,12 @@ static int db_apply_identity_aggregator(const char *mac)
                             "  (length(r.pattern) >= 4 AND ?2 LIKE '%'||r.pattern||'%') "
                             ") "
                             "ORDER BY r.confidence DESC, length(r.pattern) DESC LIMIT 1";
-                        if (sqlite3_prepare_v2(sdb, sql, -1, &rule_st, NULL) == SQLITE_OK) {
+                        if (!rule_st &&
+                            sqlite3_prepare_v2(sdb, sql, -1, &rule_st, NULL) != SQLITE_OK)
+                            break;
+                        if (rule_st) {
+                            sqlite3_reset(rule_st);
+                            sqlite3_clear_bindings(rule_st);
                             sqlite3_bind_text(rule_st, 1, match_type, -1, SQLITE_TRANSIENT);
                             sqlite3_bind_text(rule_st, 2, sig_val, -1, SQLITE_TRANSIENT);
                             if (sqlite3_step(rule_st) == SQLITE_ROW) {
@@ -2646,11 +2707,10 @@ static int db_apply_identity_aggregator(const char *mac)
                                     if ((int)r_conf > score) score = (int)r_conf;
                                 }
                             }
-                            sqlite3_finalize(rule_st);
                         }
-                        sqlite3_close(sdb);
                     }
                 }
+                sqlite3_finalize(rule_st);
                 sqlite3_finalize(sig_st);
             }
         }
@@ -2957,9 +3017,9 @@ int jmx_db_init(void)
 
     if (g_db) return 0;
     db_mkdirs();
-    rc = sqlite3_open(g_db_path, &g_db);
+    rc = sqlite3_open(jmx_dataset_path("core"), &g_db);
     if (rc != SQLITE_OK) {
-        LOG_ERROR("open db failed path=%s err=%s\n", g_db_path, g_db ? sqlite3_errmsg(g_db) : "oom");
+        LOG_ERROR("open db failed path=%s err=%s\n", jmx_dataset_path("core"), g_db ? sqlite3_errmsg(g_db) : "oom");
         if (g_db) sqlite3_close(g_db);
         g_db = NULL;
         return -1;
@@ -3251,6 +3311,11 @@ int jmx_db_init(void)
     }
 
     /* Load fingerprint rules from signature database */
+    jmx_metrics_store_set_legacy_db(g_db);
+    if (jmx_obs_event_store_init(g_db) != 0) {
+        LOG_ERROR("structured observability event store initialization failed\n");
+        goto failed;
+    }
     db_try_import_fingerprint_catalog();
     if (g_fingerprint_catalog_changed)
         db_refresh_all_client_fingerprints();
@@ -3268,6 +3333,8 @@ failed:
 
 void jmx_db_close(void)
 {
+    jmx_signature_db_cache_clear();
+    jmx_metrics_store_set_legacy_db(NULL);
     if (g_db) sqlite3_close(g_db);
     g_db = NULL;
 }
@@ -3278,34 +3345,8 @@ void jmx_db_write_activity_sample(const char *wan_id, int64_t up_rate, int64_t d
                                    int connections, double latency_avg,
                                    double latency_min, double latency_max)
 {
-    int64_t now;
-    sqlite3_stmt *st = NULL;
-    if (!wan_id || !wan_id[0]) return;
-    if (!jmx_storage_guard_allow("/", JMX_STORAGE_WRITE_BULK, NULL)) return;
-    if (jmx_db_init() != 0) return;
-
-    now = now_s();
-    /* round to 10-second buckets for uniform sampling */
-    now = (now / 10) * 10;
-
-    if (db_prepare(&st,
-        "INSERT INTO dashboard_activity_sample(ts,wan_id,up_rate,down_rate,connections,latency_avg,latency_min,latency_max) "
-        "VALUES(?1,?2,?3,?4,?5,?6,?7,?8) "
-        "ON CONFLICT(ts,wan_id) DO UPDATE SET "
-        "up_rate=excluded.up_rate,down_rate=excluded.down_rate,"
-        "connections=excluded.connections,latency_avg=excluded.latency_avg,"
-        "latency_min=excluded.latency_min,latency_max=excluded.latency_max") == 0) {
-        sqlite3_bind_int64(st, 1, now);
-        sqlite3_bind_text(st, 2, wan_id, -1, SQLITE_TRANSIENT);
-        sqlite3_bind_int64(st, 3, up_rate);
-        sqlite3_bind_int64(st, 4, down_rate);
-        sqlite3_bind_int(st, 5, connections);
-        sqlite3_bind_double(st, 6, latency_avg);
-        sqlite3_bind_double(st, 7, latency_min);
-        sqlite3_bind_double(st, 8, latency_max);
-        db_step_done(st);
-        sqlite3_finalize(st);
-    }
+    jmx_metrics_record_sample(wan_id, up_rate, down_rate, connections,
+                              latency_avg, latency_min, latency_max);
 }
 
 int jmx_db_prune_activity_samples(int64_t max_age_sec)
@@ -4276,6 +4317,7 @@ int jmx_db_sync_clients_from_memory(void)
 {
     client_node_t *c = NULL;
     int count = 0;
+    struct db_signature_read_session signature = {0};
     if (!jmx_storage_guard_allow("/", JMX_STORAGE_WRITE_BULK, NULL))
         return 0;
     if (jmx_db_init() != 0) return -1;
@@ -4320,23 +4362,24 @@ int jmx_db_sync_clients_from_memory(void)
         if (osn && osn[0]) db_upsert_identity_signal(mac, "hostname-pattern", "os_name", osn, 55, "", now_s());
         /* Signature DB model matching: match hostname against fingerprint rules */
         {
+            char stored_hostname[256] = "";
             const char *hn = c->hostname[0] ? c->hostname : NULL;
             if (!hn) {
                 sqlite3_stmt *hn_st = NULL;
                 if (g_db && sqlite3_prepare_v2(g_db, "SELECT hostname FROM clients WHERE mac=?1 LIMIT 1", -1, &hn_st, NULL) == SQLITE_OK) {
                     sqlite3_bind_text(hn_st, 1, mac, -1, SQLITE_TRANSIENT);
                     if (sqlite3_step(hn_st) == SQLITE_ROW) {
-                        hn = (const char *)sqlite3_column_text(hn_st, 0);
+                        const char *value = (const char *)sqlite3_column_text(hn_st, 0);
+                        snprintf(stored_hostname, sizeof(stored_hostname), "%s", value ? value : "");
+                        hn = stored_hostname;
                     }
                     sqlite3_finalize(hn_st);
                 }
             }
             if (hn && hn[0]) {
-                sqlite3 *sdb = NULL;
+                sqlite3 *sdb = db_signature_read_get(&signature);
                 sqlite3_stmt *rst = NULL;
-                char signature_path[512];
-                if (db_signature_db_path(signature_path, sizeof(signature_path)) == 0 &&
-                    sqlite3_open_v2(signature_path, &sdb, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+                if (sdb) {
                     if (sqlite3_prepare_v2(sdb,
                         "SELECT COALESCE(v.name,''), COALESCE(t.name,''), r.model, r.pattern, r.confidence "
                         "FROM device_fingerprint_rule r "
@@ -4380,7 +4423,6 @@ int jmx_db_sync_clients_from_memory(void)
                         }
                         sqlite3_finalize(rst);
                     }
-                    sqlite3_close(sdb);
                 }
             }
         }
@@ -4468,9 +4510,10 @@ int jmx_db_sync_clients_from_memory(void)
         json_object_object_add(ns, "online", json_object_new_int(c->online));
         db_upsert_network_state(cid, ns);
         json_object_put(ns);
-        db_apply_identity_aggregator(mac);
+        db_apply_identity_aggregator_with_signature(mac, &signature);
         count++;
     }
+    db_signature_read_close(&signature);
     if (db_commit() != 0) { db_rollback(); return -1; }
     return count;
 }
@@ -4602,7 +4645,9 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
     int conn_v4 = 0;
     int conn_v6 = 0;
 
-    runtime = db_find_runtime_client((const char *)sqlite3_column_text(st, 1));
+    /* Runtime client nodes and bridge/conntrack enrichment belong to uloop. */
+    if (!g_db_worker_mode)
+        runtime = db_find_runtime_client((const char *)sqlite3_column_text(st, 1));
     if (runtime) {
         /* Count both families in one conntrack pass. The old call counted only
          * the IPv4 literal, so a dual-stack client's IPv6 connections were
@@ -4674,7 +4719,7 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
      * that field is only refreshed by the legacy scheduler, which is disabled on
      * current deployments, so it would stay -1 and silently switch off the
      * ghost-client cross-check. */
-    evidence.bridge_fdb_present =
+    evidence.bridge_fdb_present = g_db_worker_mode ? -1 :
         client_bridge_fdb_present((const char *)sqlite3_column_text(st, 1));
     if (evidence.bridge_fdb_present < 0 && runtime)
         evidence.bridge_fdb_present = runtime->bridge_fdb_present;
@@ -5115,6 +5160,324 @@ static struct json_object *db_row_to_client(sqlite3_stmt *st)
     return o;
 }
 
+/*
+ * Serialize one durable client row on a read worker.
+ *
+ * Keep this separate from db_row_to_client(): the normal serializer is allowed
+ * to enrich from uloop-owned client_list state, conntrack and the bridge FDB.
+ * A worker only owns its SQLite statement, so every value below comes from that
+ * row or from a pure text/JSON helper.
+ */
+static struct json_object *db_row_to_client_worker_compact(sqlite3_stmt *st,
+                                                            struct json_object *req)
+{
+    struct json_object *o = json_object_new_object();
+    struct json_object *fp = json_object_new_object();
+    struct json_object *override_fields = json_object_new_array();
+    struct jmx_db_client_evidence evidence;
+    struct jmx_db_client_verdict verdict;
+    const char *mac = (const char *)sqlite3_column_text(st, 1);
+    const char *hostname = (const char *)sqlite3_column_text(st, 2);
+    const char *display_name = (const char *)sqlite3_column_text(st, 3);
+    const char *vendor = (const char *)sqlite3_column_text(st, 4);
+    const char *device_type = (const char *)sqlite3_column_text(st, 6);
+    const char *custom_name = (const char *)sqlite3_column_text(st, 11);
+    const char *custom_icon = (const char *)sqlite3_column_text(st, 12);
+    const char *custom_type = (const char *)sqlite3_column_text(st, 13);
+    const char *custom_vendor = (const char *)sqlite3_column_text(st, 14);
+    const char *raw_fp = (const char *)sqlite3_column_text(st, 39);
+    const char *fp_vendor = (const char *)sqlite3_column_text(st, 40);
+    const char *fp_type = (const char *)sqlite3_column_text(st, 41);
+    const char *fp_image = (const char *)sqlite3_column_text(st, 42);
+    const char *ipv6_json = (const char *)sqlite3_column_text(st, 46);
+    const char *resolved_name;
+    const char *name_source;
+    const char *resolved_vendor;
+    const char *resolved_type = "unknown";
+    const char *image;
+    const char *image_source;
+    char ip_buf[8192];
+    char link_type_buf[8192];
+    char model[256] = "";
+    char model_source[96] = "";
+    const char *stored_ip;
+    const char *ip;
+    const char *link_type;
+    int64_t now = now_s();
+    int64_t last_seen = sqlite3_column_int64(st, 10);
+    int64_t updated_at = sqlite3_column_int64(st, 47);
+    int64_t last_seen_age = last_seen > 0 && now >= last_seen ?
+                            now - last_seen : -1;
+    int64_t sample_age_ms = updated_at > 0 && now >= updated_at ?
+                            (now - updated_at) * 1000 : -1;
+    int randomized;
+    int unknown_link;
+    int include_evidence = json_i(req, "include_fingerprint_evidence", 0) != 0;
+
+    if (!o || !fp || !override_fields) {
+        if (o) json_object_put(o);
+        if (fp) json_object_put(fp);
+        if (override_fields) json_object_put(override_fields);
+        return NULL;
+    }
+
+    mac = mac ? mac : "";
+    hostname = hostname ? hostname : "";
+    display_name = display_name ? display_name : "";
+    vendor = vendor ? vendor : "";
+    device_type = device_type ? device_type : "";
+    custom_name = custom_name ? custom_name : "";
+    custom_icon = custom_icon ? custom_icon : "";
+    custom_type = custom_type ? custom_type : "";
+    custom_vendor = custom_vendor ? custom_vendor : "";
+    raw_fp = raw_fp ? raw_fp : "";
+    fp_vendor = fp_vendor ? fp_vendor : "";
+    fp_type = fp_type ? fp_type : "";
+    fp_image = fp_image ? fp_image : "";
+    ipv6_json = ipv6_json ? ipv6_json : "[]";
+
+    randomized = db_mac_is_locally_administered(mac);
+    stored_ip = db_sqlite_safe_text(st, 18, ip_buf, sizeof(ip_buf));
+    ip = db_ipv4_usable(stored_ip) ? stored_ip : "";
+    link_type = db_sqlite_safe_text(st, 22, link_type_buf,
+                                    sizeof(link_type_buf));
+    unknown_link = !link_type[0] || !strcmp(link_type, "unknown");
+
+    if (custom_name[0]) {
+        resolved_name = custom_name;
+        name_source = "custom_name";
+    } else if (display_name[0]) {
+        resolved_name = display_name;
+        name_source = "display_name";
+    } else if (hostname[0]) {
+        resolved_name = hostname;
+        name_source = "hostname";
+    } else {
+        resolved_name = mac;
+        name_source = "mac_fallback";
+    }
+    resolved_vendor = custom_vendor[0] ? custom_vendor :
+                      (fp_vendor[0] ? fp_vendor : vendor);
+    if (custom_type[0])
+        resolved_type = custom_type;
+    else if (fp_type[0] && strcmp(fp_type, "unknown"))
+        resolved_type = fp_type;
+    else if (device_type[0] && strcmp(device_type, "unknown"))
+        resolved_type = device_type;
+    else {
+        switch (sqlite3_column_int(st, 35)) {
+        case 1: resolved_type = "smartphone"; break;
+        case 2: resolved_type = "tablet"; break;
+        case 3: resolved_type = "computer"; break;
+        case 4: resolved_type = "tv"; break;
+        case 5: resolved_type = "nas"; break;
+        case 6: resolved_type = "router"; break;
+        case 7: resolved_type = "printer"; break;
+        case 8: resolved_type = "camera"; break;
+        case 9: resolved_type = "iot"; break;
+        case 10: resolved_type = "game_console"; break;
+        case 11: resolved_type = "hypervisor"; break;
+        default: break;
+        }
+    }
+    if (!strcmp(resolved_type, "unknown") && hostname[0]) {
+        const char *guessed = db_guess_type_from_hostname(hostname);
+
+        if (strcmp(guessed, "unknown"))
+            resolved_type = guessed;
+    }
+    db_signal_model_from_evidence(raw_fp, model, sizeof(model),
+                                  model_source, sizeof(model_source));
+    image = custom_icon[0] ? custom_icon : fp_image;
+    image_source = custom_icon[0] ? "override" :
+                   (fp_image[0] ? "fingerprint" : "none");
+
+    memset(&evidence, 0, sizeof(evidence));
+    evidence.db_online = sqlite3_column_int(st, 37) != 0;
+    evidence.tx_rate = sqlite3_column_int64(st, 25);
+    evidence.rx_rate = sqlite3_column_int64(st, 26);
+    evidence.connections = sqlite3_column_int(st, 29);
+    evidence.sample_age_ms = sample_age_ms;
+    evidence.last_seen_age = last_seen_age;
+    evidence.bridge_fdb_present = -1;
+    jmx_db_client_online_verdict(&evidence, &verdict);
+
+    add_col_text(o, "mac", st, 1);
+    json_object_object_add(o, "mac_randomized",
+                           json_object_new_boolean(randomized));
+    add_col_text(o, "hostname", st, 2);
+    add_col_text(o, "display_name", st, 3);
+    add_col_text(o, "custom_name", st, 11);
+    json_object_object_add(o, "name", json_object_new_string(resolved_name));
+    json_object_object_add(o, "name_source", json_object_new_string(name_source));
+    json_object_object_add(o, "name_fallback_rule", json_object_new_string(
+        "custom_name_then_display_name_then_hostname_then_mac"));
+    json_object_object_add(o, "name_is_placeholder",
+                           json_object_new_boolean(!strcmp(name_source,
+                                                            "mac_fallback")));
+    json_object_object_add(o, "vendor", json_object_new_string(resolved_vendor));
+    json_object_object_add(o, "vendor_name", json_object_new_string(resolved_vendor));
+    add_col_text(o, "oui", st, 5);
+    json_object_object_add(o, "type", json_object_new_string(resolved_type));
+    json_object_object_add(o, "type_reason", json_object_new_string(
+        !strcmp(resolved_type, "unknown") ?
+        (randomized ? "randomized_mac_no_oui_and_no_fingerprint_evidence" :
+                      "fingerprint_evidence_inconclusive") : ""));
+    json_object_object_add(o, "type_identifiable",
+                           json_object_new_boolean(!randomized));
+    json_object_object_add(o, "model", json_object_new_string(model));
+    json_object_object_add(o, "device_name", json_object_new_string(model));
+    json_object_object_add(o, "model_source", json_object_new_string(model_source));
+    add_col_text(o, "os_name", st, 7);
+    json_object_object_add(o, "first_seen",
+                           json_object_new_int64(sqlite3_column_int64(st, 9)));
+    json_object_object_add(o, "last_seen", json_object_new_int64(last_seen));
+    json_object_object_add(o, "last_seen_age", json_object_new_int64(last_seen_age));
+    add_col_text(o, "custom_icon", st, 12);
+    add_col_text(o, "custom_image_path", st, 12);
+    json_object_object_add(o, "pinned",
+                           json_object_new_boolean(sqlite3_column_int(st, 15) != 0));
+    json_object_object_add(o, "hidden",
+                           json_object_new_boolean(sqlite3_column_int(st, 16) != 0));
+    add_col_text(o, "note", st, 17);
+    json_object_object_add(o, "ip", json_object_new_string(ip));
+    json_object_object_add(o, "ipv4", json_object_new_string(ip));
+    json_object_object_add(o, "ipv4_available", json_object_new_boolean(ip[0]));
+    json_object_object_add(o, "ipv4_source", json_object_new_string(
+        ip[0] ? "client_network_state" : ""));
+    json_object_object_add(o, "ipv4_reason", json_object_new_string(
+        ip[0] ? "" : (strchr(ipv6_json, ':') ?
+        "ipv6_only_client_no_ipv4_address_observed" :
+        (verdict.online ? "no_ipv4_address_observed_for_mac" :
+                          "offline_no_ipv4_address_recorded"))));
+    json_object_object_add(o, "ipv4_stored_placeholder",
+                           json_object_new_boolean(stored_ip[0] && !ip[0]));
+    add_col_text(o, "interface", st, 19);
+    add_col_text(o, "network", st, 20);
+    add_col_text(o, "ssid", st, 21);
+    json_object_object_add(o, "link_type", json_object_new_string(link_type));
+    json_object_object_add(o, "link_type_reason", json_object_new_string(
+        unknown_link ? "no_persisted_attachment_evidence" : ""));
+    json_object_object_add(o, "is_wired", json_object_new_boolean(
+        !unknown_link && (!strcmp(link_type, "wired") ||
+                          !strcmp(link_type, "ethernet"))));
+    json_object_object_add(o, "is_wired_known",
+                           json_object_new_boolean(!unknown_link));
+    json_object_object_add(o, "is_wired_source", json_object_new_string(
+        unknown_link ? "undetermined_link_type" : "derived_from_link_type"));
+    add_col_text(o, "link_speed", st, 23);
+    add_col_text(o, "parent_mac", st, 43);
+    add_col_text(o, "parent_id", st, 44);
+    add_col_text(o, "port", st, 45);
+    db_add_ipv6_contract(o, ipv6_json, "", "", "", "");
+    json_object_object_add(o, "ipv6_source",
+                           json_object_new_string("client_network_state"));
+    json_object_object_add(o, "signal",
+                           json_object_new_int(sqlite3_column_int(st, 24)));
+    json_object_object_add(o, "tx_rate", json_object_new_int64(verdict.tx_rate));
+    json_object_object_add(o, "rx_rate", json_object_new_int64(verdict.rx_rate));
+    json_object_object_add(o, "up_rate", json_object_new_int64(verdict.tx_rate));
+    json_object_object_add(o, "down_rate", json_object_new_int64(verdict.rx_rate));
+    json_object_object_add(o, "tx_bytes",
+                           json_object_new_int64(sqlite3_column_int64(st, 27)));
+    json_object_object_add(o, "rx_bytes",
+                           json_object_new_int64(sqlite3_column_int64(st, 28)));
+    json_object_object_add(o, "bytes_window", json_object_new_string("today"));
+    json_object_object_add(o, "bytes_source",
+                           json_object_new_string("client_network_state"));
+    json_object_object_add(o, "bytes_reset_at",
+                           json_object_new_string("local_midnight"));
+    json_object_object_add(o, "bytes_estimated", json_object_new_boolean(1));
+    json_object_object_add(o, "connections",
+                           json_object_new_int(verdict.connections));
+    json_object_object_add(o, "connections_source",
+                           json_object_new_string("client_network_state"));
+    json_object_object_add(o, "connections_exact", json_object_new_boolean(0));
+    json_object_object_add(o, "connections_by_family_available",
+                           json_object_new_boolean(0));
+    json_object_object_add(o, "ipv4_connections", json_object_new_int(0));
+    json_object_object_add(o, "ipv6_connections", json_object_new_int(0));
+    json_object_object_add(o, "ipv6_connections_supported",
+                           json_object_new_boolean(0));
+    json_object_object_add(o, "ipv6_connections_reason",
+                           json_object_new_string("runtime_conntrack_not_sampled"));
+    json_object_object_add(o, "online", json_object_new_boolean(verdict.online));
+    json_object_object_add(o, "updated_at", json_object_new_int64(updated_at));
+    json_object_object_add(o, "sample_age_ms", json_object_new_int64(sample_age_ms));
+    json_object_object_add(o, "sample_valid",
+                           json_object_new_boolean(verdict.sample_valid));
+    json_object_object_add(o, "rate_source",
+                           json_object_new_string("client_network_state"));
+    json_object_object_add(o, "online_source", json_object_new_string(
+        verdict.online_source ? verdict.online_source : ""));
+    json_object_object_add(o, "online_duration_source",
+                           json_object_new_string("runtime_enrichment_not_sampled"));
+    json_object_object_add(o, "bridge_fdb_present", NULL);
+    json_object_object_add(o, "bridge_fdb_reason",
+                           json_object_new_string("runtime_enrichment_not_sampled"));
+    json_object_object_add(o, "zero_reason", json_object_new_string(
+        verdict.zero_reason ? verdict.zero_reason : ""));
+
+    json_object_object_add(fp, "engine",
+                           json_object_new_int(sqlite3_column_int(st, 30)));
+    json_object_object_add(fp, "device_id",
+                           json_object_new_int(sqlite3_column_int(st, 31)));
+    json_object_object_add(fp, "vendor_id",
+                           json_object_new_int(sqlite3_column_int(st, 32)));
+    json_object_object_add(fp, "os_class",
+                           json_object_new_int(sqlite3_column_int(st, 33)));
+    json_object_object_add(fp, "dev_cat",
+                           json_object_new_int(sqlite3_column_int(st, 35)));
+    json_object_object_add(fp, "confidence",
+                           json_object_new_double(sqlite3_column_double(st, 36)));
+    add_col_text(fp, "source", st, 38);
+    if (include_evidence)
+        add_col_text(fp, "raw_json", st, 39);
+    else
+        json_object_object_add(fp, "raw_json", json_object_new_string(""));
+    json_object_object_add(fp, "raw_json_omitted",
+                           json_object_new_boolean(!include_evidence));
+    json_object_object_add(fp, "device_type", json_object_new_string(resolved_type));
+    json_object_object_add(fp, "vendor_name", json_object_new_string(resolved_vendor));
+    json_object_object_add(fp, "device_name", json_object_new_string(model));
+    json_object_object_add(fp, "model_source", json_object_new_string(model_source));
+    json_object_object_add(fp, "image", json_object_new_string(fp_image));
+    json_object_object_add(fp, "effective_image", json_object_new_string(image));
+    json_object_object_add(o, "fingerprint", fp);
+    json_object_object_add(o, "detected_image", json_object_new_string(fp_image));
+    json_object_object_add(o, "image", json_object_new_string(image));
+    json_object_object_add(o, "image_url", json_object_new_string(image));
+    json_object_object_add(o, "effective_image", json_object_new_string(image));
+    json_object_object_add(o, "image_source", json_object_new_string(image_source));
+    json_object_object_add(o, "image_fallback", json_object_new_boolean(0));
+    json_object_object_add(o, "image_fallback_reason", json_object_new_string(""));
+    json_object_object_add(o, "image_format",
+                           json_object_new_string(db_image_format_of(image)));
+    json_object_object_add(o, "image_is_bitmap", json_object_new_boolean(
+        db_image_format_is_bitmap(db_image_format_of(image))));
+
+    if (custom_name[0])
+        json_object_array_add(override_fields, json_object_new_string("nickname"));
+    if (custom_icon[0])
+        json_object_array_add(override_fields,
+                              json_object_new_string("custom_image_path"));
+    if (custom_type[0])
+        json_object_array_add(override_fields,
+                              json_object_new_string("device_type"));
+    if (custom_vendor[0])
+        json_object_array_add(override_fields,
+                              json_object_new_string("vendor_name"));
+    if (sqlite3_column_int(st, 15))
+        json_object_array_add(override_fields, json_object_new_string("pinned"));
+    if (sqlite3_column_int(st, 16))
+        json_object_array_add(override_fields, json_object_new_string("hidden"));
+    json_object_object_add(o, "override_fields", override_fields);
+    json_object_object_add(o, "runtime_enrichment", json_object_new_boolean(0));
+    json_object_object_add(o, "runtime_enrichment_reason",
+                           json_object_new_string("worker_compact_db_snapshot"));
+    return o;
+}
+
 static const char *client_select_sql =
     "SELECT c.client_id,c.mac,c.hostname,c.display_name,c.vendor,c.oui,c.device_type,c.os_name,c.is_wired,c.first_seen,c.last_seen,"
     "COALESCE(o.custom_name,''),COALESCE(o.custom_icon,''),COALESCE(o.custom_device_type,''),COALESCE(o.custom_vendor,''),COALESCE(o.pinned,0),COALESCE(o.hidden,0),COALESCE(o.note,''),"
@@ -5377,6 +5740,168 @@ struct json_object *jmx_db_api_clients_list(struct json_object *req)
                            json_object_new_string("pinned,custom_name,note"));
     json_object_object_add(data, "capabilities", cap);
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+}
+
+/* Worker-safe clients inventory read. It has its own SQLite connection and
+ * statement lifecycle, and never calls the normal runtime-enriched list path. */
+struct json_object *jmx_db_api_clients_list_worker(struct json_object *req)
+{
+    struct json_object *data = json_object_new_object();
+    struct json_object *arr = json_object_new_array();
+    struct json_object *cap = json_object_new_object();
+    sqlite3 *worker_db = NULL;
+    sqlite3_stmt *st = NULL;
+    char sql[4096];
+    const char *q = json_s(req, "q", "");
+    const char *type = json_s(req, "type", "");
+    const char *vendor = json_s(req, "vendor", "");
+    int online = json_i(req, "online", -1);
+    int include_stale = json_i(req, "include_stale", 0) != 0;
+    int64_t retention_sec = JMX_DB_CLIENT_STALE_RETENTION_SEC;
+    int64_t now = now_s();
+    int64_t max_sample_age_ms = 0;
+    int stale_hidden = 0;
+    int bind = 1;
+    int rc;
+
+    if (!data || !arr || !cap)
+        goto failed;
+    if (json_i(req, "stale_days", 0) > 0)
+        retention_sec = (int64_t)json_i(req, "stale_days", 0) * 86400;
+    if (sqlite3_open_v2(jmx_dataset_path("core"), &worker_db,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+                        NULL) != SQLITE_OK || !worker_db) {
+        goto failed;
+    }
+    sqlite3_busy_timeout(worker_db, 1500);
+    (void)sqlite3_exec(worker_db, "PRAGMA query_only=ON", NULL, NULL, NULL);
+    (void)sqlite3_exec(worker_db, "PRAGMA temp_store=MEMORY", NULL, NULL, NULL);
+
+    snprintf(sql, sizeof(sql), "%s WHERE COALESCE(o.hidden,0)=0",
+             client_select_sql);
+    if (type[0])
+        strncat(sql,
+                " AND COALESCE(o.custom_device_type,c.device_type,'unknown')=?",
+                sizeof(sql) - strlen(sql) - 1);
+    if (vendor[0])
+        strncat(sql, " AND COALESCE(o.custom_vendor,c.vendor,'')=?",
+                sizeof(sql) - strlen(sql) - 1);
+    if (q[0])
+        strncat(sql,
+                " AND (c.mac LIKE ? OR COALESCE(c.hostname,'') LIKE ?"
+                " OR COALESCE(c.display_name,'') LIKE ?"
+                " OR COALESCE(o.custom_name,'') LIKE ?)",
+                sizeof(sql) - strlen(sql) - 1);
+    strncat(sql, " ORDER BY COALESCE(n.online,0) DESC, c.last_seen DESC",
+            sizeof(sql) - strlen(sql) - 1);
+
+    rc = sqlite3_prepare_v2(worker_db, sql, -1, &st, NULL);
+    if (rc != SQLITE_OK)
+        goto failed;
+    if (type[0])
+        sqlite3_bind_text(st, bind++, type, -1, SQLITE_TRANSIENT);
+    if (vendor[0])
+        sqlite3_bind_text(st, bind++, vendor, -1, SQLITE_TRANSIENT);
+    if (q[0]) {
+        char like[256];
+
+        snprintf(like, sizeof(like), "%%%s%%", q);
+        sqlite3_bind_text(st, bind++, like, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, bind++, like, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, bind++, like, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, bind++, like, -1, SQLITE_TRANSIENT);
+    }
+    while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+        struct json_object *client =
+            db_row_to_client_worker_compact(st, req);
+
+        if (!client)
+            goto failed;
+        if ((online == 0 || online == 1) &&
+            json_i(client, "online", -1) != online) {
+            json_object_put(client);
+            continue;
+        }
+        if (!include_stale && !json_i(client, "online", 0) &&
+            jmx_db_client_row_stale(client, now, retention_sec)) {
+            stale_hidden++;
+            json_object_put(client);
+            continue;
+        }
+        if (json_i64(client, "sample_age_ms", 0) > max_sample_age_ms)
+            max_sample_age_ms = json_i64(client, "sample_age_ms", 0);
+        json_object_array_add(arr, client);
+    }
+    if (rc != SQLITE_DONE)
+        goto failed;
+    sqlite3_finalize(st);
+    st = NULL;
+    sqlite3_close(worker_db);
+    worker_db = NULL;
+
+    /*
+     * Lift AC-reported AP stations into the authoritative /api/v1/clients
+     * inventory.  Done after the worker DB is closed (the merge uses its own
+     * ubus context and never touches the shared main-thread SQLite handle), so
+     * it is safe on this async worker thread.  Wireless terminals are appended
+     * after the SQL online/stale filters on purpose -- AC attribution is the
+     * evidence, not local conntrack/DHCP/fdb.
+     */
+    dw_ac_merge_station_devices(arr);
+
+    json_object_object_add(data, "clients", arr);
+    arr = NULL;
+    json_object_object_add(data, "total", json_object_new_int(
+                               json_object_array_length(
+                                   json_object_object_get(data, "clients"))));
+    json_object_object_add(data, "stale_hidden",
+                           json_object_new_int(stale_hidden));
+    json_object_object_add(data, "stale_retention_sec",
+                           json_object_new_int64(retention_sec));
+    json_object_object_add(data, "stale_filter_applied",
+                           json_object_new_boolean(!include_stale));
+    json_object_object_add(data, "source",
+                           json_object_new_string("client_db_worker"));
+    json_object_object_add(data, "data_source",
+                           json_object_new_string("client_db_worker"));
+    json_object_object_add(data, "runtime_enrichment",
+                           json_object_new_boolean(0));
+    json_object_object_add(data, "complete", json_object_new_boolean(1));
+    json_object_object_add(data, "sample_age_ms",
+                           json_object_new_int64(max_sample_age_ms));
+    json_object_object_add(cap, "stale_offline_retention",
+                           json_object_new_boolean(1));
+    json_object_object_add(cap, "stale_retention_sec",
+                           json_object_new_int64(retention_sec));
+    json_object_object_add(cap, "stale_retention_days",
+                           json_object_new_int64(retention_sec / 86400));
+    json_object_object_add(cap, "include_stale_param",
+                           json_object_new_string("include_stale"));
+    json_object_object_add(cap, "stale_days_param",
+                           json_object_new_string("stale_days"));
+    json_object_object_add(cap, "fingerprint_evidence_param",
+                           json_object_new_string("include_fingerprint_evidence"));
+    json_object_object_add(cap, "runtime_enrichment",
+                           json_object_new_boolean(0));
+    json_object_object_add(data, "capabilities", cap);
+    cap = NULL;
+    return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+
+failed:
+    if (st)
+        sqlite3_finalize(st);
+    if (worker_db)
+        sqlite3_close(worker_db);
+    if (arr)
+        json_object_put(arr);
+    if (cap)
+        json_object_put(cap);
+    if (!data)
+        data = json_object_new_object();
+    else
+        json_object_object_add(data, "error",
+                               json_object_new_string("client_db_worker_failed"));
+    return jmx_gen_api_response_data(API_CODE_ERROR, data);
 }
 
 static struct json_object *db_query_aliases(int64_t client_id)
@@ -5687,7 +6212,7 @@ int jmx_db_write_interface_state(const char *name, int online, unsigned long lon
     rc = db_step_done(st);
     sqlite3_finalize(st);
     if (rc == 0) {
-        jmx_db_update_daily_usage_counter(name, rx_bytes, tx_bytes, online);
+        jmx_metrics_counter_observe(name, rx_bytes, tx_bytes, online);
         /* Lifetime totals must be maintained on every sample, online or not, or
          * a reconnect that lands between two samples silently rebases them. */
         jmx_db_update_wan_lifetime_usage(name, rx_bytes, tx_bytes, online);
@@ -5706,6 +6231,33 @@ int jmx_db_write_wan_health(const char *name, int latency_ms, int loss_pct)
     if (db_prepare(&st, "INSERT INTO wan_health_samples(iface_id,ts,latency_ms,loss_pct) VALUES(?1,?2,?3,?4)") != 0) return -1;
     sqlite3_bind_int64(st, 1, id); sqlite3_bind_int64(st, 2, ts); sqlite3_bind_int(st, 3, latency_ms); sqlite3_bind_int(st, 4, loss_pct);
     rc = db_step_done(st); sqlite3_finalize(st); return rc;
+}
+
+int jmx_db_read_wan_health_latest(const char *name, int *latency_ms,
+                                  int *loss_pct, int64_t *ts)
+{
+    sqlite3_stmt *st = NULL;
+    int rc = -1;
+
+    if (!name || !name[0] || jmx_db_init() != 0)
+        return -1;
+    if (!db_table_exists("wan_health_samples"))
+        return -1;
+    if (db_prepare(&st,
+            "SELECT s.latency_ms,s.loss_pct,s.ts "
+            "FROM wan_health_samples s "
+            "JOIN net_interfaces i ON i.iface_id=s.iface_id "
+            "WHERE i.name=?1 ORDER BY s.ts DESC LIMIT 1") != 0)
+        return -1;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        if (latency_ms) *latency_ms = sqlite3_column_int(st, 0);
+        if (loss_pct) *loss_pct = sqlite3_column_int(st, 1);
+        if (ts) *ts = sqlite3_column_int64(st, 2);
+        rc = 0;
+    }
+    sqlite3_finalize(st);
+    return rc;
 }
 
 int jmx_db_write_traffic_bucket(int64_t bucket_ts, int bucket_sec, const char *iface_name, unsigned long long rx_bytes, unsigned long long tx_bytes)
@@ -5862,7 +6414,7 @@ struct json_object *jmx_db_api_line_load(struct json_object *req)
     json_object_object_add(data, "ts", json_object_new_int64(now));
     if (jmx_db_init() == 0 && db_prepare(&st,
         "SELECT i.name,i.kind,i.device,i.proto,i.carrier,s.ts,s.online,s.rx_bytes,s.tx_bytes,s.rx_rate,s.tx_rate,s.latency_ms,s.loss_pct "
-        "FROM net_interfaces i LEFT JOIN net_interface_state s ON s.rowid=(SELECT rowid FROM net_interface_state WHERE iface_id=i.iface_id ORDER BY ts DESC LIMIT 1) "
+        "FROM net_interfaces i LEFT JOIN net_interface_state s ON s.iface_id=i.iface_id "
         "WHERE i.kind='wan' ORDER BY i.name LIMIT ?1") == 0) {
         sqlite3_bind_int(st, 1, limit);
         int idx = 1;
@@ -5940,6 +6492,385 @@ struct json_object *jmx_db_api_line_load(struct json_object *req)
     }
     json_object_object_add(data, "interfaces", arr);
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
+}
+
+/*
+ * Worker-only line-load projection.  The historical line_load builder mixed
+ * UCI/netifd, process-global runtime state, conntrack attribution and a
+ * wan_session write into one response.  That shape cannot safely run on a
+ * dw_async_query worker.  This producer intentionally returns the immutable
+ * SQLite/config snapshot and labels the runtime pieces it does not sample.
+ */
+static int line_load_worker_prepare(sqlite3 *db, sqlite3_stmt **st,
+                                    const char *sql)
+{
+    if (!db || !st || !sql || sqlite3_prepare_v2(db, sql, -1, st, NULL) != SQLITE_OK)
+        return -1;
+    return 0;
+}
+
+static void line_load_worker_add_lifetime(sqlite3 *db,
+                                          struct json_object *wan,
+                                          const char *wan_id,
+                                          int64_t device_rx,
+                                          int64_t device_tx)
+{
+    sqlite3_stmt *st = NULL;
+    int64_t rx = device_rx > 0 ? device_rx : 0;
+    int64_t tx = device_tx > 0 ? device_tx : 0;
+    int found = 0;
+    int reset_count = 0;
+    int64_t first_seen = 0;
+    int64_t last_reset = 0;
+
+    if (db && wan_id && wan_id[0] &&
+        line_load_worker_prepare(db, &st,
+            "SELECT first_seen_ts,last_rx_bytes,last_tx_bytes,"
+            "base_rx_bytes,base_tx_bytes,reset_count,last_reset_ts "
+            "FROM wan_lifetime_usage WHERE wan_id=?1 LIMIT 1") == 0) {
+        sqlite3_bind_text(st, 1, wan_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            int64_t last_rx = sqlite3_column_int64(st, 1);
+            int64_t last_tx = sqlite3_column_int64(st, 2);
+            int64_t base_rx = sqlite3_column_int64(st, 3);
+            int64_t base_tx = sqlite3_column_int64(st, 4);
+
+            first_seen = sqlite3_column_int64(st, 0);
+            reset_count = sqlite3_column_int(st, 5);
+            last_reset = sqlite3_column_int64(st, 6);
+            rx = (base_rx > 0 ? base_rx : 0) + (last_rx > 0 ? last_rx : 0);
+            tx = (base_tx > 0 ? base_tx : 0) + (last_tx > 0 ? last_tx : 0);
+            if (rx < device_rx) rx = device_rx;
+            if (tx < device_tx) tx = device_tx;
+            found = 1;
+        }
+        sqlite3_finalize(st);
+    }
+    json_object_object_add(wan, "up_bytes", json_object_new_int64(tx));
+    json_object_object_add(wan, "down_bytes", json_object_new_int64(rx));
+    json_object_object_add(wan, "device_up_bytes", json_object_new_int64(device_tx));
+    json_object_object_add(wan, "device_down_bytes", json_object_new_int64(device_rx));
+    json_object_object_add(wan, "bytes_source", json_object_new_string(
+        found ? "persisted_lifetime_counter" : "runtime_device_counter"));
+    json_object_object_add(wan, "counter_since", json_object_new_int64(found ? first_seen : 0));
+    json_object_object_add(wan, "counter_reset_detected",
+                           json_object_new_boolean(found && reset_count > 0));
+    json_object_object_add(wan, "counter_reset_count", json_object_new_int(reset_count));
+    json_object_object_add(wan, "counter_last_reset_at", json_object_new_int64(last_reset));
+}
+
+static void line_load_worker_add_session(sqlite3 *db,
+                                         struct json_object *wan,
+                                         const char *wan_id,
+                                         int64_t now)
+{
+    sqlite3_stmt *st = NULL;
+    int64_t started_at = 0;
+    const char *source = "wan_session_db";
+    const char *reason = "no_active_session";
+    int valid = 0;
+
+    if (db && wan_id && wan_id[0] &&
+        line_load_worker_prepare(db, &st,
+            "SELECT started_at,ip,gateway FROM wan_session "
+            "WHERE wan_id=?1 AND ended_at IS NULL "
+            "ORDER BY started_at ASC,id ASC LIMIT 1") == 0) {
+        sqlite3_bind_text(st, 1, wan_id, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *ip = (const char *)sqlite3_column_text(st, 1);
+            const char *gateway = (const char *)sqlite3_column_text(st, 2);
+
+            started_at = sqlite3_column_int64(st, 0);
+            if (ip && ip[0])
+                json_object_object_add(wan, "ip", json_object_new_string(ip));
+            if (gateway && gateway[0])
+                json_object_object_add(wan, "gateway", json_object_new_string(gateway));
+        }
+        sqlite3_finalize(st);
+    }
+    if (started_at > 0 && started_at <= now) {
+        valid = 1;
+        reason = "session_inherited";
+        json_object_object_add(wan, "uptime", json_object_new_int64(now - started_at));
+        json_object_object_add(wan, "connected_at", json_object_new_int64(started_at));
+    } else {
+        json_object_object_add(wan, "uptime", json_object_new_int64(0));
+    }
+    json_object_object_add(wan, "online_seconds",
+                           json_object_new_int64(valid ? now - started_at : 0));
+    json_object_object_add(wan, "connected_seconds",
+                           json_object_new_int64(valid ? now - started_at : 0));
+    json_object_object_add(wan, "connection_time_source",
+                           json_object_new_string(source));
+    json_object_object_add(wan, "connection_time_valid",
+                           json_object_new_boolean(valid));
+    json_object_object_add(wan, "connection_time_reason",
+                           json_object_new_string(reason));
+}
+
+static void line_load_worker_add_loss(sqlite3 *db,
+                                      struct json_object *wan,
+                                      const char *wan_id,
+                                      int64_t now)
+{
+    sqlite3_stmt *st = NULL;
+    double up = 0.0;
+    double down = 0.0;
+    double latency = 0.0;
+    int samples = 0;
+
+    if (db && wan_id && wan_id[0] &&
+        line_load_worker_prepare(db, &st,
+            "SELECT COALESCE(SUM(loss_up*samples)*1.0/NULLIF(SUM(samples),0),0),"
+            "COALESCE(SUM(loss_down*samples)*1.0/NULLIF(SUM(samples),0),0),"
+            "COALESCE(SUM(latency_avg*samples)*1.0/NULLIF(SUM(samples),0),0),"
+            "COALESCE(SUM(samples),0) FROM wan_health_bucket "
+            "WHERE wan_id=?1 AND bucket_start>=?2 AND bucket_start<=?3") == 0) {
+        sqlite3_bind_text(st, 1, wan_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, now - 86400);
+        sqlite3_bind_int64(st, 3, now);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            up = sqlite3_column_double(st, 0);
+            down = sqlite3_column_double(st, 1);
+            latency = sqlite3_column_double(st, 2);
+            samples = sqlite3_column_int(st, 3);
+        }
+        sqlite3_finalize(st);
+    }
+    if (samples > 0) {
+        json_object_object_add(wan, "up_loss_24h", json_object_new_double(up));
+        json_object_object_add(wan, "down_loss_24h", json_object_new_double(down));
+        json_object_object_add(wan, "loss_up_24h", json_object_new_double(up));
+        json_object_object_add(wan, "loss_down_24h", json_object_new_double(down));
+        json_object_object_add(wan, "latency_avg", json_object_new_double(latency));
+    } else {
+        json_object_object_add(wan, "up_loss_24h", json_object_new_null());
+        json_object_object_add(wan, "down_loss_24h", json_object_new_null());
+        json_object_object_add(wan, "loss_up_24h", json_object_new_null());
+        json_object_object_add(wan, "loss_down_24h", json_object_new_null());
+        json_object_object_add(wan, "loss_reason",
+                               json_object_new_string("no_samples_in_window"));
+    }
+    json_object_object_add(wan, "loss_window_sec", json_object_new_int(86400));
+    json_object_object_add(wan, "loss_window_label", json_object_new_string("24h"));
+    json_object_object_add(wan, "loss_source", json_object_new_string("wan_health_bucket"));
+    json_object_object_add(wan, "loss_sample_count", json_object_new_int(samples));
+}
+
+static void line_load_worker_read_config(sqlite3 *config_db,
+                                         const char *name,
+                                         char *note, size_t note_len,
+                                         char *access_mode, size_t access_len,
+                                         char *ip, size_t ip_len,
+                                         char *ipv6, size_t ipv6_len,
+                                         char *gateway, size_t gateway_len)
+{
+    sqlite3_stmt *st = NULL;
+
+    if (note && note_len) note[0] = '\0';
+    if (access_mode && access_len) access_mode[0] = '\0';
+    if (ip && ip_len) ip[0] = '\0';
+    if (ipv6 && ipv6_len) ipv6[0] = '\0';
+    if (gateway && gateway_len) gateway[0] = '\0';
+    if (!config_db || !name || !name[0] ||
+        line_load_worker_prepare(config_db, &st,
+            "SELECT note,access_mode,ipv6_addr,gateway FROM wan "
+            "WHERE id=?1 OR ifname=?1 "
+            "ORDER BY CASE WHEN id=?1 THEN 0 ELSE 1 END LIMIT 1") != 0)
+        return;
+    sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+    if (sqlite3_step(st) == SQLITE_ROW) {
+        const char *v;
+
+        v = (const char *)sqlite3_column_text(st, 0);
+        if (note && note_len && v) snprintf(note, note_len, "%s", v);
+        v = (const char *)sqlite3_column_text(st, 1);
+        if (access_mode && access_len && v) snprintf(access_mode, access_len, "%s", v);
+        v = (const char *)sqlite3_column_text(st, 2);
+        if (ipv6 && ipv6_len && v) snprintf(ipv6, ipv6_len, "%s", v);
+        v = (const char *)sqlite3_column_text(st, 3);
+        if (gateway && gateway_len && v) snprintf(gateway, gateway_len, "%s", v);
+    }
+    sqlite3_finalize(st);
+    (void)ip;
+    (void)ip_len;
+}
+
+struct json_object *jmx_db_api_line_load_worker(struct json_object *req)
+{
+    struct json_object *data = json_object_new_object();
+    struct json_object *arr = json_object_new_array();
+    sqlite3 *db = NULL;
+    sqlite3 *config_db = NULL;
+    sqlite3_stmt *st = NULL;
+    int limit = json_i(req, "limit", 32);
+    int64_t now = now_s();
+    int64_t max_age_ms = 0;
+    int rows = 0;
+    int ok = 0;
+    int step_rc = SQLITE_DONE;
+    int config_ok = 0;
+
+    if (limit <= 0 || limit > 128)
+        limit = 32;
+    if (!data || !arr) {
+        if (data) json_object_put(data);
+        if (arr) json_object_put(arr);
+        return jmx_gen_api_response_data(API_CODE_ERROR, NULL);
+    }
+    if (sqlite3_open_v2(jmx_dataset_path("core"), &db,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) != SQLITE_OK || !db)
+        goto failed;
+    config_ok = sqlite3_open_v2(JMX_NETCONFIG_DB_PATH_DEFAULT, &config_db,
+                                SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) == SQLITE_OK &&
+                config_db != NULL;
+    sqlite3_busy_timeout(db, 1500);
+    if (config_ok)
+        sqlite3_busy_timeout(config_db, 1500);
+    (void)sqlite3_exec(db, "PRAGMA query_only=ON", NULL, NULL, NULL);
+    if (config_ok)
+        (void)sqlite3_exec(config_db, "PRAGMA query_only=ON", NULL, NULL, NULL);
+
+    if (line_load_worker_prepare(db, &st,
+            "SELECT i.name,i.device,i.proto,i.carrier,s.ts,s.online,s.rx_bytes,s.tx_bytes,"
+            "s.rx_rate,s.tx_rate,s.latency_ms,s.loss_pct "
+            "FROM net_interfaces i LEFT JOIN net_interface_state s "
+            "ON s.iface_id=i.iface_id WHERE i.kind='wan' "
+            "ORDER BY i.name LIMIT ?1") != 0)
+        goto failed;
+    sqlite3_bind_int(st, 1, limit);
+    while ((step_rc = sqlite3_step(st)) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(st, 0);
+        const char *device = (const char *)sqlite3_column_text(st, 1);
+        const char *proto = (const char *)sqlite3_column_text(st, 2);
+        const char *carrier = (const char *)sqlite3_column_text(st, 3);
+        int64_t state_ts = sqlite3_column_int64(st, 4);
+        int online = sqlite3_column_int(st, 5);
+        int64_t rx_bytes = sqlite3_column_int64(st, 6);
+        int64_t tx_bytes = sqlite3_column_int64(st, 7);
+        int rx_rate = sqlite3_column_int(st, 8);
+        int tx_rate = sqlite3_column_int(st, 9);
+        int latency = sqlite3_column_int(st, 10);
+        int loss = sqlite3_column_int(st, 11);
+        char note[128], access_mode[32], ip[64], ipv6[128], gateway[64];
+        int link_speed = 0;
+        struct json_object *wan = json_object_new_object();
+
+        if (!wan)
+            goto failed;
+        line_load_worker_read_config(config_ok ? config_db : NULL,
+                                     name, note, sizeof(note),
+                                     access_mode, sizeof(access_mode), ip, sizeof(ip),
+                                     ipv6, sizeof(ipv6), gateway, sizeof(gateway));
+        if (device && device[0]) {
+            char path[160];
+            FILE *fp;
+
+            snprintf(path, sizeof(path), "/sys/class/net/%s/speed", device);
+            fp = fopen(path, "r");
+            if (fp) {
+                if (fscanf(fp, "%d", &link_speed) != 1)
+                    link_speed = 0;
+                fclose(fp);
+            }
+        }
+        if (state_ts > 0 && now >= state_ts && now - state_ts > max_age_ms)
+            max_age_ms = (now - state_ts) * 1000;
+        json_object_object_add(wan, "id", json_object_new_string(name ? name : ""));
+        json_object_object_add(wan, "order", json_object_new_int(++rows));
+        json_object_object_add(wan, "type", json_object_new_string("wan"));
+        json_object_object_add(wan, "name", json_object_new_string(name ? name : ""));
+        json_object_object_add(wan, "note", json_object_new_string(note[0] ? note : ""));
+        json_object_object_add(wan, "ifname", json_object_new_string(name ? name : ""));
+        json_object_object_add(wan, "device", json_object_new_string(device ? device : ""));
+        json_object_object_add(wan, "runtime_device", json_object_new_string(device ? device : ""));
+        json_object_object_add(wan, "proto", json_object_new_string(proto ? proto : ""));
+        json_object_object_add(wan, "access_mode", json_object_new_string(access_mode));
+        json_object_object_add(wan, "carrier", json_object_new_string(carrier ? carrier : ""));
+        json_object_object_add(wan, "carrier_source", json_object_new_string("core_db"));
+        json_object_object_add(wan, "ip", json_object_new_string(ip));
+        json_object_object_add(wan, "ipv4", json_object_new_string(ip));
+        json_object_object_add(wan, "ipv6", json_object_new_string(ipv6));
+        json_object_object_add(wan, "gateway", json_object_new_string(gateway));
+        json_object_object_add(wan, "ts", json_object_new_int64(state_ts));
+        json_object_object_add(wan, "observed_at", json_object_new_int64(now));
+        json_object_object_add(wan, "sample_age_ms", json_object_new_int64(
+            state_ts > 0 && now >= state_ts ? (now - state_ts) * 1000 : -1));
+        json_object_object_add(wan, "online", json_object_new_boolean(online != 0));
+        json_object_object_add(wan, "status", json_object_new_string(
+            online ? ((loss >= 50 || latency >= 180) ? "bad" :
+                      ((loss > 0 || latency >= 80) ? "warn" : "ok")) : "down"));
+        json_object_object_add(wan, "latency", json_object_new_int(latency));
+        json_object_object_add(wan, "latency_ms", json_object_new_int(latency));
+        json_object_object_add(wan, "loss", json_object_new_int(loss));
+        json_object_object_add(wan, "loss_pct", json_object_new_int(loss));
+        json_object_object_add(wan, "up_rate", json_object_new_int64(tx_rate));
+        json_object_object_add(wan, "down_rate", json_object_new_int64(rx_rate));
+        json_object_object_add(wan, "rx_bytes", json_object_new_int64(rx_bytes));
+        json_object_object_add(wan, "tx_bytes", json_object_new_int64(tx_bytes));
+        if (link_speed > 0) {
+            char speed[32];
+            snprintf(speed, sizeof(speed), "%d Mbps", link_speed);
+            json_object_object_add(wan, "link_speed", json_object_new_string(speed));
+            json_object_object_add(wan, "link_speed_mbps", json_object_new_int(link_speed));
+        } else {
+            json_object_object_add(wan, "link_speed", json_object_new_string(""));
+            json_object_object_add(wan, "link_speed_mbps", json_object_new_int(0));
+        }
+        line_load_worker_add_lifetime(db, wan, name, rx_bytes, tx_bytes);
+        line_load_worker_add_session(db, wan, name, now);
+        line_load_worker_add_loss(db, wan, name, now);
+        /* Runtime attribution is deliberately absent, never a fake idle count. */
+        json_object_object_add(wan, "connections", json_object_new_int(0));
+        json_object_object_add(wan, "connections_source",
+                               json_object_new_string("not_sampled_worker_projection"));
+        json_object_object_add(wan, "conntrack_state",
+                               json_object_new_string("not_sampled"));
+        json_object_object_add(wan, "conntrack_reason",
+                               json_object_new_string("worker_projection_excludes_runtime_conntrack"));
+        json_object_array_add(arr, wan);
+    }
+    /* A successful sqlite3_step() loop ends at SQLITE_DONE.  Do not use
+     * sqlite3_errcode() as a proxy for the loop result: it reports the
+     * connection's last API error and can remain SQLITE_OK after a clean
+     * SQLITE_DONE terminator. */
+    if (step_rc != SQLITE_DONE)
+        goto failed;
+    ok = 1;
+
+failed:
+    if (st) sqlite3_finalize(st);
+    if (config_db) sqlite3_close(config_db);
+    if (db) sqlite3_close(db);
+    json_object_object_add(data, "ts", json_object_new_int64(now));
+    json_object_object_add(data, "observed_at", json_object_new_int64(now));
+    json_object_object_add(data, "interfaces", arr);
+    json_object_object_add(data, "data_source",
+                           json_object_new_string("sqlite_readonly_snapshot"));
+    json_object_object_add(data, "sample_age_ms", json_object_new_int64(max_age_ms));
+    json_object_object_add(data, "stale", json_object_new_boolean(max_age_ms > 30000));
+    json_object_object_add(data, "refreshing", json_object_new_boolean(0));
+    json_object_object_add(data, "cache_hit", json_object_new_boolean(0));
+    json_object_object_add(data, "complete", json_object_new_boolean(0));
+    json_object_object_add(data, "partial", json_object_new_boolean(1));
+    {
+        struct json_object *partial_sources = json_object_new_array();
+        if (partial_sources) {
+            json_object_array_add(partial_sources,
+                                  json_object_new_string("conntrack_runtime"));
+            json_object_array_add(partial_sources,
+                                  json_object_new_string("route_policy_runtime"));
+            json_object_array_add(partial_sources,
+                                  json_object_new_string("netifd_runtime"));
+            if (!config_ok)
+                json_object_array_add(partial_sources,
+                                      json_object_new_string("wan_config_db"));
+        }
+        json_object_object_add(data, "partial_sources", partial_sources);
+    }
+    json_object_object_add(data, "runtime_projection",
+                           json_object_new_string("db_state_only;conntrack_route_policy_and_netifd_not_sampled"));
+    return jmx_gen_api_response_data(ok ? API_CODE_SUCCESS : API_CODE_ERROR, data);
 }
 
 /* ══════════════════════════════════════════════════════════════════════
@@ -6705,7 +7636,7 @@ struct json_object *jmx_db_api_line_health(struct json_object *req)
     /* query all interfaces with latest state */
     if (db_prepare(&st,
         "SELECT i.name,i.proto,i.carrier,s.ts,s.online,s.rx_bytes,s.tx_bytes,s.rx_rate,s.tx_rate,s.latency_ms,s.loss_pct "
-        "FROM net_interfaces i LEFT JOIN net_interface_state s ON s.rowid=(SELECT rowid FROM net_interface_state WHERE iface_id=i.iface_id ORDER BY ts DESC LIMIT 1) "
+        "FROM net_interfaces i LEFT JOIN net_interface_state s ON s.iface_id=i.iface_id "
         "WHERE i.kind='wan' ORDER BY i.name LIMIT ?1") == 0) {
         sqlite3_bind_int(st, 1, limit);
         while (sqlite3_step(st) == SQLITE_ROW) {
@@ -6799,6 +7730,307 @@ struct json_object *jmx_db_api_line_health(struct json_object *req)
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
 }
 
+static int line_health_worker_prepare(sqlite3 *db, sqlite3_stmt **st,
+                                      const char *sql)
+{
+    int rc;
+
+    if (!db || !st || !sql)
+        return -1;
+    rc = sqlite3_prepare_v2(db, sql, -1, st, NULL);
+    if (rc != SQLITE_OK) {
+        LOG_ERROR("line health worker prepare failed rc=%d err=%s\n",
+                  rc, sqlite3_errmsg(db));
+        return -1;
+    }
+    return 0;
+}
+
+static int line_health_worker_wan_configured(sqlite3 *config_db,
+                                             sqlite3_stmt **lookup,
+                                             const char *name)
+{
+    int found;
+
+    if (!config_db || !lookup || !name || !name[0])
+        return 0;
+    if (!*lookup && line_health_worker_prepare(config_db, lookup,
+            "SELECT 1 FROM wan WHERE id=?1 OR ifname=?1 LIMIT 1") != 0)
+        return 0;
+    sqlite3_reset(*lookup);
+    sqlite3_clear_bindings(*lookup);
+    sqlite3_bind_text(*lookup, 1, name, -1, SQLITE_TRANSIENT);
+    found = sqlite3_step(*lookup) == SQLITE_ROW;
+    return found;
+}
+
+static void line_health_worker_add_session(sqlite3 *db,
+                                           struct json_object *wan,
+                                           const char *name,
+                                           int64_t now,
+                                           int64_t boot_at)
+{
+    sqlite3_stmt *st = NULL;
+    int64_t started_at = 0;
+    int64_t uptime = 0;
+    const char *source = "wan_session_db";
+    const char *reason = "no_active_session";
+    int valid = 0;
+
+    if (line_health_worker_prepare(db, &st,
+            "SELECT started_at,ip,gateway FROM wan_session "
+            "WHERE wan_id=?1 AND ended_at IS NULL "
+            "ORDER BY started_at ASC,id ASC LIMIT 1") == 0) {
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            const char *ip = (const char *)sqlite3_column_text(st, 1);
+            const char *gateway = (const char *)sqlite3_column_text(st, 2);
+
+            started_at = sqlite3_column_int64(st, 0);
+            if (ip && ip[0])
+                json_object_object_add(wan, "ip", json_object_new_string(ip));
+            if (gateway && gateway[0])
+                json_object_object_add(wan, "gateway",
+                                       json_object_new_string(gateway));
+        }
+        sqlite3_finalize(st);
+    }
+    if (started_at > now) {
+        reason = "future_session_timestamp";
+    } else if (started_at > 0 && boot_at > 0 && started_at < boot_at) {
+        started_at = 0;
+        source = "system_boot_guard";
+        reason = "session_predates_current_boot";
+    } else if (started_at > 0) {
+        uptime = now - started_at;
+        valid = 1;
+        reason = "session_inherited";
+    }
+    json_object_object_add(wan, "uptime", json_object_new_int64(uptime));
+    json_object_object_add(wan, "online_seconds", json_object_new_int64(uptime));
+    json_object_object_add(wan, "connected_seconds", json_object_new_int64(uptime));
+    if (started_at > 0)
+        json_object_object_add(wan, "connected_at",
+                               json_object_new_int64(started_at));
+    json_object_object_add(wan, "connection_time_source",
+                           json_object_new_string(source));
+    json_object_object_add(wan, "connection_time_valid",
+                           json_object_new_boolean(valid));
+    json_object_object_add(wan, "connection_time_reason",
+                           json_object_new_string(reason));
+}
+
+static void line_health_worker_add_loss(sqlite3 *db,
+                                        struct json_object *wan,
+                                        const char *name,
+                                        int64_t now)
+{
+    sqlite3_stmt *st = NULL;
+    double up = 0.0;
+    double down = 0.0;
+    double latency = 0.0;
+    int samples = 0;
+
+    if (line_health_worker_prepare(db, &st,
+            "SELECT COALESCE(SUM(loss_up*samples)*1.0/NULLIF(SUM(samples),0),0),"
+            "COALESCE(SUM(loss_down*samples)*1.0/NULLIF(SUM(samples),0),0),"
+            "COALESCE(SUM(latency_avg*samples)*1.0/NULLIF(SUM(samples),0),0),"
+            "COALESCE(SUM(samples),0) FROM wan_health_bucket "
+            "WHERE wan_id=?1 AND bucket_start>=?2 AND bucket_start<=?3") == 0) {
+        sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, now - 86400);
+        sqlite3_bind_int64(st, 3, now);
+        if (sqlite3_step(st) == SQLITE_ROW) {
+            up = sqlite3_column_double(st, 0);
+            down = sqlite3_column_double(st, 1);
+            latency = sqlite3_column_double(st, 2);
+            samples = sqlite3_column_int(st, 3);
+        }
+        sqlite3_finalize(st);
+    }
+    if (samples > 0) {
+        json_object_object_add(wan, "up_loss_24h", json_object_new_double(up));
+        json_object_object_add(wan, "down_loss_24h", json_object_new_double(down));
+        json_object_object_add(wan, "loss_up_24h", json_object_new_double(up));
+        json_object_object_add(wan, "loss_down_24h", json_object_new_double(down));
+        json_object_object_add(wan, "latency_avg",
+                               json_object_new_double(latency));
+    } else {
+        json_object_object_add(wan, "up_loss_24h", json_object_new_null());
+        json_object_object_add(wan, "down_loss_24h", json_object_new_null());
+        json_object_object_add(wan, "loss_up_24h", json_object_new_null());
+        json_object_object_add(wan, "loss_down_24h", json_object_new_null());
+        json_object_object_add(wan, "loss_reason",
+                               json_object_new_string("no_samples_in_window"));
+    }
+    json_object_object_add(wan, "loss_window_sec", json_object_new_int(86400));
+    json_object_object_add(wan, "loss_window_label", json_object_new_string("24h"));
+    json_object_object_add(wan, "loss_source",
+                           json_object_new_string("wan_health_bucket"));
+    json_object_object_add(wan, "loss_sample_count",
+                           json_object_new_int(samples));
+}
+
+struct json_object *jmx_db_api_line_health_worker(struct json_object *req)
+{
+    struct json_object *data = json_object_new_object();
+    struct json_object *wans = json_object_new_array();
+    sqlite3 *db = NULL;
+    sqlite3 *config_db = NULL;
+    sqlite3_stmt *st = NULL;
+    sqlite3_stmt *configured = NULL;
+    int64_t now = now_s();
+    int64_t system_uptime = db_read_system_uptime_sec();
+    int64_t boot_at = system_uptime > 0 && system_uptime <= now ?
+                      now - system_uptime : 0;
+    int limit = json_i(req, "limit", 32);
+    int ok = 0;
+
+    if (limit <= 0 || limit > 128)
+        limit = 32;
+    if (!data || !wans)
+        goto failed;
+    json_object_object_add(data, "ts", json_object_new_int64(now));
+    if (sqlite3_open_v2(jmx_dataset_path("core"), &db,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+                        NULL) != SQLITE_OK || !db)
+        goto failed;
+    if (sqlite3_open_v2(JMX_NETCONFIG_DB_PATH_DEFAULT, &config_db,
+                        SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX,
+                        NULL) != SQLITE_OK || !config_db)
+        goto failed;
+    sqlite3_busy_timeout(db, 1500);
+    sqlite3_busy_timeout(config_db, 1500);
+    (void)sqlite3_exec(db, "PRAGMA query_only=ON", NULL, NULL, NULL);
+    (void)sqlite3_exec(config_db, "PRAGMA query_only=ON", NULL, NULL, NULL);
+
+    if (line_health_worker_prepare(db, &st,
+            "SELECT i.name,i.proto,i.carrier,s.ts,s.online,s.rx_bytes,s.tx_bytes,"
+            "s.rx_rate,s.tx_rate,s.latency_ms,s.loss_pct,"
+            "COALESCE((SELECT p.access_mode FROM wan_profile p "
+            "WHERE p.id=i.name OR p.ifname=i.name ORDER BY p.updated_at DESC LIMIT 1),''),"
+            "COALESCE((SELECT p.note FROM wan_profile p "
+            "WHERE p.id=i.name OR p.ifname=i.name ORDER BY p.updated_at DESC LIMIT 1),''),"
+            "COALESCE((SELECT p.configured_up_rate FROM wan_profile p "
+            "WHERE p.id=i.name OR p.ifname=i.name ORDER BY p.updated_at DESC LIMIT 1),0),"
+            "COALESCE((SELECT p.configured_down_rate FROM wan_profile p "
+            "WHERE p.id=i.name OR p.ifname=i.name ORDER BY p.updated_at DESC LIMIT 1),0) "
+            "FROM net_interfaces i LEFT JOIN net_interface_state s "
+            "ON s.iface_id=i.iface_id WHERE i.kind='wan' "
+            "ORDER BY i.name LIMIT ?1") != 0)
+        goto failed;
+    sqlite3_bind_int(st, 1, limit);
+    while (sqlite3_step(st) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(st, 0);
+        const char *proto = (const char *)sqlite3_column_text(st, 1);
+        const char *carrier = (const char *)sqlite3_column_text(st, 2);
+        const char *access_mode = (const char *)sqlite3_column_text(st, 11);
+        const char *note = (const char *)sqlite3_column_text(st, 12);
+        int64_t state_ts = sqlite3_column_int64(st, 3);
+        int online = sqlite3_column_int(st, 4);
+        int64_t rx_bytes = sqlite3_column_int64(st, 5);
+        int64_t tx_bytes = sqlite3_column_int64(st, 6);
+        int rx_rate = sqlite3_column_int(st, 7);
+        int tx_rate = sqlite3_column_int(st, 8);
+        int latency = sqlite3_column_int(st, 9);
+        int loss = sqlite3_column_int(st, 10);
+        struct json_object *wan;
+        struct json_object *history;
+        sqlite3_stmt *hist = NULL;
+
+        if (!line_health_worker_wan_configured(config_db, &configured, name))
+            continue;
+        wan = json_object_new_object();
+        history = json_object_new_array();
+        if (!wan || !history) {
+            if (wan) json_object_put(wan);
+            if (history) json_object_put(history);
+            goto failed;
+        }
+        json_object_object_add(wan, "name", json_object_new_string(name));
+        json_object_object_add(wan, "id", json_object_new_string(name));
+        json_object_object_add(wan, "ifname", json_object_new_string(name));
+        json_object_object_add(wan, "carrier",
+                               json_object_new_string(carrier ? carrier : ""));
+        json_object_object_add(wan, "proto",
+                               json_object_new_string(proto ? proto : ""));
+        json_object_object_add(wan, "access_mode",
+                               json_object_new_string(access_mode ? access_mode : ""));
+        json_object_object_add(wan, "note",
+                               json_object_new_string(note ? note : ""));
+        json_object_object_add(wan, "health", json_object_new_boolean(online));
+        json_object_object_add(wan, "online", json_object_new_boolean(online));
+        json_object_object_add(wan, "ts", json_object_new_int64(state_ts));
+        json_object_object_add(wan, "rx_bytes", json_object_new_int64(rx_bytes));
+        json_object_object_add(wan, "tx_bytes", json_object_new_int64(tx_bytes));
+        json_object_object_add(wan, "down_rate", json_object_new_int(rx_rate));
+        json_object_object_add(wan, "up_rate", json_object_new_int(tx_rate));
+        json_object_object_add(wan, "latency", json_object_new_int(latency));
+        json_object_object_add(wan, "latency_ms", json_object_new_int(latency));
+        json_object_object_add(wan, "loss", json_object_new_int(loss));
+        json_object_object_add(wan, "loss_pct", json_object_new_int(loss));
+        json_object_object_add(wan, "status", json_object_new_string(
+            online ? ((loss >= 50 || latency >= 180) ? "bad" :
+                      ((loss > 0 || latency >= 80) ? "warn" : "ok")) : "down"));
+        json_object_object_add(wan, "configured_up_rate",
+                               json_object_new_int(sqlite3_column_int(st, 13)));
+        json_object_object_add(wan, "configured_down_rate",
+                               json_object_new_int(sqlite3_column_int(st, 14)));
+        line_health_worker_add_session(db, wan, name, now, boot_at);
+        line_health_worker_add_loss(db, wan, name, now);
+
+        if (line_health_worker_prepare(db, &hist,
+                "SELECT bucket_start,status,reason,latency_avg,latency_max,latency_min,"
+                "loss_up,loss_down,avg_up_rate,avg_down_rate,busy,samples "
+                "FROM wan_health_bucket WHERE wan_id=?1 AND bucket_start>=?2 "
+                "AND bucket_start<=?3 ORDER BY bucket_start ASC") == 0) {
+            sqlite3_bind_text(hist, 1, name, -1, SQLITE_TRANSIENT);
+            sqlite3_bind_int64(hist, 2, now - 86400);
+            sqlite3_bind_int64(hist, 3, now);
+            while (sqlite3_step(hist) == SQLITE_ROW) {
+                struct json_object *bucket = json_object_new_object();
+
+                json_object_object_add(bucket, "ts",
+                    json_object_new_int64(sqlite3_column_int64(hist, 0)));
+                add_col_text(bucket, "status", hist, 1);
+                add_col_text(bucket, "reason", hist, 2);
+                json_object_object_add(bucket, "latency_avg",
+                    json_object_new_int(sqlite3_column_int(hist, 3)));
+                json_object_object_add(bucket, "latency_max",
+                    json_object_new_int(sqlite3_column_int(hist, 4)));
+                json_object_object_add(bucket, "latency_min",
+                    json_object_new_int(sqlite3_column_int(hist, 5)));
+                json_object_object_add(bucket, "loss_up",
+                    json_object_new_int(sqlite3_column_int(hist, 6)));
+                json_object_object_add(bucket, "loss_down",
+                    json_object_new_int(sqlite3_column_int(hist, 7)));
+                json_object_object_add(bucket, "avg_up_rate",
+                    json_object_new_int(sqlite3_column_int(hist, 8)));
+                json_object_object_add(bucket, "avg_down_rate",
+                    json_object_new_int(sqlite3_column_int(hist, 9)));
+                json_object_object_add(bucket, "busy",
+                    json_object_new_int(sqlite3_column_int(hist, 10)));
+                json_object_object_add(bucket, "samples",
+                    json_object_new_int(sqlite3_column_int(hist, 11)));
+                json_object_array_add(history, bucket);
+            }
+            sqlite3_finalize(hist);
+        }
+        json_object_object_add(wan, "health_history", history);
+        json_object_array_add(wans, wan);
+    }
+    ok = 1;
+
+failed:
+    if (configured) sqlite3_finalize(configured);
+    if (st) sqlite3_finalize(st);
+    if (config_db) sqlite3_close(config_db);
+    if (db) sqlite3_close(db);
+    json_object_object_add(data, "wans", wans);
+    return jmx_gen_api_response_data(ok ? API_CODE_SUCCESS : API_CODE_ERROR,
+                                     data);
+}
+
 /* ipv6_load API - read IPv6 addresses from /proc/net/if_inet6 */
 /* ipv6_load API: return interfaces[] with IPv6 addresses + traffic stats */
 struct json_object *jmx_db_api_ipv6_load(struct json_object *req)
@@ -6817,7 +8049,7 @@ struct json_object *jmx_db_api_ipv6_load(struct json_object *req)
     /* Enumerate WAN interfaces that have IPv6 addresses */
     if (jmx_db_init() == 0 && db_prepare(&st,
         "SELECT i.name,i.device,i.carrier,s.online,s.rx_bytes,s.tx_bytes,s.rx_rate,s.tx_rate "
-        "FROM net_interfaces i LEFT JOIN net_interface_state s ON s.rowid=(SELECT rowid FROM net_interface_state WHERE iface_id=i.iface_id ORDER BY ts DESC LIMIT 1) "
+        "FROM net_interfaces i LEFT JOIN net_interface_state s ON s.iface_id=i.iface_id "
         "WHERE i.kind='wan' ORDER BY i.name LIMIT ?1") == 0) {
         sqlite3_bind_int(st, 1, limit);
         while (sqlite3_step(st) == SQLITE_ROW) {
@@ -6864,7 +8096,7 @@ struct json_object *jmx_db_api_ipv6_load(struct json_object *req)
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data);
 }
 
-static long long jmx_read_ll_file(const char*p){FILE*f=fopen(p,"r");long long v=0;if(f){fscanf(f,"%lld",&v);fclose(f);}return v;}
+static long long jmx_read_ll_file(const char*p){FILE*f=fopen(p,"r");long long v=0;if(f){if(fscanf(f,"%lld",&v)!=1)v=0;fclose(f);}return v;}
 static void jmx_add_vpn_if(struct json_object*protos,const char*proto,const char*ifn,const char*name){struct json_object*arr=NULL,*o=json_object_new_object();char path[256];json_object_object_get_ex(protos,proto,&arr);if(!arr)return;snprintf(path,sizeof(path),"/sys/class/net/%s/statistics/rx_bytes",ifn);long long rx=jmx_read_ll_file(path);snprintf(path,sizeof(path),"/sys/class/net/%s/statistics/tx_bytes",ifn);long long tx=jmx_read_ll_file(path);json_object_object_add(o,"id",json_object_new_string(ifn));json_object_object_add(o,"order",json_object_new_int(0));json_object_object_add(o,"name",json_object_new_string(name?name:ifn));json_object_object_add(o,"note",json_object_new_string("runtime interface scan"));json_object_object_add(o,"ifname",json_object_new_string(ifn));json_object_object_add(o,"device",json_object_new_string(ifn));json_object_object_add(o,"up_rate",json_object_new_int64(0));json_object_object_add(o,"up_bytes",json_object_new_int64(tx));json_object_object_add(o,"down_rate",json_object_new_int64(0));json_object_object_add(o,"down_bytes",json_object_new_int64(rx));json_object_object_add(o,"connections",json_object_new_int(0));json_object_array_add(arr,o);}
 struct json_object *jmx_db_api_vpn_status(struct json_object *req)
 {(void)req;static const char*pns[]={"pptp","l2tp","openvpn","ipsec","ikev2","wireguard",NULL};struct json_object*d=json_object_new_object(),*protos=json_object_new_object();for(int i=0;pns[i];i++)json_object_object_add(protos,pns[i],json_object_new_array());DIR*dir=opendir("/sys/class/net");struct dirent*e;if(dir){while((e=readdir(dir))){const char*n=e->d_name;if(!strcmp(n,".")||!strcmp(n,".."))continue;if(!strncmp(n,"wg",2))jmx_add_vpn_if(protos,"wireguard",n,n);else if(!strncmp(n,"tun",3)||!strncmp(n,"tap",3)||strstr(n,"ovpn"))jmx_add_vpn_if(protos,"openvpn",n,n);else if(!strncmp(n,"ppp",3))jmx_add_vpn_if(protos,"pptp",n,n);else if(strstr(n,"ipsec")||!strncmp(n,"xfrm",4))jmx_add_vpn_if(protos,"ipsec",n,n);}closedir(dir);}json_object_object_add(d,"ts",json_object_new_int64((int64_t)time(NULL)));json_object_object_add(d,"protocols",protos);return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
@@ -6873,5 +8105,5 @@ struct json_object *jmx_db_api_client_detail(struct json_object *req)
 {struct json_object*d=json_object_new_object(),*arr=json_object_new_array();const char*q="";struct json_object*v=NULL;if(req&&json_object_object_get_ex(req,"query",&v))q=json_object_get_string(v);client_node_t*c=NULL;list_for_each_entry(c,&client_list,client){if(q&&*q&&(!strstr(c->mac,q)&&!strstr(c->ip,q)&&!strstr(c->hostname,q)&&!strstr(c->nickname,q)))continue;struct json_object*o=json_object_new_object();json_object_object_add(o,"mac",json_object_new_string(c->mac));json_object_object_add(o,"ip",json_object_new_string(c->ip));json_object_object_add(o,"ipv6",json_object_new_string(c->ipv6));json_object_object_add(o,"hostname",json_object_new_string(c->hostname));json_object_object_add(o,"nickname",json_object_new_string(c->nickname));json_object_object_add(o,"up_rate",json_object_new_int64(c->up_rate));json_object_object_add(o,"down_rate",json_object_new_int64(c->down_rate));json_object_object_add(o,"online",json_object_new_boolean(c->online));json_object_object_add(o,"online_time",json_object_new_int64(c->online_time));json_object_object_add(o,"offline_time",json_object_new_int64(c->offline_time));json_object_object_add(o,"visiting_url",json_object_new_string(c->visiting_url));json_object_object_add(o,"visiting_app",json_object_new_int(c->visiting_app));json_object_array_add(arr,o);}json_object_object_add(d,"ts",json_object_new_int64((int64_t)time(NULL)));json_object_object_add(d,"clients",arr);return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
 
 struct json_object *jmx_db_api_system_health(struct json_object *req)
-{(void)req;struct json_object*d=json_object_new_object(),*sys=json_object_new_object(),*traf=json_object_new_object();char host[128]={0};FILE*f=fopen("/proc/sys/kernel/hostname","r");if(f){fgets(host,sizeof(host),f);host[strcspn(host,"\r\n")]=0;fclose(f);}long long mt=0,ma=0,freev=0,buff=0,cached=0;char key[64];long long val;f=fopen("/proc/meminfo","r");if(f){while(fscanf(f,"%63s %lld kB",key,&val)==2){if(!strcmp(key,"MemTotal:"))mt=val*1024;else if(!strcmp(key,"MemAvailable:"))ma=val*1024;else if(!strcmp(key,"MemFree:"))freev=val*1024;else if(!strcmp(key,"Buffers:"))buff=val*1024;else if(!strcmp(key,"Cached:"))cached=val*1024;}fclose(f);}if(!ma)ma=freev+buff+cached;struct statvfs sv;long long dt=0,du=0;if(statvfs("/",&sv)==0){dt=(long long)sv.f_blocks*sv.f_frsize;du=(long long)(sv.f_blocks-sv.f_bfree)*sv.f_frsize;}double up=0,la=0;f=fopen("/proc/uptime","r");if(f){fscanf(f,"%lf",&up);fclose(f);}f=fopen("/proc/loadavg","r");if(f){fscanf(f,"%lf",&la);fclose(f);}json_object_object_add(sys,"hostname",json_object_new_string(host));json_object_object_add(sys,"model",json_object_new_string("DreamingWrt"));json_object_object_add(sys,"uptime",json_object_new_int((int)up));json_object_object_add(sys,"cpu_percent",json_object_new_int((int)(la*100)));json_object_object_add(sys,"mem_total",json_object_new_int64(mt));json_object_object_add(sys,"mem_used",json_object_new_int64(mt>ma?mt-ma:0));json_object_object_add(sys,"disk_total",json_object_new_int64(dt));json_object_object_add(sys,"disk_used",json_object_new_int64(du));json_object_object_add(sys,"client_num",json_object_new_int(0));json_object_object_add(traf,"up_rate",json_object_new_int64(0));json_object_object_add(traf,"down_rate",json_object_new_int64(0));json_object_object_add(d,"ts",json_object_new_int64((int64_t)time(NULL)));json_object_object_add(d,"system",sys);json_object_object_add(d,"traffic",traf);return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
+{(void)req;struct json_object*d=json_object_new_object(),*sys=json_object_new_object(),*traf=json_object_new_object();char host[128]={0};FILE*f=fopen("/proc/sys/kernel/hostname","r");if(f){if(!fgets(host,sizeof(host),f))host[0]=0;host[strcspn(host,"\r\n")]=0;fclose(f);}long long mt=0,ma=0,freev=0,buff=0,cached=0;char key[64];long long val;f=fopen("/proc/meminfo","r");if(f){while(fscanf(f,"%63s %lld kB",key,&val)==2){if(!strcmp(key,"MemTotal:"))mt=val*1024;else if(!strcmp(key,"MemAvailable:"))ma=val*1024;else if(!strcmp(key,"MemFree:"))freev=val*1024;else if(!strcmp(key,"Buffers:"))buff=val*1024;else if(!strcmp(key,"Cached:"))cached=val*1024;}fclose(f);}if(!ma)ma=freev+buff+cached;struct statvfs sv;long long dt=0,du=0;if(statvfs("/",&sv)==0){dt=(long long)sv.f_blocks*sv.f_frsize;du=(long long)(sv.f_blocks-sv.f_bfree)*sv.f_frsize;}double up=0,la=0;f=fopen("/proc/uptime","r");if(f){if(fscanf(f,"%lf",&up)!=1)up=0;fclose(f);}f=fopen("/proc/loadavg","r");if(f){if(fscanf(f,"%lf",&la)!=1)la=0;fclose(f);}json_object_object_add(sys,"hostname",json_object_new_string(host));json_object_object_add(sys,"model",json_object_new_string("DreamingWrt"));json_object_object_add(sys,"uptime",json_object_new_int((int)up));json_object_object_add(sys,"cpu_percent",json_object_new_int((int)(la*100)));json_object_object_add(sys,"mem_total",json_object_new_int64(mt));json_object_object_add(sys,"mem_used",json_object_new_int64(mt>ma?mt-ma:0));json_object_object_add(sys,"disk_total",json_object_new_int64(dt));json_object_object_add(sys,"disk_used",json_object_new_int64(du));json_object_object_add(sys,"client_num",json_object_new_int(0));json_object_object_add(traf,"up_rate",json_object_new_int64(0));json_object_object_add(traf,"down_rate",json_object_new_int64(0));json_object_object_add(d,"ts",json_object_new_int64((int64_t)time(NULL)));json_object_object_add(d,"system",sys);json_object_object_add(d,"traffic",traf);return jmx_gen_api_response_data(API_CODE_SUCCESS,d);}
 struct json_object *jmx_db_api_lan_config(struct json_object *req) { (void)req; return jmx_netconfig_lan_list(); }

@@ -5,7 +5,9 @@ import unittest
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src" / "webd" / "jmx_app_api.c"
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text
 
 
 def function_body(source, name):
@@ -29,7 +31,7 @@ def function_body(source, name):
 
 class DashboardWanRestMergeContractTest(unittest.TestCase):
     def setUp(self):
-        self.source = SOURCE.read_text(encoding="utf-8")
+        self.source = webd_dispatch_text()
 
     def test_line_load_merge_preserves_runtime_device(self):
         body = function_body(self.source, "webd_merge_wan_load_item")

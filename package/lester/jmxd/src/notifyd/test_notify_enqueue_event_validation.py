@@ -16,6 +16,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 NOTIFYD_DB = ROOT / "src" / "notifyd" / "notifyd_db.c"
 NOTIFYD_UBUS = ROOT / "src" / "notifyd" / "notifyd_ubus.c"
+EVENT_SEMANTICS = ROOT / "src" / "event_semantics.c"
 
 
 def read(path: Path) -> str:
@@ -68,9 +69,11 @@ def c_function(source: str, marker: str) -> str:
 
 
 def catalog_ids(source: str) -> set[str]:
-    start = source.index("static const struct notifyd_event_definition notifyd_event_definitions[]")
-    end = source.index("static void notifyd_event_ids_json(", start)
-    return set(re.findall(r'\{\s*"([A-Z0-9_]+)"', source[start:end]))
+    start = source.index("dw_event_definitions[]")
+    table = source[start:]
+    if end := table.find("\n};"):
+        table = table[:end]
+    return set(re.findall(r'DW_EVENT\(\s*"([A-Z0-9_]+)"', table))
 
 
 def test_unknown_and_missing_event_are_rejected_before_routing():
@@ -91,13 +94,13 @@ def test_unknown_and_missing_event_are_rejected_before_routing():
 
 def test_lookup_covers_pending_definitions_too():
     source = read(NOTIFYD_DB)
-    finder = c_function(source, "static const struct notifyd_event_definition *notifyd_event_definition_find(")
+    finder = c_function(source, "static const struct dw_event_definition *notifyd_event_definition_find(")
     # Matching on `available` would reject catalog ids whose producer is not
     # wired up yet, turning "not collected" into "rejected".
     assert "available" not in finder, \
         "lookup must not filter on the available flag"
 
-    ids = catalog_ids(source)
+    ids = catalog_ids(read(EVENT_SEMANTICS))
     for required in ("WAN_DOWN", "PROXY_EGRESS_DRIFT", "ISP_PACKET_LOSS"):
         assert required in ids, f"{required} should be a catalog id"
 
@@ -117,7 +120,7 @@ def test_ubus_layer_returns_nonzero_status():
 def test_real_producer_ids_are_all_in_the_catalog():
     """Guards the compatibility risk: validation must not start rejecting a
     live producer's event. Every id enqueued in-tree has to be a catalog id."""
-    ids = catalog_ids(read(NOTIFYD_DB))
+    ids = catalog_ids(read(EVENT_SEMANTICS))
     used = set()
     for path in ROOT.rglob("*.c"):
         if "notifyd_db.c" in path.name:

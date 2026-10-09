@@ -110,6 +110,10 @@ html[data-theme-resolved="light"] {
   color: var(--color-text-primary, var(--app-text));
 }
 
+/* Runtime host for legacy bare selects. It supplies a field ancestor without
+   inserting a new layout box into page grids and toolbars. */
+.dwrt-kit-field.dwrt-kit-adopted-field { display: contents; }
+
 .dwrt-kit-field > :where(label, [data-dwrt-field-label], span:first-child) {
   font-size: 13px;
   line-height: 1.4;
@@ -133,7 +137,41 @@ html[data-theme-resolved="light"] {
 
 .dwrt-kit-field [data-dwrt-field-description] { color: var(--color-text-muted, var(--app-text-muted)); font-size: 12px; line-height: 1.4; }
 .dwrt-kit-field [data-dwrt-field-error] { color: var(--color-danger, #ef5b66); font-size: 12px; line-height: 1.4; }
-.dwrt-kit-select { appearance: none; padding-right: 36px; }
+/*
+ * 裸 select 也要拿到 Kit field 材质（Acceptance-to-Front P1 组件逃逸单）。
+ *
+ * 上面那条控件材质挂在 `.dwrt-kit-field` 的**后代**选择器上，于是没有 field 祖先的
+ * `<select class="dwrt-kit-select">` 只吃到下面这行 `appearance: none`，边框与底色全靠页面
+ * 自己兜。30.1 实机取样 10 条路由 16 个 select 未包 field，其中 9 个计算出的 appearance
+ * 仍是 auto，闭合态直接被 WebKit 画成 macOS 原生小控件；另外 7 个虽然 appearance 为 none，
+ * 但进抽屉 portal 后变量链一断就回落成白底。
+ *
+ * 正确的长期形状仍然是「每个 select 包在 field 容器里」（design.md:1090）。Kit 会为历史
+ * 裸控件补一个 `display: contents` 的 field 宿主；这条样式同时作为挂载前的材质兜底，避免
+ * 首帧闪成系统控件。选择器写成 `:not(.dwrt-kit-field *)`，挂载完成后控件改走上面那条。
+ *
+ * 注意这只管闭合态。展开后的选项菜单是系统控件，CSS 接管不了——需要自绘弹层、搜索或大量
+ * 选项时必须改用 `dwrt-kit-combobox`，不要指望这里能把原生菜单也变成主题样式。
+ */
+.dwrt-kit-select:not(.dwrt-kit-field *) {
+  width: 100%;
+  min-width: 0;
+  min-height: 44px;
+  border: 1px solid var(--color-border-control, color-mix(in srgb, var(--app-text) 18%, transparent));
+  border-radius: 6px;
+  /* 只写上下与左侧：右侧内边距由下面 `.dwrt-kit-select` 那条统一给到 36px 留出箭头位。
+     写成 `padding` 简写会把它重置回 12px，箭头压在文字上。 */
+  padding-block: 8px;
+  padding-inline-start: 12px;
+  color: var(--color-text-primary, var(--app-text));
+  background: var(--color-surface-control, color-mix(in srgb, var(--app-text) 5%, transparent));
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.4;
+  letter-spacing: 0;
+}
+
+.dwrt-kit-select { appearance: none; -webkit-appearance: none; padding-right: 36px; }
 
 .dwrt-kit-combobox { position: relative; min-width: 0; }
 .dwrt-kit-combobox-trigger {
@@ -255,18 +293,19 @@ html[data-theme-resolved="light"] {
   display: inline-grid;
   grid-auto-flow: column;
   grid-auto-columns: minmax(88px, 1fr);
-  gap: 2px;
+  gap: 3px;
   padding: 3px;
   border: 1px solid var(--color-border-control, color-mix(in srgb, var(--app-text) 18%, transparent));
-  border-radius: 6px;
-  background: var(--color-surface-control, color-mix(in srgb, var(--app-text) 5%, transparent));
+  border-radius: 14px;
+  background: color-mix(in srgb, var(--color-surface-control, rgba(0,0,0,.26)) 88%, transparent);
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.055);
 }
 
 .dwrt-kit-segmented [data-dwrt-segment] {
   min-width: 44px;
   min-height: 44px;
   border: 0;
-  border-radius: 4px;
+  border-radius: 11px;
   padding: 6px 12px;
   color: var(--color-text-muted, var(--app-text-muted));
   background: transparent;
@@ -280,6 +319,7 @@ html[data-theme-resolved="light"] {
 .dwrt-kit-segmented [data-dwrt-segment].is-active {
   color: var(--color-on-accent, var(--app-text));
   background: var(--color-accent, var(--app-accent));
+  box-shadow: 0 3px 10px color-mix(in srgb, var(--color-accent, var(--app-accent)) 34%, transparent);
 }
 
 .dwrt-kit-segmented [data-dwrt-segment]:disabled { cursor: not-allowed; opacity: .52; }
@@ -399,9 +439,43 @@ html[data-theme-resolved="light"] {
   padding: 12px clamp(12px, 1.25vw, 20px);
 }
 
+/*
+ * Surface 材质基线的圆角按组件角色取刻度，不再钉死 8px。
+ *
+ * 这两条属性选择器权重是 0,2,0，而所有靠类名声明卡片圆角的规则（`.dwrt-kit-table-wrap`
+ * 等）是 0,1,0，所以一旦它们自带 `border-radius: 8px`，就会压过卡片刻度。更糟的是
+ * `data-dwrt-surface` 多数时候不是页面写的，而是 `mountDataTable()` /
+ * `mountVirtualDataTable()` / `mountPageShell()` 自动补上的，于是「越按 kit 规范写的页面
+ * 越会被压成 8px」——`#/network/global-config` 与 `#/network/qwrt-modules` 就是这么逃逸的，
+ * 而另外 11 个同类主表卡只是靠各自页面 CSS 又写一遍 24px 才绕开。
+ *
+ * 修法是让材质只管材质：圆角交给 `--dwrt-kit-surface-radius`，默认仍是紧凑档 8px（真正
+ * 密集的属性行、内联面板不受影响），大面组件在下面把它抬到卡片刻度。不要再让消费方各写
+ * 一遍 `border-radius: var(--app-radius-card)` 来纠偏。
+ */
+[data-dwrt-component][data-dwrt-surface] {
+  --dwrt-kit-surface-radius: var(--app-radius-compact, 8px);
+}
+
+[data-dwrt-component][data-dwrt-surface]:is(
+  .dwrt-kit-table-wrap,
+  .dwrt-kit-virtual-table,
+  .dwrt-kit-page-shell,
+  .dwrt-kit-page-surface,
+  .dwrt-kit-sheet,
+  .dwrt-kit-modal,
+  .dwrt-kit-overview-card,
+  [data-dwrt-component="surface"],
+  [data-dwrt-component="page-shell"],
+  [data-dwrt-component="data-table"],
+  [data-dwrt-component="virtual-data-table"]
+) {
+  --dwrt-kit-surface-radius: var(--app-radius-card, var(--dwrt-kit-radius));
+}
+
 [data-dwrt-component][data-dwrt-surface="stable-glass"] {
   border: 1px solid var(--dwrt-glass-edge, color-mix(in srgb, var(--app-text) 14%, transparent));
-  border-radius: 8px;
+  border-radius: var(--dwrt-kit-surface-radius, var(--app-radius-compact, 8px));
   color: var(--color-text-primary, var(--app-text));
   background: var(--color-surface-stable, var(--dwrt-glass-surface));
   box-shadow: var(--dwrt-glass-shadow, 0 12px 28px rgba(0, 0, 0, 0.12));
@@ -411,7 +485,7 @@ html[data-theme-resolved="light"] {
 
 [data-dwrt-component][data-dwrt-surface="dense-surface"] {
   border: 1px solid var(--color-border-subtle, color-mix(in srgb, var(--app-text) 12%, transparent));
-  border-radius: 8px;
+  border-radius: var(--dwrt-kit-surface-radius, var(--app-radius-compact, 8px));
   color: var(--color-text-primary, var(--app-text));
   background: var(--color-surface-dense, rgb(10 16 25 / 0.78));
   box-shadow: inset 0 1px 0 color-mix(in srgb, var(--app-text) 7%, transparent);
@@ -1033,6 +1107,56 @@ html[data-theme-resolved="light"] .dwrt-risk-meter {
     padding-inline: 20px;
     font-size: 15px;
   }
+}
+
+/* Opt-in sidebar geometry; page tabs continue to own the track and pill material. */
+.dwrt-kit-tabs.dwrt-kit-sidebar-tabs {
+  --dwrt-page-tab-height: 52px;
+  --dwrt-page-tab-pad: 4px;
+  width: 100%;
+  min-width: 0;
+  height: var(--dwrt-page-tab-height);
+  display: flex;
+  flex: 0 0 auto;
+  gap: 0;
+  overflow: hidden;
+}
+
+.dwrt-kit-sidebar-tabs > .dwrt-kit-tab {
+  flex: 1 1 0;
+  min-width: 0;
+  gap: 6px;
+  padding-inline: 8px;
+  font-size: 13px;
+  font-weight: 650;
+  letter-spacing: 0;
+}
+
+.dwrt-kit-sidebar-tab-icon,
+.dwrt-kit-sidebar-tab-icon > :is(svg, i) {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 18px;
+  width: 18px;
+  height: 18px;
+}
+
+.dwrt-kit-sidebar-tab-label {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dwrt-kit-sidebar-tabs[data-dwrt-sidebar-tabs-icons-only="true"] .dwrt-kit-sidebar-tab-label {
+  display: none;
+}
+
+.dwrt-kit-sidebar-tabs > .dwrt-kit-tab:disabled,
+.dwrt-kit-sidebar-tabs > .dwrt-kit-tab[aria-disabled="true"] {
+  cursor: not-allowed;
+  opacity: .52;
+  transform: none;
 }
 
 /* 纵向 tab：一栏卡片式导航，收编自 dreamingproxy。
@@ -2738,6 +2862,23 @@ body:has(.dwrt-kit-modal-layer.is-open) {
 }
 
 /*
+ * 遮罩守卫（CSS 兜底）。
+ *
+ * 遮罩是 `position: fixed; inset: 0` 的全视口 <button>，`.is-open` 时 pointer-events: auto。
+ * 抽屉关掉后它若还带着 is-open，页面就对一切点击无反应，而 opacity 已经是 0，屏幕上看不出
+ * 任何异常 —— 表现就是「卡死，刷新才好」。JS 侧已在每条关闭/卸载路径摘除，这里再用兄弟
+ * 选择器兜一层：紧随其后的那个抽屉没有 is-open 时，遮罩一律不许拦事件。
+ *
+ * 只压 pointer-events 不压 opacity：滑出动画期间 paintSheet() 正把 opacity 往 0 推，
+ * 让它继续按动画淡出，避免背景板突然消失。
+ */
+.dwrt-kit-sheet-overlay.is-open:has(+ .dwrt-kit-sheet:not(.is-open)),
+.dwrt-kit-sheet-overlay.is-open:has(+ [data-dwrt-component="sheet"]:not(.is-open)),
+.dwrt-kit-sheet-overlay.is-open:has(+ [data-dwrt-component="filter-sheet"]:not(.is-open)) {
+  pointer-events: none;
+}
+
+/*
  * 抽屉传送门容器。它自己绝不能带 transform / filter / contain / perspective，
  * 否则又会成为新的包含块，等于把问题搬到了另一层。零尺寸、不拦事件。
  */
@@ -3075,7 +3216,9 @@ body:has(.dwrt-kit-modal-layer.is-open) {
   z-index: 0;
   overflow: hidden;
   border-radius: inherit;
-  background: #050710;
+  /* A real surface fallback keeps the first compositor frame readable while
+     the mirrored app wallpaper is still loading or being moved into portal. */
+  background: var(--color-surface-solid, var(--app-surface-solid, #172131));
 }
 
 .dwrt-kit-sheet-wallpaper img {
@@ -3091,6 +3234,13 @@ body:has(.dwrt-kit-modal-layer.is-open) {
   object-position: 50% 50%;
 }
 
+/* A side Sheet is always right-anchored. Aligning its viewport-sized wallpaper
+   from the same edge avoids retaining a pre-portal left coordinate. */
+.dwrt-kit-sheet .dwrt-kit-sheet-wallpaper img {
+  left: auto;
+  right: 0;
+}
+
 .dwrt-kit-sheet-material {
   z-index: 1;
   border-radius: inherit;
@@ -3102,6 +3252,13 @@ body:has(.dwrt-kit-modal-layer.is-open) {
     inset 0 -24px 40px rgba(3,8,18,0.10);
   backdrop-filter: blur(var(--dwrt-glass-base-blur, 3.2px)) saturate(var(--dwrt-glass-saturation, 140%));
   -webkit-backdrop-filter: blur(var(--dwrt-glass-base-blur, 3.2px)) saturate(var(--dwrt-glass-saturation, 140%));
+}
+
+.dwrt-kit-sheet[data-dwrt-wallpaper-ready="false"] .dwrt-kit-sheet-material,
+.dwrt-kit-modal[data-dwrt-wallpaper-ready="false"] .dwrt-kit-sheet-material {
+  background: var(--color-surface-solid, var(--app-surface-solid, #172131));
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
 }
 
 .dwrt-kit-sheet[data-dwrt-sheet-variant="copilot"] > :not(.dwrt-kit-sheet-wallpaper, .dwrt-kit-sheet-material, .dwrt-glass-canvas),
@@ -3263,17 +3420,15 @@ button.dwrt-risk-meter {
     -webkit-backdrop-filter: none;
   }
 
-  .dwrt-kit-sheet[data-dwrt-sheet-variant="copilot"] .dwrt-kit-sheet-wallpaper,
-  .dwrt-kit-modal[data-dwrt-modal-variant="copilot"] .dwrt-kit-sheet-wallpaper {
-    display: none;
-  }
-
-  .dwrt-kit-sheet[data-dwrt-sheet-variant="copilot"] .dwrt-kit-sheet-material,
-  .dwrt-kit-modal[data-dwrt-modal-variant="copilot"] .dwrt-kit-sheet-material {
-    background: var(--color-surface-solid, var(--app-surface-solid, #172131));
+  /* Copilot sheets own a wallpaper + material stack. The broad stable-glass
+     fallback above must not paint an opaque base beneath that stack. */
+  .dwrt-kit-sheet[data-dwrt-sheet-variant="copilot"],
+  .dwrt-kit-modal[data-dwrt-modal-variant="copilot"] {
+    background: transparent;
     backdrop-filter: none;
     -webkit-backdrop-filter: none;
   }
+
 }
 
 @media (prefers-contrast: more) {

@@ -1,0 +1,71 @@
+/* DreamingWrt ad analyzer: host material, Kit controls, page geometry only. */
+.ada-host,.ada-host * { box-sizing:border-box; }
+.console-stage:has(> .ada-host) { grid-template-rows:minmax(0,1fr); align-items:stretch; height:var(--app-stage-height); min-height:0; padding:var(--app-page-gutter-block,14px) var(--app-page-gutter-inline,14px); overflow:hidden; }
+.console-stage > .route-preview.ada-host { display:block; width:100%; max-width:100%; height:100%; min-height:0; margin:0; padding:0; border:0; border-radius:0; background:transparent; box-shadow:none; overflow:hidden; }
+@media (max-width:720px) { .console-stage:has(> .ada-host) { height:calc(100dvh - var(--app-content-inset-top,0px) - var(--app-mobile-nav-bottom-inset,0px)) !important; } }
+.ada-host { min-width: 0; min-height: 0; height: 100%; color: var(--dwrt-ink); font-size: var(--dwrt-type-body,14px); }
+.ada-app { display:flex; height:100%; min-width:0; min-height:0; container:ada / inline-size; }
+.ada-main { display:flex; flex:1; flex-direction:column; gap:var(--app-page-gap,12px); min-width:0; min-height:0; overflow:auto; padding:var(--app-page-gutter,16px); }
+.ada-host [hidden] { display:none !important; }
+.ada-toolbar,.ada-filters,.ada-actions,.ada-status,.ada-sessions { display:flex; flex-wrap:wrap; align-items:center; gap:8px; min-width:0; }
+.ada-toolbar { justify-content:space-between; }
+.ada-field { display:flex; flex:1 1 160px; flex-direction:column; gap:4px; min-width:0; }
+.ada-field > span { color:var(--dwrt-muted); font-size:var(--dwrt-type-meta,12px); }
+.ada-field input,.ada-field select,.ada-field textarea { min-width:0; }
+.ada-field.ada-search { flex:1 1 220px; }
+.ada-field.ada-narrow { flex:0 1 150px; }
+.ada-tabs { align-self:flex-start; flex-shrink:0; }
+.ada-pane { display:flex; flex-direction:column; gap:var(--app-page-gap,12px); min-width:0; }
+.ada-pane > .ada-field { flex:0 0 auto; }
+.ada-panel > .ada-filters,.ada-panel > .ada-actions,.ada-panel > details { padding:8px 12px; }
+:root[data-desktop-app="true"] .ada-panel { background:transparent; box-shadow:none; backdrop-filter:none; }
+.ada-panel { min-width:0; min-height:0; }
+.ada-workspace { display:grid; grid-template-columns:minmax(0,1fr) minmax(230px,28%); align-items:start; gap:var(--app-page-gap,12px); min-width:0; }
+.ada-evidence { padding:12px; border-inline-start:1px solid var(--dwrt-glass-edge-strong); min-width:0; overflow-wrap:anywhere; }
+.ada-evidence h3,.ada-decisions h3 { font-size:var(--dwrt-type-section,16px); margin:0 0 8px; }
+.ada-evidence dl { display:grid; gap:6px; margin:0; }
+.ada-evidence dt { font-size:var(--dwrt-type-meta,12px); color:var(--dwrt-muted); }
+.ada-evidence dd { margin:0 0 8px; }
+.ada-evidence ul { padding-inline-start:20px; }
+.ada-table-scroll { min-width:0; max-height:55vh; overflow:auto; }
+.ada-table { min-width:670px; width:100%; table-layout:fixed; }
+.ada-table th:first-child { width:44px; }
+.ada-table th:nth-child(2) { width:36%; }
+.ada-table th { position:sticky; top:0; }
+.ada-domain { color:var(--dwrt-ink); font:inherit; background:none; border:0; text-align:start; padding:6px 0; overflow-wrap:anywhere; cursor:pointer; }
+.ada-domain:hover { color:var(--color-accent); }
+.ada-host :focus-visible { outline:2px solid var(--color-accent); outline-offset:2px; }
+.ada-host td { overflow-wrap:anywhere; font-variant-numeric:tabular-nums; }
+.ada-table td { white-space:normal; }
+.ada-meta,.ada-muted { color:var(--dwrt-muted); font-size:var(--dwrt-type-meta,12px); line-height:1.6; }
+.ada-notice { margin:0; padding:10px 12px; border:1px solid var(--dwrt-glass-edge-strong); border-radius:var(--app-radius-control,12px); overflow-wrap:anywhere; }
+.ada-notice[role=alert] { border-color:var(--color-warning,var(--color-accent)); }
+.ada-empty { padding:28px 16px; color:var(--dwrt-muted); line-height:1.7; }
+.ada-status { color:var(--dwrt-text); font-size:var(--dwrt-type-meta,12px); }
+.ada-status span { overflow-wrap:anywhere; }
+.ada-timeline { display:flex; gap:6px; padding:8px 0; overflow:auto; }
+.ada-timeline button { flex:0 0 auto; }
+.ada-decisions { border-top:1px solid var(--dwrt-glass-edge); padding:12px 0; }
+.ada-decisions p { overflow-wrap:anywhere; }
+.ada-history-list { display:grid; gap:8px; }
+.ada-report-row { display:flex; align-items:center; gap:10px; padding:12px; border-bottom:1px solid var(--dwrt-glass-edge); min-width:0; }
+.ada-report-row > div { flex:1; min-width:0; overflow-wrap:anywhere; }
+.ada-history-detail { border-top:1px solid var(--dwrt-glass-edge); padding-top:12px; }
+.ada-host pre { white-space:pre-wrap; overflow-wrap:anywhere; font-size:12px; max-height:300px; overflow:auto; }
+.ada-app .dwrt-rail { box-sizing:border-box; height:100%; }
+.ada-app .dwrt-rail-item { width:100%; }
+.ada-app .dwrt-rail-item svg { width:22px; height:22px; }
+.ada-standalone,.ada-standalone body { margin:0; height:100%; background:transparent; }
+.ada-standalone #adAnalyzerRoot { height:100%; }
+@container ada (max-width:950px) { .ada-workspace { grid-template-columns:minmax(0,1fr); } .ada-evidence { border-inline-start:0; border-top:1px solid var(--dwrt-glass-edge); } }
+@container ada (max-width:720px) { .ada-app .dwrt-rail { --dwrt-rail-width:64px; padding:10px 6px; } .ada-app .dwrt-rail-brand,.ada-app .dwrt-rail-item-text,.ada-app .dwrt-rail-foot { display:none; } .ada-app .dwrt-rail-item { justify-content:center; } .ada-main { padding:12px; } .ada-field,.ada-field.ada-narrow { flex:1 1 140px; } }
+@container ada (max-width:400px) { .ada-field,.ada-field.ada-narrow { flex-basis:100%; } .ada-actions button { flex:1 1 auto; } .ada-main { padding:10px; } }
+.ada-host .ada-table th,.ada-host .ada-table td { white-space:normal; overflow-wrap:anywhere; }
+.ada-host .ada-table { min-width:760px; }
+.ada-trial { margin-block:12px; padding-block:12px; border-block:1px solid var(--dwrt-glass-edge); }
+.ada-trial h3 { margin:0 0 8px; font-size:var(--dwrt-type-section,16px); }
+.ada-connections { min-width:0; overflow-wrap:anywhere; }
+.ada-connections table { min-width:650px; }
+.ada-main { container:ada-main / inline-size; }
+@container ada-main (max-width:1100px) { .ada-workspace { grid-template-columns:minmax(0,1fr); } .ada-evidence { border-inline-start:0; border-top:1px solid var(--dwrt-glass-edge); } }
+.console-stage:has(> .ada-host) > .stage-header { display:none; }

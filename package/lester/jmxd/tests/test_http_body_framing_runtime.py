@@ -22,7 +22,8 @@ import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
-API = ROOT / "src/webd/jmx_app_api.c"
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text
 FIXTURE = ROOT / "tests/http_body_framing_fixture.c"
 
 EXTRACT_START = ("static int http_content_length_from_raw(const char *raw, "
@@ -50,11 +51,11 @@ def check(condition: bool, message: str) -> None:
 
 def parent_writes_nul() -> bool:
     """True when app_api_pending_fd_cb() still terminates at header_len."""
-    return PARENT_TERMINATOR in API.read_text()
+    return PARENT_TERMINATOR in webd_dispatch_text()
 
 
 def extract_under_test() -> str:
-    source = API.read_text()
+    source = webd_dispatch_text()
     begin = source.find(EXTRACT_START)
     if begin < 0:
         raise SystemExit(f"extraction anchor not found: {EXTRACT_START!r}")
@@ -65,7 +66,7 @@ def extract_under_test() -> str:
 
 
 def extract_body_len() -> str:
-    source = API.read_text()
+    source = webd_dispatch_text()
     begin = source.find(BODY_LEN_START)
     if begin < 0:
         raise SystemExit(f"body-length anchor not found: {BODY_LEN_START!r}")

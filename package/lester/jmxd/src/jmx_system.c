@@ -4,6 +4,7 @@
  * Copyright(c) 2026 Lester(CJM) <www.lesterwrt.com>  
 */
 #include <unistd.h>
+#include "jmx_release.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -68,8 +69,6 @@
 #endif
 
 #define JMX_FSTAB_DEFAULT_PATH "/etc/config/fstab"
-#define JMX_RELEASE_PATH "/etc/dreamingwrt-release.json"
-#define JMX_RELEASE_MAX_BYTES (1024 * 1024)
 
 #ifndef JMX_CROND_SPECIAL_TIMES
 #define JMX_CROND_SPECIAL_TIMES 0
@@ -1649,7 +1648,11 @@ static void jmx_mount_apply_swaps(const char *path,
     FILE *fp = fopen(path, "r");
     char line[1024];
     if (!fp) return;
-    (void)fgets(line, sizeof(line), fp);
+    /* Skip the /proc/swaps header; an empty file leaves the probes untouched. */
+    if (!fgets(line, sizeof(line), fp)) {
+        fclose(fp);
+        return;
+    }
     while (fgets(line, sizeof(line), fp)) {
         char source[4096], resolved[PATH_MAX];
         const char *name;
@@ -2770,37 +2773,30 @@ static void jmx_system_release_add_value(struct json_object *system,
 
 void jmx_system_add_release_contract(struct json_object *system)
 {
-    struct stat st;
     struct json_object *release = NULL;
-    const char *error = NULL;
+    const char *source = NULL;
+    char display[256];
     int invalid = 0;
-
-    if (!system || !json_object_is_type(system, json_type_object))
-        return;
-    if (stat(JMX_RELEASE_PATH, &st) != 0) {
-        error = "release_file_unavailable";
-    } else if (!S_ISREG(st.st_mode) || st.st_size <= 0 ||
-               st.st_size > JMX_RELEASE_MAX_BYTES) {
-        error = "release_file_invalid_size";
-    } else {
-        release = json_object_from_file(JMX_RELEASE_PATH);
-        if (!release || !json_object_is_type(release, json_type_object))
-            error = "release_file_invalid_json";
-    }
-
-    jmx_system_release_add_value(system, release, "build_date", &invalid);
-    jmx_system_release_add_value(system, release, "build_id", &invalid);
-    jmx_system_release_add_value(system, release, "dreamingwrt_version", &invalid);
-    jmx_system_release_add_value(system, release, "linux_version", &invalid);
-    json_object_object_add(system, "release_source",
-                           json_object_new_string(JMX_RELEASE_PATH));
-    if (!error && invalid)
-        error = "release_fields_missing_or_invalid";
-    json_object_object_add(system, "release_error",
-                           error ? json_object_new_string(error) :
-                                   json_object_new_null());
-    if (release)
-        json_object_put(release);
+    const char *fields[] = { "build_id", "linux_version", "model", "product" };
+    size_t i;
+    if (!system || !json_object_is_type(system, json_type_object)) return;
+    release = dw_release_read(&source);
+    for (i = 0; i < sizeof(fields) / sizeof(fields[0]); i++)
+        jmx_system_release_add_value(system, release, fields[i], &invalid);
+    const char *build_date = dw_release_string(release, "build_date");
+    if (!build_date[0]) build_date = dw_release_string(release, "build_id");
+    json_object_object_add(system, "build_date", build_date[0] ? json_object_new_string(build_date) : NULL);
+    const char *version = dw_release_version(release);
+    json_object_object_add(system, "version", version[0] ? json_object_new_string(version) : NULL);
+    json_object_object_add(system, "dreamingwrt_version", version[0] ? json_object_new_string(version) : NULL);
+    dw_release_display(release, display, sizeof(display));
+    json_object_object_add(system, "display_version", display[0] ? json_object_new_string(display) : NULL);
+    /* Compatibility API name; there is no separately versioned jmx file. */
+    json_object_object_add(system, "jmx_version", display[0] ? json_object_new_string(display) : NULL);
+    json_object_object_add(system, "release_source", json_object_new_string(source));
+    json_object_object_add(system, "release_error", !release ? json_object_new_string("release_file_unavailable_or_invalid") :
+        !version[0] ? json_object_new_string("release_version_missing") : NULL);
+    if (release) json_object_put(release);
 }
 
 struct json_object *jmx_api_get_system_info(struct json_object *req_obj) {
@@ -2838,7 +2834,11 @@ struct json_object *get_system_status(void)
 
     /* hostname */
     fp = fopen("/proc/sys/kernel/hostname", "r");
-    if (fp) { fgets(hostname, sizeof(hostname), fp); fclose(fp); }
+    if (fp) {
+        if (!fgets(hostname, sizeof(hostname), fp))
+            hostname[0] = '\0';
+        fclose(fp);
+    }
     {
         size_t hl = strlen(hostname);
         while (hl > 0 && (hostname[hl-1] == '\n' || hostname[hl-1] == '\r')) hostname[--hl] = '\0';

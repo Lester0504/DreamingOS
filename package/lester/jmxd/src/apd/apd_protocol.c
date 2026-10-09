@@ -1,5 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "apd_internal.h"
+#include "apd_txpower_mode.h"
+#include "apd_secret_executor.h"
 
 static void apd_capability(struct json_object *cap, struct json_object *reasons,
                            const char *name, int enabled, const char *reason)
@@ -23,7 +25,7 @@ static void apd_hex_public(char out[APD_ED25519_KEY_LEN * 2 + 1],
     out[APD_ED25519_KEY_LEN * 2] = '\0';
 }
 
-static struct json_object *apd_local_error(const char *operation,
+struct json_object *apd_local_error(const char *operation,
                                            const char *reason)
 {
     struct json_object *root = json_object_new_object();
@@ -93,6 +95,19 @@ struct json_object *apd_capabilities_json(void)
                    config_executor ? NULL : "config_executor_unavailable");
     apd_capability(cap, reasons, "rollback", config_executor,
                    config_executor ? NULL : "config_executor_unavailable");
+    apd_capability(cap, reasons, "secret_executor",
+                   apd_secret_executor_available(),
+                   apd_secret_executor_available() ? NULL :
+                   "secret_executor_unavailable");
+    {
+        struct apd_txpower_mode_state txpower;
+
+        apd_txpower_mode_state_collect(&txpower);
+        apd_capability(cap, reasons, "txpower_mode", 1, NULL);
+        apd_capability(cap, reasons, "txpower_mode_set", txpower.supported,
+                       txpower.reason[0] ? txpower.reason :
+                                           "txpower_mode_unavailable");
+    }
     json_object_object_add(cap, "reasons", reasons);
     json_object_object_add(root, "capabilities", cap);
     return root;

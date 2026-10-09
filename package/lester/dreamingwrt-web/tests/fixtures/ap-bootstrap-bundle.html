@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/ui-kit/dwrt-ui-kit.css">
+  <link rel="stylesheet" href="../../files/www/dreamingwrt/static/css/wifi-management.css">
+  <style>
+    :root {
+      --app-page-gutter-block: 14px; --app-page-gutter-inline: 14px; --app-page-gap: 16px;
+      --app-radius-card: 20px; --app-radius-panel: 18px; --app-radius-control: 12px; --app-radius-compact: 8px;
+      --dwrt-kit-radius: 20px; --dwrt-kit-text: #172033; --dwrt-kit-muted: #667085;
+      --dwrt-kit-liquid-surface: rgba(255,255,255,.28); --dwrt-kit-liquid-backdrop: blur(3px) saturate(130%);
+      --dwrt-glass-edge: rgba(255,255,255,.5); --dwrt-glass-shadow: 0 12px 28px rgba(0,0,0,.10);
+    }
+    * { box-sizing: border-box; }
+    html, body, .console-stage { width: 100%; height: 100%; margin: 0; }
+    body { color: #172033; background: linear-gradient(135deg, #b9d4e5, #e6c3a0); font: 13px/1.45 system-ui, sans-serif; }
+    .console-stage { display: grid; }
+    .route-preview { height: 100%; }
+    .dwrt-kit-page-tabs { display: flex; }
+  </style>
+</head>
+<body>
+  <div class="console-stage"><main id="routePreview" class="route-preview"></main></div>
+  <script type="module">
+    const now = Math.floor(Date.now() / 1000);
+    const ca = '-----BEGIN CERTIFICATE-----\nMIIBFAKE-AP-BOOTSTRAP\n-----END CERTIFICATE-----';
+    const bundle = {
+      version: 1,
+      bootstrap_code: 'DWRTCT1-TEST-SECRET',
+      ca_cert_pem: ca,
+      display_once: true,
+      expires_at: now + 3600
+    };
+    const config = {
+      capabilities: { wifi: true, bands: [], save_config: false, apply_config: false },
+      local_wifi: { available: false, phy_count: 0, wireless_present: false, reason: 'no_phy_detected' },
+      radios: [], ssids: [], speed_limits: [], global: {}
+    };
+    const counts = { discovery: 0, confirm: 0, status: 0, aps: 0, capabilities: 0, tokens: 0 };
+    let statusReads = 0;
+    const statusPayload = () => ({
+      binding_id: 'binding-test-1',
+      state: statusReads++ > 0 ? 'adopted' : 'enrollment_pending',
+      poll_interval_ms: 500
+    });
+    const response = (data, ok = true, status = 200) => ({ ok, status, text: async () => JSON.stringify(ok ? { ok: true, data } : data) });
+    const candidate = {
+      ap_id: 'ap-test-1', key_id: 'sha256:TEST-FINGERPRINT', model: 'Gemtek W1700K',
+      mgmt_ip: '192.0.2.10', mgmt_port: 443, trusted: false, adopted_elsewhere: false,
+      confirm_request: { api: '/api/v1/ac/discovery/confirm', method: 'POST', body: { ap_id: 'ap-test-1', ticket: 'opaque-ticket' } }
+    };
+    window.__AP_BOOTSTRAP_COUNTS = counts;
+    window.__AP_BOOTSTRAP_SECRET = bundle.bootstrap_code;
+    window.__AP_BOOTSTRAP_PEM = ca;
+    window.__AP_BOOTSTRAP_WRITES = [];
+    window.__AP_BOOTSTRAP_CLIPBOARD_MODE = 'ok';
+    Object.defineProperty(navigator, 'clipboard', {
+      configurable: true,
+      value: { writeText: async (value) => {
+        if (window.__AP_BOOTSTRAP_CLIPBOARD_MODE === 'fail') throw new Error('clipboard_denied');
+        window.__AP_BOOTSTRAP_WRITES.push(value);
+      } }
+    });
+    window.fetch = async (input, init = {}) => {
+      const url = new URL(String(input), location.href);
+      const method = String(init.method || 'GET').toUpperCase();
+      if (url.pathname === '/api/v1/wifi/config') return response(config);
+      if (url.pathname === '/api/v1/ac/aps') { counts.aps += 1; return response({ items: [], observed_at: now }); }
+      if (url.pathname === '/api/v1/ac/capabilities') {
+        counts.capabilities += 1;
+        return response({ capabilities: {
+          ap_discovery: true, ap_discovery_confirm: true,
+          reasons: {}, pairing_token_ipc: false
+        } });
+      }
+      if (url.pathname === '/api/v1/ac/pairing-tokens') { counts.tokens += 1; return response({ items: [] }); }
+      if (url.pathname === '/api/v1/ac/discovery' && method === 'GET') {
+        counts.discovery += 1;
+        return response({ available: true, confirm_available: true, observed_at: now, items: [candidate] });
+      }
+      if (url.pathname === '/api/v1/ac/discovery/confirm' && method === 'POST') {
+        counts.confirm += 1;
+        return response({
+          binding_id: 'binding-test-1', state: 'enrollment_pending', binding_state: 'enrollment_pending',
+          bootstrap_bundle: bundle, next_step: "jmctl ap pair --bundle '<JSON>'", poll_interval_ms: 500
+        });
+      }
+      if (url.pathname === '/api/v1/ac/ap-bindings/binding-test-1' && method === 'GET') {
+        counts.status += 1;
+        return response(statusPayload());
+      }
+      return response({ error: 'not_found', reason: 'fixture_not_found' }, false, 404);
+    };
+    const { mount } = await import('../../files/www/dreamingwrt/plugins/native/wifi-management.js');
+    const ui = {
+      floatingSavebarMarkup: () => '',
+      confirmationMarkup: ({ id, action, title, description, cancelLabel, confirmLabel, disabled }) => `<div class="dwrt-kit-confirmation-layer is-open" data-dwrt-confirmation="${action}"><section role="dialog" aria-labelledby="${id}-title"><h2 id="${id}-title">${title}</h2><p id="${id}-description">${description}</p><button type="button" data-dwrt-confirm-cancel>${cancelLabel}</button><button type="button" data-dwrt-confirm-accept ${disabled ? 'disabled' : ''}>${confirmLabel}</button></section></div>`
+    };
+    const utils = { escapeHtml: value => String(value ?? '').replace(/[&<>"']/g, character => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[character])) };
+    const context = root => ({ root, item: { id: 'wifi-config' }, ui, utils });
+    let root = document.getElementById('routePreview');
+    let instance = mount(context(root));
+    window.AP_BOOTSTRAP_FIXTURE = {
+      async ready() {
+        for (let attempt = 0; attempt < 100; attempt += 1) {
+          if (root.querySelector('[data-wifi-config-tab="aps"]')) return true;
+          await new Promise(resolve => setTimeout(resolve, 20));
+        }
+        return false;
+      },
+      async remount() {
+        instance?.unmount?.();
+        const nextRoot = document.createElement('main');
+        nextRoot.id = 'routePreview';
+        nextRoot.className = 'route-preview';
+        root.replaceWith(nextRoot);
+        root = nextRoot;
+        instance = mount(context(root));
+        return this.ready();
+      }
+    };
+  </script>
+</body>
+</html>

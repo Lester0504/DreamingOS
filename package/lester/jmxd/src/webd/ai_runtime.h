@@ -41,6 +41,13 @@ struct json_object *webd_ai_runtime_resume(const char *resume_token,
                                            int *http_status);
 int webd_ai_runtime_resume_stream(int fd, const char *resume_token,
                                   const char *actor);
+/* Aggregate readiness for the chat runtime. Pure read: never contacts the
+ * provider and never writes, so it is safe as a JMX_RISK_LOW GET. */
+struct json_object *webd_ai_local_status(int models);
+struct json_object *webd_ai_local_request(const char *method, const char *path,
+    struct json_object *body, const char *actor, int *status);
+struct json_object *webd_ai_local_unavailable(int *http_status);
+struct json_object *webd_ai_runtime_status(int *http_status);
 void webd_ai_runtime_attach_capabilities(struct json_object *response);
 
 #endif

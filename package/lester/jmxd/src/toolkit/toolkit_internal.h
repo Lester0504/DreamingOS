@@ -48,4 +48,8 @@ struct json_object *toolkit_throughput_start(struct json_object *payload);
 struct json_object *toolkit_throughput_status(struct json_object *payload);
 struct json_object *toolkit_throughput_stop(struct json_object *payload);
 
+/* Network diagnostics (toolkit_net.c). Returns NULL when `command` is not a
+ * network command so the caller can fall through to unknown_command. */
+struct json_object *toolkit_net_dispatch(const char *command, struct json_object *payload);
+
 #endif

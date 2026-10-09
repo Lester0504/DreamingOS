@@ -1,4 +1,5 @@
 @import url('/static/css/policy-table.css?v=20260718-18');
+@import url('/static/css/wifi-channel-ai.css?v=20260905-channel-ai-01');
 
 .console-stage.is-wifi-management {
   grid-template-rows: minmax(0, 1fr);
@@ -128,6 +129,79 @@
   gap: 8px;
 }
 
+/*
+ * demo 的页头两颗胶囊：.header-actions { display:flex; gap:12px }，比工具条默认的
+ * 8px 宽一档 —— 两颗都是带文字的宽按钮，8px 会挤在一起。允许换行是我们这边的必需：
+ * demo 是整页宽，我们的页头装在应用外壳的内容列里，窄屏放不下两颗 + 标题一行。
+ */
+.wifi-ap-header-actions {
+  flex-wrap: wrap;
+  gap: 12px;
+}
+
+/*
+ * demo 的 .btn-pill 逐字：padding 10px 22px / radius 20px / 13px 700 / inline-flex
+ * gap 6px / transition .2s。20px 圆角在一颗约 38px 高的胶囊上就是 demo 的胶囊形，
+ * 所以取 --app-radius-panel(18px) —— 写死 20px 会在 --lg-corner-radius 更小的主题里
+ * 比外层容器还圆。
+ *
+ * demo 两个变体都是 color: #fff，那是因为 demo 只有深色一套。.is-glass 在浅色主题下
+ * 白字会直接消失，所以它走 inherit（自适应前景），只有坐在固定蓝底上的 .is-blue 才
+ * 保留白字 —— 那不是主题色，是可读性。
+ */
+.wifi-btn-pill {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  flex: 0 0 auto;
+  padding: 10px 22px;
+  border: 1px solid transparent;
+  border-radius: var(--app-radius-panel);
+  font-size: 13px;
+  font-weight: 700;
+  line-height: 1.15;
+  color: inherit;
+  background: none;
+  cursor: pointer;
+  transition: background .2s ease, border-color .2s ease, transform .2s ease, box-shadow .2s ease;
+}
+
+.wifi-management-shell .wifi-btn-pill svg {
+  width: 15px;
+  height: 15px;
+}
+
+.wifi-btn-pill.is-glass {
+  border-color: var(--wifi-line);
+  background: color-mix(in srgb, var(--app-text) 8%, transparent);
+}
+
+.wifi-btn-pill.is-glass:hover:not(:disabled) {
+  border-color: color-mix(in srgb, currentColor 24%, transparent);
+  background: color-mix(in srgb, var(--app-text) 8%, transparent);
+  transform: translateY(-1px);
+}
+
+.wifi-btn-pill.is-blue {
+  color: #fff;
+  border-color: color-mix(in srgb, var(--wifi-accent) 70%, transparent);
+  background: var(--wifi-accent);
+  box-shadow: 0 4px 15px color-mix(in srgb, var(--wifi-accent) 35%, transparent);
+}
+
+.wifi-btn-pill.is-blue:hover:not(:disabled) {
+  transform: translateY(-1px);
+  box-shadow: 0 6px 18px color-mix(in srgb, var(--wifi-accent) 42%, transparent);
+}
+
+.wifi-btn-pill:disabled {
+  cursor: not-allowed;
+  opacity: .52;
+  transform: none;
+  box-shadow: none;
+}
+
 .wifi-search {
   flex: 0 0 auto;
 }
@@ -186,6 +260,113 @@
 }
 
 .wifi-config-surface .dwrt-kit-state-panel { min-height: 240px; }
+
+.wifi-broadcast-stack {
+  display: grid;
+  gap: var(--app-page-gap, 16px);
+  min-width: 0;
+}
+
+.wifi-resource-card {
+  min-width: 0;
+  overflow: hidden;
+  border-radius: var(--app-radius-card);
+}
+
+.wifi-resource-card-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  min-height: 64px;
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-resource-card-header > div {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.wifi-resource-card-header strong { font-size: 14px; font-weight: 650; }
+.wifi-resource-card-header small { color: var(--wifi-muted); font-size: 12px; line-height: 1.45; }
+
+.wifi-resource-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px 20px;
+  min-height: 52px;
+  padding: 8px 16px;
+  border-top: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-resource-footer.is-managing { flex-wrap: wrap; }
+
+.wifi-resource-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 0;
+  min-width: 0;
+}
+
+.wifi-card-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 34px;
+  padding: 4px 12px;
+  border: 0;
+  color: var(--wifi-accent);
+  background: transparent;
+  cursor: pointer;
+}
+
+.wifi-card-action svg { width: 16px; height: 16px; }
+.wifi-card-action.is-danger { color: var(--wifi-bad); }
+.wifi-card-action:hover:not(:disabled) { background: color-mix(in srgb, currentColor 8%, transparent); }
+.wifi-card-action:focus-visible { outline: 2px solid color-mix(in srgb, var(--wifi-accent) 64%, transparent); outline-offset: -2px; }
+
+.wifi-resource-action-divider {
+  display: block;
+  width: 1px;
+  height: 22px;
+  margin: 0 2px;
+  background: var(--wifi-soft-line);
+}
+
+.wifi-resource-action-note {
+  flex: 1 1 360px;
+  min-width: 0;
+  color: var(--wifi-muted);
+  font-size: 11px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+
+.wifi-config-table table { min-width: 880px; }
+
+.wifi-ssid-select-column {
+  width: 48px;
+  min-width: 48px;
+  padding-inline: 14px !important;
+  text-align: center !important;
+}
+
+.wifi-ssid-select-column input {
+  width: 17px;
+  height: 17px;
+  margin: 0;
+  accent-color: var(--wifi-accent);
+  cursor: pointer;
+}
+
+.wifi-config-table tr[data-wifi-ssid-select-row] { cursor: pointer; }
+.wifi-config-table tr[data-wifi-ssid-select-row].is-selected td { background: color-mix(in srgb, var(--wifi-accent) 12%, transparent); }
+.wifi-config-table tr[data-wifi-ssid-select-row]:focus-visible { outline: 2px solid color-mix(in srgb, var(--wifi-accent) 70%, transparent); outline-offset: -2px; }
 
 .wifi-panel-section {
   min-width: 0;
@@ -291,6 +472,14 @@
   box-shadow: 0 0 0 4px color-mix(in srgb, var(--wifi-ok) 14%, transparent);
 }
 
+/* 同名多频段合并成一行后，「部分频段在广播」既不是开也不是关，需要第三种状态：
+   否则三条 VAP 里停了两条，这一行仍然亮绿，界面上再没有第二行能纠正它。
+   title 里带「3 个频段中 2 个在广播」，所以颜色不是唯一的信息载体。 */
+.wifi-name-cell > i.is-partial {
+  background: var(--wifi-warn);
+  box-shadow: 0 0 0 4px color-mix(in srgb, var(--wifi-warn) 16%, transparent);
+}
+
 .wifi-band-list,
 .wifi-band-picker,
 .wifi-channel-legend,
@@ -315,6 +504,53 @@
 .wifi-band-pill.is-2g { color: #23895a; background: color-mix(in srgb, #31c96b 11%, transparent); }
 .wifi-band-pill.is-5g { color: #286fc0; background: color-mix(in srgb, #3c91ee 11%, transparent); }
 .wifi-band-pill.is-6g { color: #9d6112; background: color-mix(in srgb, #eeb34b 13%, transparent); }
+
+/* 合并行里的每个频段胶囊是该频段 VAP 的编辑入口（一条 VAP 一份配置，合并只是
+   显示层的事）。这里只做按钮化的复位与可点提示：UA 的 button 会带上系统字体和
+   自己的外边距，字号字重仍沿用上面的基础规则，所以不要在这里写 font 简写。 */
+.wifi-band-pill.is-link {
+  margin: 0;
+  font-family: inherit;
+  cursor: pointer;
+  appearance: none;
+  -webkit-appearance: none;
+  transition: border-color .18s ease, box-shadow .18s ease;
+}
+
+.wifi-band-pill.is-link:hover {
+  border-color: color-mix(in srgb, currentColor 45%, transparent);
+}
+
+.wifi-band-pill.is-link:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--wifi-accent) 70%, transparent);
+  outline-offset: 1px;
+}
+
+/* 「未上报」与「0」必须看得出区别：数字用表格数字，缺失用弱化的 --。 */
+.wifi-ssid-unreported {
+  color: var(--app-text-muted);
+  font-variant-numeric: tabular-nums;
+}
+
+/* 合并行里各频段取值不一致时的呈现：把全部取值列出来，再用 <small> 说明这是
+   一行里的多个事实，而不是挑一个当代表。逐频段明细在 title 里。 */
+.wifi-ssid-mixed {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+  font-variant-numeric: tabular-nums;
+}
+
+.wifi-ssid-mixed > small {
+  flex: none;
+  padding: 1px 6px;
+  border: 1px solid var(--wifi-soft-line);
+  border-radius: 999px;
+  color: var(--app-text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
 
 /* 后端没给频段时的占位。刻意不做成药丸徽章 —— 它要看起来像「没有数据」，
    而不是像又一个频段标签，否则等于换个样子继续暗示一个不存在的事实。 */
@@ -439,14 +675,24 @@
 
 .wifi-channel-band header strong { min-width: 64px; font-size: 13px; }
 .wifi-channel-band header span { color: var(--wifi-muted); font-size: 12px; }
+.wifi-channel-band-note { color: var(--wifi-warn); font-size: 11px; }
 
 .wifi-channel-grid {
-  display: grid;
-  grid-template-columns: 66px repeat(var(--channel-count), minmax(20px, 1fr));
-  align-items: center;
+  display: flex;
+  flex-direction: column;
   gap: 5px;
   min-width: max-content;
 }
+
+.wifi-channel-row {
+  display: grid;
+  grid-template-columns: 66px repeat(var(--channel-count), minmax(22px, 1fr));
+  align-items: center;
+  gap: 5px;
+  min-height: 24px;
+}
+
+.wifi-channel-row.is-header { min-height: 20px; }
 
 .wifi-channel-axis,
 .wifi-channel-number {
@@ -464,20 +710,33 @@
 .wifi-channel-cell {
   display: block;
   width: 100%;
-  min-width: 20px;
-  height: 18px;
+  min-width: 22px;
+  height: 22px;
   padding: 0;
   border: 1px solid color-mix(in srgb, currentColor 22%, transparent);
-  border-radius: 2px;
+  border-radius: var(--app-radius-compact);
   background: color-mix(in srgb, currentColor 5%, transparent);
   cursor: pointer;
 }
 
 .wifi-channel-cell.is-using { border-color: var(--wifi-ok); background: var(--wifi-ok); }
-.wifi-channel-cell.is-dfs { background: repeating-linear-gradient(135deg, color-mix(in srgb, currentColor 10%, transparent) 0 2px, transparent 2px 5px); }
+.wifi-channel-cell.is-enabled { border-color: color-mix(in srgb, var(--wifi-accent) 28%, var(--wifi-line)); background: color-mix(in srgb, var(--wifi-accent) 8%, transparent); }
+.wifi-channel-cell.is-dfs,
+.wifi-channel-slot.is-dfs { border-color: color-mix(in srgb, var(--wifi-accent) 34%, var(--wifi-line)); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--wifi-accent) 16%, transparent) 0 3px, transparent 3px 7px); }
 .wifi-channel-cell.is-unavailable { border-color: color-mix(in srgb, var(--wifi-warn) 46%, transparent); background: color-mix(in srgb, var(--wifi-warn) 24%, transparent); }
 .wifi-channel-cell.is-excluded { border-color: color-mix(in srgb, var(--wifi-bad) 38%, transparent); background: color-mix(in srgb, var(--wifi-bad) 22%, transparent); }
+.wifi-channel-cell.is-unknown,
+.wifi-channel-slot.is-unknown { border-color: color-mix(in srgb, var(--wifi-muted) 28%, transparent); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--wifi-muted) 7%, transparent) 0 2px, transparent 2px 6px); }
 .wifi-channel-cell:disabled { opacity: .58; }
+
+.wifi-channel-slot {
+  display: block;
+  min-width: 22px;
+  height: 22px;
+  border: 1px solid color-mix(in srgb, currentColor 18%, transparent);
+  border-radius: var(--app-radius-compact);
+  background: color-mix(in srgb, currentColor 4%, transparent);
+}
 
 .wifi-channel-legend {
   flex-wrap: wrap;
@@ -502,9 +761,26 @@
 }
 
 .wifi-channel-legend .using::before { border-color: var(--wifi-ok); background: var(--wifi-ok); }
-.wifi-channel-legend .dfs::before { background: repeating-linear-gradient(135deg, color-mix(in srgb, currentColor 14%, transparent) 0 2px, transparent 2px 4px); }
+.wifi-channel-legend .enabled::before { border-color: color-mix(in srgb, var(--wifi-accent) 34%, var(--wifi-line)); background: color-mix(in srgb, var(--wifi-accent) 8%, transparent); }
+.wifi-channel-legend .dfs::before { border-color: color-mix(in srgb, var(--wifi-accent) 34%, var(--wifi-line)); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--wifi-accent) 16%, transparent) 0 2px, transparent 2px 4px); }
 .wifi-channel-legend .unavailable::before { border-color: color-mix(in srgb, var(--wifi-warn) 50%, transparent); background: color-mix(in srgb, var(--wifi-warn) 24%, transparent); }
 .wifi-channel-legend .excluded::before { border-color: color-mix(in srgb, var(--wifi-bad) 44%, transparent); background: color-mix(in srgb, var(--wifi-bad) 22%, transparent); }
+.wifi-channel-legend .unknown::before { border-color: color-mix(in srgb, var(--wifi-muted) 34%, transparent); background: repeating-linear-gradient(135deg, color-mix(in srgb, var(--wifi-muted) 10%, transparent) 0 2px, transparent 2px 4px); }
+
+.wifi-radio-power-input,
+.wifi-radio-power-readback { display: inline-flex; align-items: center; gap: 5px; }
+/* 编辑态是两行：输入框一行，注脚（当前生效值 / 重启后是否保持）一行。
+   注脚与只读态的 small 同样式，两种状态在表格里高度一致。 */
+.wifi-radio-power-edit { display: inline-flex; flex-direction: column; align-items: flex-start; gap: 2px; }
+.wifi-radio-power-note { color: var(--wifi-muted); font-size: 10px; font-variant-numeric: tabular-nums; }
+.wifi-radio-power-input input { width: 68px; min-height: 32px; padding: 5px 7px; border: 1px solid var(--wifi-line); border-radius: var(--app-radius-compact); color: inherit; background: color-mix(in srgb, currentColor 5%, transparent); font: inherit; font-variant-numeric: tabular-nums; }
+.wifi-radio-power-input input::placeholder { color: var(--wifi-muted); font-variant-numeric: normal; }
+.wifi-radio-power-input input:focus { border-color: color-mix(in srgb, var(--wifi-accent) 62%, transparent); outline: none; box-shadow: 0 0 0 3px color-mix(in srgb, var(--wifi-accent) 12%, transparent); }
+.wifi-radio-power-input b { color: var(--wifi-muted); font-size: 11px; font-weight: 500; }
+.wifi-radio-power-readback { flex-direction: column; align-items: flex-start; gap: 2px; }
+.wifi-radio-power-readback strong { font-variant-numeric: tabular-nums; }
+.wifi-radio-power-readback small { color: var(--wifi-muted); font-size: 10px; }
+.wifi-radio-power-readback.is-missing strong { color: var(--wifi-muted); }
 
 .wifi-link-button {
   display: inline-flex;
@@ -525,29 +801,91 @@
   align-items: start;
 }
 
-.wifi-unifi-setting-grid {
-  display: grid;
-  grid-template-columns: minmax(180px, .34fr) minmax(0, 1fr);
-  gap: 28px;
-  align-items: start;
+.wifi-unifi-global { display: grid; gap: 18px; }
+.wifi-unifi-global > .wifi-section-head { padding-bottom: 14px; border-bottom: 1px solid var(--wifi-soft-line); }
+.wifi-speed-controls { min-width: 0; display: grid; gap: 20px; }
+
+.wifi-speed-profile-row,
+.wifi-speed-profile-options,
+.wifi-speed-profile-choice {
+  display: flex;
+  align-items: center;
 }
 
-.wifi-unifi-label { display: grid; gap: 4px; padding-top: 8px; }
-.wifi-unifi-label strong { font-size: 14px; font-weight: 650; }
-.wifi-unifi-label small { color: var(--wifi-muted); font-size: 12px; line-height: 1.45; }
-.wifi-speed-controls { min-width: 0; display: grid; gap: 16px; }
-.wifi-speed-controls .wifi-radio-options { display: flex; align-items: center; gap: 8px; }
-.wifi-link-button.is-inline { margin: 0 0 0 8px; }
+.wifi-speed-profile-row { min-width: 0; justify-content: space-between; gap: 16px; }
+.wifi-speed-profile-options { min-width: 0; flex-wrap: wrap; gap: 18px; }
+.wifi-speed-profile-choice { gap: 5px; }
+.wifi-speed-profile-choice label { position: relative; display: inline-flex; align-items: center; min-height: 34px; cursor: pointer; }
+.wifi-speed-profile-choice label input { position: absolute; opacity: 0; pointer-events: none; }
+.wifi-speed-profile-choice label span {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  color: var(--wifi-muted);
+  font-size: 13px;
+  white-space: nowrap;
+}
+.wifi-speed-profile-choice label span::before {
+  content: '';
+  width: 17px;
+  height: 17px;
+  flex: 0 0 17px;
+  border: 1px solid var(--wifi-line);
+  border-radius: 50%;
+  background: color-mix(in srgb, currentColor 3%, transparent);
+  box-shadow: inset 0 0 0 4px transparent;
+}
+.wifi-speed-profile-choice label input:checked + span { color: var(--dwrt-page-fg, inherit); }
+.wifi-speed-profile-choice label input:checked + span::before {
+  border-color: var(--wifi-accent);
+  background: var(--wifi-accent);
+  box-shadow: inset 0 0 0 4px var(--dwrt-kit-liquid-surface, rgba(255,255,255,.85));
+}
+.wifi-speed-profile-choice label input:focus-visible + span { outline: 2px solid color-mix(in srgb, var(--wifi-accent) 50%, transparent); outline-offset: 5px; }
+.wifi-speed-profile-choice label input:disabled + span { cursor: not-allowed; opacity: .45; }
+
+.wifi-speed-profile-info {
+  display: inline-grid;
+  place-items: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: 0;
+  color: var(--wifi-accent);
+  background: transparent;
+  cursor: help;
+}
+.wifi-speed-profile-info svg { width: 17px; height: 17px; fill: none; stroke: currentColor; stroke-width: 1.8; }
+.wifi-link-button.is-inline { flex: 0 0 auto; margin: 0; white-space: nowrap; }
 
 .wifi-width-picker { min-width: 0; display: grid; gap: 10px; }
-.wifi-width-picker > strong { color: var(--wifi-muted); font-size: 12px; font-weight: 560; }
-.wifi-width-picker > div { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 18px; }
+.wifi-width-picker > strong { color: var(--dwrt-page-fg, inherit); font-size: 13px; font-weight: 620; }
+.wifi-width-picker > div { display: grid; grid-template-columns: repeat(var(--wifi-speed-band-count, 1), minmax(0, 1fr)); gap: 22px; }
 .wifi-width-picker fieldset { min-width: 0; margin: 0; padding: 0; border: 0; }
-.wifi-width-picker legend { margin-bottom: 7px; color: var(--wifi-muted); font-size: 11px; }
+.wifi-width-picker legend { margin-bottom: 8px; color: var(--wifi-muted); font-size: 12px; }
 .wifi-width-picker fieldset > span { display: flex; flex-wrap: wrap; gap: 6px; }
+.wifi-width-current-only {
+  display: grid;
+  justify-items: start;
+  gap: 4px;
+}
+.wifi-width-current-only output {
+  min-width: 48px;
+  min-height: 40px;
+  padding-inline: 10px;
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-compact);
+  color: var(--wifi-muted);
+  background: color-mix(in srgb, currentColor 3%, transparent);
+  font-size: 12px;
+  line-height: 38px;
+  text-align: center;
+}
+.wifi-width-current-only small { color: var(--wifi-muted); font-size: 10px; line-height: 1.35; }
 .wifi-width-picker button {
-  width: 46px;
-  height: 38px;
+  min-width: 48px;
+  height: 40px;
+  padding-inline: 10px;
   border: 1px solid var(--wifi-line);
   border-radius: var(--app-radius-compact);
   color: inherit;
@@ -769,8 +1107,146 @@
 .wifi-field-unit input { flex: 1; }
 .wifi-field-unit b { color: var(--wifi-muted); font-size: 11px; }
 
+.wifi-roaming-policy {
+  display: grid;
+  gap: 16px;
+}
+
+.wifi-roaming-policy > .wifi-section-head {
+  margin-bottom: 0;
+  padding-bottom: 14px;
+  border-bottom: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-roaming-domain-field {
+  max-width: 520px;
+}
+
+.wifi-roaming-capabilities {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px 0;
+  color: var(--wifi-muted);
+  font-size: 11px;
+}
+
+.wifi-roaming-capabilities > span:first-child {
+  margin-right: 2px;
+  font-weight: 650;
+  color: inherit;
+}
+
+.wifi-roaming-capabilities .dwrt-kit-status-badge {
+  min-height: 26px;
+  padding-inline: 8px;
+  font-size: 11px;
+}
+
+.wifi-roaming-settings {
+  display: grid;
+  gap: 0;
+  min-width: 0;
+}
+
+.wifi-roaming-mode-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 18px;
+  min-width: 0;
+  padding: 10px 2px 14px;
+  border-bottom: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-roaming-mode-row > div:first-child,
+.wifi-roaming-advanced [data-dwrt-disclosure-trigger] > span {
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  min-width: 0;
+}
+
+.wifi-roaming-mode-row strong,
+.wifi-roaming-advanced strong {
+  font-size: 13px;
+  font-weight: 650;
+}
+
+.wifi-roaming-mode-row small,
+.wifi-roaming-advanced small {
+  color: var(--wifi-muted);
+  font-size: 12px;
+  line-height: 1.45;
+}
+
+.wifi-roaming-preference {
+  flex: 0 0 auto;
+}
+
+.wifi-roaming-number .wifi-field-unit {
+  flex: 0 0 min(220px, 42%);
+  min-height: 38px;
+}
+
+.wifi-roaming-number .wifi-field-unit input {
+  width: 100%;
+  height: 38px;
+  min-height: 38px;
+}
+
+.wifi-roaming-advanced {
+  margin-top: 4px;
+  padding-top: 2px;
+}
+
+.wifi-roaming-advanced [data-dwrt-disclosure-trigger] {
+  min-height: 54px;
+}
+
+.wifi-roaming-advanced [data-dwrt-disclosure-trigger] > svg {
+  flex: 0 0 auto;
+  width: 18px;
+  height: 18px;
+  transition: transform 120ms ease;
+}
+
+.wifi-roaming-advanced[data-dwrt-open="true"] [data-dwrt-disclosure-trigger] > svg {
+  transform: rotate(180deg);
+}
+
+.wifi-roaming-advanced [data-dwrt-disclosure-panel] {
+  padding-bottom: 4px;
+}
+
+.wifi-roaming-scope-note {
+  padding: 8px 2px 0;
+  color: var(--wifi-muted);
+  font-size: 11px;
+}
+
+.wifi-roaming-empty {
+  padding: 18px 2px 4px;
+}
+
+.wifi-roaming-empty strong {
+  display: block;
+  margin-bottom: 4px;
+  font-size: 13px;
+}
+
+.wifi-roaming-empty p {
+  max-width: 620px;
+  margin: 0;
+  color: var(--wifi-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
 .wifi-sheet {
-  width: var(--dwrt-kit-sheet-width-form);
+  width: var(--dwrt-kit-sheet-width-standard);
   max-width: 100vw;
   border-left: 1px solid var(--wifi-line);
 }
@@ -882,24 +1358,11 @@
 }
 
 .wireless-status-route-host .airview-view-tabs {
-  --dwrt-page-tab-height: 52px;
-  --dwrt-page-tab-pad: 4px;
   width: 100%;
   max-width: 100%;
   min-width: 0;
   flex: 1 1 auto;
-  overflow-x: hidden;
 }
-
-.wireless-status-route-host .airview-view-tabs .airview-view-tab {
-  min-width: 0;
-  flex: 1 1 0;
-  gap: 4px;
-  padding-inline: 6px;
-  font-size: 12px;
-}
-.airview-view-tabs .airview-view-tab span { display: inline; white-space: nowrap; }
-.wireless-status-route-host .airview-view-tabs .airview-view-tab svg { width: 16px; height: 16px; fill: currentColor; stroke: none; }
 
 .airview-layout {
   display: grid;
@@ -1264,6 +1727,12 @@
    否则「未采集 24 小时历史」这类文案会把列撑开、把右侧列推出滚动区。 */
 .airview-radio-table .airview-cell-reason { display: inline-block; max-width: 132px; white-space: normal; vertical-align: top; line-height: 1.3; }
 .airview-radio-table .airview-cell-reason small { display: block; margin-top: 2px; color: var(--wifi-muted); font-size: 10px; overflow-wrap: anywhere; }
+/* 「过去 24 小时」列的迷你曲线。列宽固定，曲线不参与内容撑宽，否则一条 137 点
+   的序列会把这一列拉出表格。 */
+.airview-radio-table .airview-cell-spark { display: inline-flex; align-items: center; gap: 6px; width: 108px; vertical-align: middle; }
+.airview-radio-table .airview-cell-spark svg { flex: 0 0 auto; width: 72px; height: 18px; overflow: visible; }
+.airview-radio-table .airview-cell-spark polyline { fill: none; stroke: var(--wifi-accent); stroke-width: 1.5; stroke-linecap: round; stroke-linejoin: round; vector-effect: non-scaling-stroke; }
+.airview-radio-table .airview-cell-spark small { color: var(--wifi-muted); font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .airview-radio-table .airview-select-column { width: 38px; min-width: 38px; padding-inline: 10px; text-align: center; }
 .airview-radio-table .airview-select-column input { width: 16px; height: 16px; margin: 0; accent-color: var(--wifi-accent); }
 /* 1440 起 10 列排得下，但更窄的容器仍需横向滚动，而浮层滚动条会淡出、
@@ -1458,7 +1927,7 @@
 .airview-ap-kpis .airview-kpi-note { color: var(--wifi-muted); font-size: 9px; line-height: 1.35; overflow-wrap: anywhere; white-space: normal; }
 .airview-ap-settings-card h3 { margin: 0 0 14px; font-size: 14px; }
 .airview-ap-actions { display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px; margin-top: 12px; }
-.airview-ap-settings-footer { position: sticky; bottom: -1px; display: flex; justify-content: flex-end; padding: 12px 0 0; background: linear-gradient(transparent, color-mix(in srgb, var(--app-surface) 84%, transparent) 28%); }
+.airview-ap-settings-footer { position: sticky; bottom: -1px; display: flex; justify-content: flex-end; gap: 8px; padding: 12px 0 0; background: linear-gradient(transparent, color-mix(in srgb, var(--app-surface) 84%, transparent) 28%); }
 
 .airview-radio-sheet .dwrt-kit-sheet-header > div {
   display: flex;
@@ -1749,9 +2218,326 @@
 }
 
 /* ── AP 管理 Tab ──
- * 只写几何与排版：卡片材质来自 .wifi-config-surface 上的 .dwrt-kit-glass-surface，
+ * 只写几何与排版：材质来自每张卡自己挂的 .dwrt-kit-glass-surface，
  * 状态胶囊沿用 Kit 的 .dwrt-kit-status-badge，圆角只取四档 token。
+ * AP Tab 不再是一整块玻璃板，而是 .wifi-ap-stack 里的一列玻璃卡，
+ * 与 .wifi-broadcast-stack 同构。
  */
+.wifi-ap-stack {
+  display: grid;
+  gap: var(--app-page-gap, 16px);
+  min-width: 0;
+}
+
+.wifi-ap-stack > .wifi-panel-section {
+  border-radius: var(--app-radius-card);
+  min-width: 0;
+  overflow: hidden;
+}
+
+/*
+ * 单板布局里相邻 .wifi-panel-section 之间靠一条 border-top 分隔；栈布局里它们
+ * 已经是各自独立的玻璃卡、之间有 gap，那条线就成了卡片顶上的一道游离横线。
+ * 用后代选择器压掉，不用 !important。
+ */
+.wifi-ap-stack > .wifi-panel-section + .wifi-panel-section,
+.wifi-ap-stack > .wifi-panel-section + .wifi-notice,
+.wifi-ap-stack > .wifi-notice + .wifi-panel-section {
+  border-top: 0;
+}
+
+/* 清单卡的内边距由表头与横条列表自己拿，卡本体不留 padding，
+ * 这样表头的分隔线才是贯通卡片的整条（demo 的 .chamber-head 就是贯通的）。 */
+.wifi-ap-inventory-modern { padding: 0; }
+
+.wifi-ap-inventory-modern .wifi-panel-heading {
+  margin-bottom: 0;
+  padding: 14px 16px;
+}
+
+.wifi-ap-summary-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 15px;
+  min-width: 0;
+}
+
+.wifi-ap-summary-card {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 18px 22px;
+  border-radius: var(--app-radius-card);
+  min-width: 0;
+}
+
+.wifi-ap-summary-content {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wifi-ap-summary-label {
+  font-size: 11px;
+  font-weight: 800;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--wifi-muted);
+}
+
+.wifi-ap-summary-value {
+  font-size: 22px;
+  font-weight: 800;
+  line-height: 1.15;
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+/* 协议号是字符串而不是计数，22px 会撑破卡片。 */
+.wifi-ap-summary-value.is-compact { font-size: 18px; }
+
+.wifi-ap-summary-value.is-accent { color: var(--wifi-accent); }
+
+.wifi-ap-summary-sub {
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1.35;
+  color: var(--wifi-muted);
+  overflow-wrap: anywhere;
+}
+
+.wifi-ap-summary-sub.is-ok { color: var(--wifi-ok); }
+
+.wifi-ap-summary-icon {
+  flex: 0 0 auto;
+  font-size: 20px;
+  line-height: 1;
+  opacity: .75;
+}
+
+.wifi-ap-strip-list {
+  display: grid;
+  gap: 12px;
+  padding: 16px;
+  min-width: 0;
+  /* 横条的退化按**容器**宽度算，不按视口 —— 理由与三档 @container 一起写在
+   * 文件后面 .wifi-sheet.wifi-ap-sheet 之后。 */
+  container-type: inline-size;
+  container-name: wifi-ap-strips;
+}
+
+/* 卡本体 padding 为 0，空态自己留出边距，否则贴着表头分隔线。 */
+.wifi-ap-inventory-modern .wifi-table-empty { margin: 16px; }
+
+/*
+ * 横条是舱内的凹槽，不是第二层玻璃 —— demo 里 .glass-chamber / .stat-card 带
+ * backdrop-filter（对应我们的 .dwrt-kit-glass-surface），而 .ap-strip 只用
+ * var(--glass-deep) 加一道内阴影，没有 backdrop-filter。所以这里不挂 kit 的玻璃
+ * 类：套两层 backdrop-filter 会把横条渲染得比舱体更亮，读起来像浮在卡片上面。
+ */
+.wifi-ap-strip {
+  display: grid;
+  grid-template-columns: 240px minmax(0, 1.2fr) 160px 120px 140px;
+  align-items: center;
+  gap: 20px;
+  padding: 18px 24px;
+  border: 1px solid var(--wifi-soft-line);
+  border-radius: var(--app-radius-panel);
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  min-width: 0;
+  transition: transform .18s ease, border-color .18s ease;
+}
+
+.wifi-ap-strip:hover {
+  transform: translateX(3px);
+  border-color: color-mix(in srgb, var(--wifi-accent) 30%, transparent);
+}
+
+.wifi-ap-strip.is-offline {
+  opacity: .55;
+  filter: grayscale(.5);
+}
+
+.wifi-ap-strip-identity {
+  display: flex;
+  align-items: center;
+  gap: 15px;
+  min-width: 0;
+}
+
+/*
+ * 身份格现在是真设备图（deviceImage(apImageDevice(ap))），不再是一个 emoji。
+ * 圆角靠 overflow: hidden 裁，不在 <img> 上再写一次 border-radius —— 那会是本页第二
+ * 处圆角真值，指纹图换尺寸时两处必然走散（.airview-*-device-image 也是这么做的）。
+ */
+.wifi-ap-strip-icon {
+  position: relative;
+  flex: 0 0 auto;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+  width: 44px;
+  height: 44px;
+  border-radius: var(--app-radius-control);
+  border: 1px solid color-mix(in srgb, var(--wifi-accent) 30%, transparent);
+  background: color-mix(in srgb, var(--wifi-accent) 14%, transparent);
+  font-size: 19px;
+  line-height: 1;
+}
+
+/* contain 而不是 cover：指纹图是整机照，裁掉边缘就认不出型号了。 */
+.wifi-ap-strip-icon img {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+}
+
+/*
+ * 图缺失时的兜底：icon('radio') 的 path 自带 fill="currentColor"，而本页只给
+ * button/a 里的 svg 描边，<span> 里的这个没人管尺寸，不写就会撑成 svg 的默认高度。
+ */
+.wifi-ap-strip-icon > span,
+.wifi-ap-strip-icon.is-fallback {
+  padding: 7px;
+}
+
+.wifi-ap-strip-icon svg {
+  width: 100%;
+  height: 100%;
+  fill: currentColor;
+  stroke: none;
+  color: var(--wifi-accent);
+}
+
+.wifi-ap-strip.is-offline .wifi-ap-strip-icon {
+  border-color: var(--wifi-soft-line);
+  background: color-mix(in srgb, currentColor 5%, transparent);
+}
+
+.wifi-ap-strip.is-offline .wifi-ap-strip-icon img { opacity: .62; }
+.wifi-ap-strip.is-offline .wifi-ap-strip-icon svg { color: inherit; }
+
+.wifi-ap-strip-names {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wifi-ap-strip-names > strong {
+  font-size: 15px;
+  font-weight: 800;
+  line-height: 1.25;
+  overflow-wrap: anywhere;
+}
+
+.wifi-ap-strip-names > span {
+  font-size: 11px;
+  line-height: 1.3;
+  color: var(--wifi-muted);
+  font-variant-numeric: tabular-nums;
+  overflow-wrap: anywhere;
+}
+
+.wifi-ap-strip-radios,
+.wifi-ap-strip-seen {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wifi-ap-strip-label {
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: .06em;
+  text-transform: uppercase;
+  color: var(--wifi-muted);
+}
+
+.wifi-ap-strip-value {
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.wifi-ap-radio-pills {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wifi-ap-radio-tag {
+  padding: 3px 8px;
+  border-radius: var(--app-radius-compact);
+  border: 1px solid var(--wifi-soft-line);
+  background: color-mix(in srgb, currentColor 5%, transparent);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.4;
+  white-space: nowrap;
+  font-variant-numeric: tabular-nums;
+}
+
+.wifi-ap-radio-tag.is-accent {
+  border-color: color-mix(in srgb, var(--wifi-accent) 32%, transparent);
+  background: color-mix(in srgb, var(--wifi-accent) 13%, transparent);
+  color: var(--wifi-accent);
+}
+
+/* 「未上报」不是一个坏消息也不是一个好成绩，只是不知道 —— 走弱化色，
+ * 不用 --wifi-bad，否则读起来像故障。 */
+.wifi-ap-radio-tag.is-muted { color: var(--wifi-muted); }
+
+.wifi-ap-strip-status { min-width: 0; }
+
+.wifi-ap-strip-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wifi-ap-strip-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  height: 30px;
+  padding: 0 12px;
+  border-radius: var(--app-radius-panel);
+  border: 1px solid var(--wifi-soft-line);
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 11px;
+  font-weight: 700;
+  cursor: pointer;
+  white-space: nowrap;
+}
+
+.wifi-ap-strip-button:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--wifi-accent) 42%, transparent);
+  color: var(--wifi-accent);
+}
+
+.wifi-ap-strip-button:disabled {
+  cursor: not-allowed;
+  opacity: .45;
+}
+
+.wifi-ap-strip-button.is-danger { padding: 0 10px; }
+
+.wifi-ap-strip-button.is-danger:hover:not(:disabled) {
+  border-color: color-mix(in srgb, var(--wifi-bad) 45%, transparent);
+  color: var(--wifi-bad);
+}
+
 .wifi-ap-search {
   flex: 0 1 260px;
   min-width: 0;
@@ -1762,7 +2548,7 @@
   height: 32px;
   padding: 0 10px;
   border: 1px solid var(--wifi-soft-line);
-  border-radius: var(--app-radius-compact);
+  border-radius: var(--app-radius-control);
   background: transparent;
   color: inherit;
   font: inherit;
@@ -1774,26 +2560,89 @@
   outline-offset: 1px;
 }
 
-.wifi-ap-name-cell,
-.wifi-ap-model-cell,
-.wifi-ap-runtime {
+.wifi-ap-state { padding: 16px; }
+
+/* 清单从表格改成横条后，.wifi-ap-model-cell / .wifi-ap-runtime / .wifi-ap-seen 三个
+ * 单元格类在 JS 里已经一次都不出现，规则随之删掉。.wifi-ap-name-cell 原本靠「发现到
+ * 的 AP」那张表续命，那张表这次整块搬进了发现向导（候选改用 .wifi-discovered-*），
+ * 所以它也一起退役 —— 留着一条永不命中的规则，下一个人会把它当成还在用的排版。
+ * 同理退役的还有 .wifi-pairing-card 的两条后代规则：配对码卡片已并入抽屉。 */
+
+.wifi-adoption-section {
   display: flex;
   flex-direction: column;
-  gap: 2px;
+  gap: 12px;
+}
+
+.wifi-adoption-section .wifi-panel-heading { margin-bottom: 0; }
+
+.wifi-bootstrap-secret {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 16px;
+  padding: 14px;
+  border: 1px solid color-mix(in srgb, var(--wifi-warn) 34%, transparent);
+  border-radius: var(--app-radius-panel);
+  background: color-mix(in srgb, var(--wifi-warn) 5%, transparent);
+}
+
+.wifi-bootstrap-field {
+  display: flex;
   min-width: 0;
+  flex-direction: column;
+  gap: 8px;
 }
 
-.wifi-ap-name-cell small,
-.wifi-ap-model-cell small,
-.wifi-ap-runtime small {
+.wifi-bootstrap-field-heading {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+  gap: 2px;
+}
+
+.wifi-bootstrap-field-heading strong { font-size: 13px; }
+.wifi-bootstrap-field-heading span { color: var(--wifi-muted); font-size: 11px; line-height: 1.4; }
+
+.wifi-bootstrap-field textarea {
+  display: block;
+  width: 100%;
+  min-height: 112px;
+  resize: vertical;
+  padding: 10px;
+  border: 1px solid var(--wifi-soft-line);
+  border-radius: var(--app-radius-compact);
+  color: inherit;
+  background: color-mix(in srgb, var(--app-surface, currentColor) 22%, transparent);
+  font: 12px/1.5 ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  overflow-wrap: anywhere;
+}
+
+.wifi-bootstrap-field textarea[data-wifi-bootstrap-value="pem"] { min-height: 180px; }
+
+.wifi-bootstrap-field > button {
+  align-self: flex-start;
+  min-height: 36px;
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+}
+
+.wifi-bootstrap-field > button svg,
+.wifi-bootstrap-actions button svg { width: 16px; height: 16px; }
+
+.wifi-bootstrap-actions {
+  grid-column: 1 / -1;
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+  padding-top: 4px;
+  border-top: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-bootstrap-polling {
   color: var(--wifi-muted);
-  font-size: 11px;
-  line-height: 1.3;
+  font-size: 12px;
 }
-
-.wifi-ap-seen { white-space: nowrap; }
-
-.wifi-pairing-card .wifi-notice { margin-bottom: 12px; }
 
 .wifi-pairing-secret {
   display: flex;
@@ -1841,7 +2690,32 @@
   overflow-wrap: anywhere;
 }
 
-.wifi-pairing-card td small {
+/*
+ * 配对码历史从页面上的卡片搬进「临时配对码」抽屉，所以后代选择器的宿主从
+ * .wifi-pairing-card 换成 .wifi-token-records —— 原来那条现在一次都命中不到。
+ */
+.wifi-sheet-section-head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 4px 12px;
+  min-width: 0;
+}
+
+.wifi-sheet-section-head > strong { font-size: 13px; font-weight: 750; }
+.wifi-sheet-section-head > small { color: var(--wifi-muted); font-size: 11px; }
+
+.wifi-token-records {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-top: 18px;
+  padding-top: 16px;
+  border-top: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-token-records td small {
   display: block;
   color: var(--wifi-muted);
   font-size: 11px;
@@ -1854,30 +2728,61 @@
   white-space: nowrap;
 }
 
-.wifi-ap-gated-list {
-  display: grid;
-  gap: 6px;
-  margin: 12px 0 0;
-  padding: 0;
-  list-style: none;
-}
-
-.wifi-ap-gated-list > li {
+/*
+ * 「后端尚未开放的操作」从独立卡片降级成清单腔体的脚注（用户要求删掉那张卡）。
+ * 它坐在已经是玻璃的 .wifi-ap-inventory-modern 里，所以自己既不挂 kit 玻璃类、也不
+ * 写 background —— 一条上边框把它和横条列表分开就够了，再铺一层底就是玻璃叠玻璃。
+ *
+ * 只能是一行：竖排的标题 + 列表在页面上仍然读作「第二块内容」，那就等于没删。所以
+ * flex 横排 + wrap，名字之间用 <i> 点分隔，原因码收进 title。
+ */
+.wifi-ap-gated {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
-  justify-content: space-between;
-  gap: 4px 12px;
-  padding: 8px 10px;
-  border: 1px solid var(--wifi-soft-line);
-  border-radius: var(--app-radius-compact);
-  font-size: 12px;
-}
-
-.wifi-ap-gated-list code {
+  gap: 2px 7px;
+  margin: 4px 16px 0;
+  padding: 11px 0 13px;
+  border-top: 1px solid var(--wifi-soft-line);
   color: var(--wifi-muted);
   font-size: 11px;
-  overflow-wrap: anywhere;
+  line-height: 1.6;
+}
+
+/*
+ * icon('info') 是**描边**图标（一个 circle + 两段 path，没有 fill），而全局那条
+ * svg 规则只作用于 button svg / a svg，脚注里的 <footer> 命中不到，所以尺寸和上色
+ * 必须自己写。第一版写成 fill: currentColor; stroke: none —— 描边图标被填成一枚
+ * 实心圆点，页面上读作项目符号而不是「信息」。描边图标要 fill: none + stroke。
+ */
+.wifi-ap-gated svg {
+  flex: 0 0 auto;
+  width: 14px;
+  height: 14px;
+  fill: none;
+  stroke: currentColor;
+  stroke-width: 1.7;
+  stroke-linecap: round;
+  stroke-linejoin: round;
+  transform: translateY(2px);
+}
+
+.wifi-ap-gated-copy { flex: 0 0 auto; }
+
+/* 名字比说明句重一档，但仍在脚注的字号里 —— 它不该长成一枚可点的标签。 */
+.wifi-ap-gated-item {
+  color: var(--app-text);
+  font-weight: 650;
+  cursor: help;
+}
+
+/*
+ * 分隔点用 --wifi-soft-line 时肉眼看不见 —— 那是画一像素分隔线用的颜色，当字形用
+ * 就是没有。它得比名字轻、但仍要读得出来，所以取脚注自己的 --wifi-muted。
+ */
+.wifi-ap-gated > i {
+  color: var(--wifi-muted);
+  font-style: normal;
 }
 
 .wifi-ap-sheet-facts {
@@ -1925,14 +2830,310 @@
   width: var(--dwrt-kit-sheet-width-standard);
 }
 
+/* ── 发现向导（demo 的 .wizard-modal / .scan-radar-box / .discovered-ap-card）──
+ *
+ * demo 的 .wizard-modal 自带 width:700px、玻璃底、36px 圆角、35px 内边距和一层
+ * 投影。这些 kit 的 .dwrt-kit-modal 已经全给了（材质 + var(--app-radius-panel)
+ * + 三段栅格 + overflow:hidden），所以本页只声明宽度这一个变量，材质与圆角一行
+ * 都不重写 —— demo 的 36px 落到 --app-radius-panel，比写死 36px 更安全：主题把
+ * --lg-corner-radius 调小时，写死值会让弹窗比它外面的容器还圆。 */
+.wifi-ap-wizard-modal { --dwrt-kit-modal-width: 700px; }
+
+/* demo 的弹窗本体是 flex column + gap:24px；kit 的 body 只给了内边距与滚动。 */
+.wifi-ap-wizard-body {
+  display: flex;
+  flex-direction: column;
+  gap: 24px;
+}
+
+/* kit 的 footer 已经右对齐，只有间距要跟 demo 的 12px 对齐（kit 默认 8px）。 */
+.wifi-ap-wizard-foot { gap: 12px; }
+
+/* demo: background: rgba(0,0,0,0.3) —— 一道凹槽。本页既有的凹槽写法是
+ * .wifi-ap-strip 的 color-mix(in srgb, currentColor 6%, transparent)，照抄它；
+ * 但**深度**（inset 投影）只能用常量深色 #04070d，不能用 currentColor 派生：
+ * 深色主题里 currentColor 是浅色墨，inset 投影会变成一圈内发光，凹槽翻成凸起
+ * （flow-engine.css:514 记的就是这条）。 */
+.wifi-scan-radar-box {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 15px;
+  padding: 30px;
+  border: 1px solid var(--wifi-soft-line);
+  border-radius: var(--app-radius-card);
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  box-shadow: inset 0 2px 6px color-mix(in srgb, #04070d 22%, transparent);
+  text-align: center;
+}
+
+.wifi-scan-radar-text > strong {
+  display: block;
+  font-size: 16px;
+  font-weight: 800;
+}
+
+.wifi-scan-radar-text > small {
+  display: block;
+  margin-top: 4px;
+  color: var(--wifi-muted);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+/* demo 的 .radar-pulse-ring：70×70、50% 圆、accent 描边 + 20% accent 填充。
+ * 50% 不是尺度而是形状，所以它不走 --app-radius-* 令牌（圆形不能由圆角派生）。 */
+.wifi-radar-pulse-ring {
+  display: grid;
+  place-items: center;
+  flex: 0 0 auto;
+  width: 70px;
+  height: 70px;
+  border: 2px solid var(--wifi-accent);
+  border-radius: 50%;
+  background: color-mix(in srgb, var(--wifi-accent) 20%, transparent);
+  color: var(--wifi-accent);
+}
+
+.wifi-radar-pulse-ring svg {
+  width: 28px;
+  height: 28px;
+  fill: currentColor;
+  stroke: none;
+}
+
+/* 只在真的在扫描时脉冲；静止时是一枚普通图标，不做无意义的动画。
+ * 不需要另写 prefers-reduced-motion 分支：本文件 @media (prefers-reduced-motion:
+ * reduce) 已经把外壳内所有 animation-duration 压到 .01ms，这条也在其中。 */
+.wifi-radar-pulse-ring.is-scanning {
+  animation: wifi-radar-pulse 2s infinite ease-in-out;
+}
+
+@keyframes wifi-radar-pulse {
+  0%, 100% {
+    transform: scale(1);
+    box-shadow: 0 0 10px color-mix(in srgb, var(--wifi-accent) 70%, transparent);
+  }
+  50% {
+    transform: scale(1.15);
+    box-shadow: 0 0 30px color-mix(in srgb, var(--wifi-accent) 70%, transparent);
+  }
+}
+
+/* demo 的 .discovered-ap-card：18px 圆角（→ --app-radius-panel）、1.5px 绿色描边、
+ * 一层绿色投影。绿色在本页是 --wifi-ok。卡片自己不挂 kit 玻璃：它躺在已经是玻璃的
+ * .wifi-ap-wizard-modal 里，再叠一层就是玻璃叠玻璃，会比弹窗本体更亮。 */
+.wifi-discovered-card {
+  box-sizing: border-box;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: 100%;
+  padding: 18px 20px;
+  border: 1.5px solid color-mix(in srgb, var(--wifi-ok) 62%, transparent);
+  border-radius: var(--app-radius-panel);
+  background: color-mix(in srgb, currentColor 6%, transparent);
+  box-shadow: 0 10px 25px color-mix(in srgb, var(--wifi-ok) 20%, transparent);
+  text-align: left;
+}
+
+/* 已被别的 AC 纳管的候选：绿色描边会读成「可以绑」，改成告警色并收掉投影 —— 卡片
+ * 留着（用户第 2 条：不删功能），但视觉上不能诱着人去点一个必然失败的绑定。 */
+.wifi-discovered-card.is-taken {
+  border-color: color-mix(in srgb, var(--wifi-warn) 55%, transparent);
+  box-shadow: none;
+}
+
+.wifi-discovered-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  min-width: 0;
+}
+
+.wifi-discovered-names {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+}
+
+.wifi-discovered-kicker {
+  color: var(--wifi-ok);
+  font-size: 12px;
+  font-weight: 800;
+}
+
+.wifi-discovered-card.is-taken .wifi-discovered-kicker { color: var(--wifi-warn); }
+
+.wifi-discovered-names > strong {
+  margin-top: 2px;
+  font-size: 14px;
+  font-weight: 800;
+  overflow-wrap: anywhere;
+}
+
+.wifi-discovered-names > small {
+  margin-top: 4px;
+  color: var(--wifi-muted);
+  font-size: 11px;
+  line-height: 1.5;
+  overflow-wrap: anywhere;
+}
+
+/* demo 的 chip 圆角 6px → --app-radius-compact（8px）；6px 没有对应令牌，而在
+ * 一枚 20px 高的胶囊上 6 与 8 的差别看不出来，为它新造一个派生变量不值得。 */
+.wifi-discovered-chip {
+  flex: 0 0 auto;
+  padding: 3px 8px;
+  border-radius: var(--app-radius-compact);
+  background: color-mix(in srgb, var(--wifi-ok) 20%, transparent);
+  color: var(--wifi-ok);
+  font-size: 11px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+
+.wifi-discovered-chip.is-warn {
+  background: color-mix(in srgb, var(--wifi-warn) 20%, transparent);
+  color: var(--wifi-warn);
+}
+
+.wifi-discovered-alias {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+}
+
+.wifi-discovered-alias > span {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.wifi-discovered-alias > small {
+  color: var(--wifi-muted);
+  font-size: 11px;
+  line-height: 1.45;
+}
+
+.wifi-discovered-actions {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 12px;
+}
+
+/* demo 的 .glass-input：12px 圆角 → --app-radius-control。demo 写死 color:#fff，
+ * 那是深色底专属；这里用 inherit 跟随自适应墨色，浅色主题里才读得出字。 */
+.wifi-glass-input {
+  box-sizing: border-box;
+  width: 100%;
+  padding: 11px 14px;
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-control);
+  background: color-mix(in srgb, var(--app-text) 8%, transparent);
+  color: inherit;
+  font: inherit;
+  font-size: 14px;
+  font-weight: 700;
+}
+
+.wifi-glass-input:focus-visible {
+  outline: 2px solid color-mix(in srgb, var(--wifi-accent) 60%, transparent);
+  outline-offset: 1px;
+  border-color: var(--wifi-accent);
+}
+
+.wifi-glass-input:disabled {
+  cursor: not-allowed;
+  opacity: .55;
+}
+
+/* 等宽栈照抄本文件 :2484 的写法，不引 --app-font-mono —— 整棵树都没有声明过那个
+ * 令牌，带兜底也只是把「未定义」藏起来。 */
+.wifi-discovery-key {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+
+/*
+ * 横条的退化必须按**容器**宽度算，不能按视口宽度 —— 原先那三条 @media 规则永远
+ * 不命中，等于没写。
+ *
+ * demo 是整页宽，我们的横条却装在应用外壳的内容列里：1200px 视口下侧边栏吃掉约
+ * 308px，舱体只有 892px，横条 860px。此时 240+160+120+140=660px 固定列加四道
+ * 20px gap 加 48px 内边距已经占掉 788px，唯一的弹性列（DOM 第二格是**射频**，
+ * 不是状态）只剩 70px，而一个射频胶囊自身就 97px：内容溢出，5 个胶囊各占一行。
+ * 视口 1200px > 980px，@media 一条都没生效 —— 「已经安排了退化」是假的。
+ *
+ * 容器宽度恒 ≤ 视口宽度，窄视口下侧边栏收起、两者又基本相等，所以 @container 完全
+ * 覆盖原来那三条视口断点的意图，把横条的排版退化收拢到这里一处。视口断点只留下与
+ * 视口真正有关的：概览四卡、表头换行、以及 hover 位移（触屏上会粘住）。
+ *
+ * container-type 放在 .wifi-ap-strip-list 上是安全的：它不是玻璃面（材质在舱体
+ * .wifi-ap-inventory-modern 上），条内也没有任何 position: absolute/fixed 后代 ——
+ * container-type 隐含的 contain: layout 会让元素变成固定定位后代的包含块，而 kit
+ * 的 tooltip 是挂在 document.body 上的 position: fixed 传送门，不受影响。
+ *
+ * 三档都用 grid-area 简写而不是 grid-column：简写会把 row 一起重设，只写
+ * grid-column 的话上一档留下的 grid-row 会残留，两格叠在同一个位置上。
+ *
+ * container-type 声明在上面 .wifi-ap-strip-list 的本体规则里（一个选择器一处规则）。
+ */
+
+/* 1040px = 740（固定列与 gap）+ 200（两个胶囊并排）+ 48（内边距）再留余量：
+ * 舱体够宽时仍然走 demo 的单行五列，不够宽才让射频独占第二行整宽。 */
+@container wifi-ap-strips (max-width: 1040px) {
+  .wifi-ap-strip { grid-template-columns: 240px 160px minmax(0, 1.2fr) 140px; }
+  .wifi-ap-strip-identity { grid-area: 1 / 1; }
+  .wifi-ap-strip-seen { grid-area: 1 / 2; }
+  .wifi-ap-strip-status { grid-area: 1 / 3; }
+  .wifi-ap-strip-actions { grid-area: 1 / 4; }
+  /* 860px 的横条里 5 个胶囊合计 465px，独占一行放得下。 */
+  .wifi-ap-strip-radios { grid-area: 2 / 1 / 3 / -1; }
+}
+
+/* 760px 以下第一行也坐不住四格（540px 固定列 + 60px gap + 48px 内边距 = 648px，
+ * 状态列又只剩百来 px），退成两列三行。 */
+@container wifi-ap-strips (max-width: 760px) {
+  .wifi-ap-strip {
+    grid-template-columns: minmax(0, 1fr) auto;
+    gap: 12px;
+    padding: 16px 18px;
+  }
+  .wifi-ap-strip-identity { grid-area: 1 / 1; }
+  .wifi-ap-strip-status { grid-area: 1 / 2; justify-self: end; }
+  .wifi-ap-strip-radios { grid-area: 2 / 1 / 3 / -1; }
+  .wifi-ap-strip-seen { grid-area: 3 / 1; }
+  .wifi-ap-strip-actions { grid-area: 3 / 2; }
+}
+
+/* 单列：grid-area: auto 把前两档的显式行列全部还给自动布局，顺序回落到 DOM 顺序。 */
+@container wifi-ap-strips (max-width: 440px) {
+  .wifi-ap-strip { grid-template-columns: minmax(0, 1fr); }
+  .wifi-ap-strip > * { grid-area: auto; grid-column: 1; }
+  .wifi-ap-strip-status { justify-self: start; }
+  .wifi-ap-strip-actions { justify-content: flex-start; }
+}
+
 @media (max-width: 980px) {
+  /* 概览四卡是固定 4 列，必须自己安排退化，否则窄屏会把描述文字压成竖条。
+   * 横条的列退化已经搬到上面的 @container 三档 —— 视口断点看不到侧边栏吃掉的
+   * 308px，写在这里的话在 892px 的舱体里永远不命中。这里只留与视口真正有关的
+   * 一条：触屏上 hover 位移会粘住不复位。 */
+  .wifi-ap-summary-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+
+  .wifi-ap-strip:hover { transform: none; }
+
   .wifi-speed-layout,
-  .wifi-unifi-setting-grid,
   .airview-layout {
     grid-template-columns: 1fr;
   }
 
-  .wifi-width-picker > div { grid-template-columns: 1fr; }
+  .wifi-width-picker > div { grid-template-columns: repeat(var(--wifi-speed-band-count, 1), minmax(0, 1fr)); }
 
   .airview-layout {
     height: auto;
@@ -1984,6 +3185,10 @@
   .wifi-config-tabs { width: 100%; }
   .wifi-page-toolbar,
   .airview-top-actions { width: 100%; }
+  .wifi-resource-card-header { align-items: flex-start; }
+  .wifi-resource-footer { align-items: flex-start; flex-direction: column; }
+  .wifi-resource-actions { width: 100%; }
+  .wifi-resource-action-note { flex-basis: auto; }
   .wireless-status-route-host .airview-top-actions { width: auto; margin-left: auto; }
   .airview-view-tabs .airview-view-tab { min-width: 116px; padding-inline: 18px; }
   .wifi-search { margin-right: auto; }
@@ -1991,6 +3196,10 @@
   .wifi-extension-grid,
   .wifi-sheet-fields,
   .airview-environment-grid { grid-template-columns: 1fr; }
+  .wifi-roaming-mode-row { grid-template-columns: 1fr; gap: 10px; }
+  .wifi-roaming-preference { width: 100%; }
+  .wifi-roaming-preference [data-dwrt-segment] { min-width: 0; }
+  .wifi-roaming-number .wifi-field-unit { flex: 0 0 auto; flex-basis: auto; width: min(220px, 100%); height: 38px; }
   .dwrt-kit-sheet.airview-radio-sheet {
     --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-full);
     --dwrt-kit-sheet-max-width: calc(100vw - 18px);
@@ -2011,21 +3220,33 @@
   .wifi-width-summary > strong { grid-column: auto; }
   .wifi-setting-row,
   .wifi-inline-setting { gap: 12px; }
+  .wifi-speed-profile-row { align-items: flex-start; flex-direction: column; }
+  .wifi-width-picker > div { grid-template-columns: 1fr; gap: 16px; }
   .wifi-section,
   .wifi-panel-section { padding: 13px; }
   .wifi-config-surface > .wifi-notice { margin-inline: 13px; }
+  .wifi-bootstrap-secret { grid-template-columns: 1fr; }
+  .wifi-bootstrap-actions { grid-column: auto; justify-content: flex-start; }
   .airview-sidebar-scroll { grid-template-columns: 1fr; }
   .airview-sidebar-scroll > * { grid-column: auto; }
+  /* 弹窗宽度由 kit 的 min(width, 100vw - 32px) 兜住，这里只收纵向节奏与雷达框的
+   * 内边距：demo 的 30px 在 700px 宽的弹窗里是留白，在窄屏里是把内容挤成一条。 */
+  .wifi-ap-wizard-body { gap: 18px; }
+  .wifi-scan-radar-box { padding: 22px 18px; }
 }
 
 @media (max-width: 460px) {
   .airview-top-actions .policy-filter-button span { display: none; }
   /* 表头换成两行，搜索框独占一行，避免标题与输入框互相挤压。 */
-  .wifi-ap-inventory .wifi-panel-heading {
+  .wifi-ap-inventory-modern .wifi-panel-heading {
     flex-wrap: wrap;
     padding: 10px 16px;
   }
   .wifi-ap-search { flex: 1 1 100%; }
+  .wifi-ap-summary-grid { grid-template-columns: minmax(0, 1fr); }
+  .wifi-ap-summary-card { padding: 14px 16px; }
+  /* 横条本体的单列退化在上面的 @container (max-width: 440px) 那一档，这里只收内边距。 */
+  .wifi-ap-strip-list { padding: 12px; }
   .wifi-ap-sheet-facts dl > div { flex-direction: column; gap: 2px; }
   .wifi-ap-sheet-facts dd { text-align: left; }
   .airview-top-actions .policy-filter-button { width: 38px; min-width: 38px; padding: 0; justify-content: center; }
@@ -2033,6 +3254,7 @@
   .wifi-radio-options.compact { justify-content: flex-start; }
   .wifi-inline-setting { align-items: flex-start; flex-direction: column; }
   .wifi-inline-setting > input { width: 100%; }
+  .wifi-roaming-number .wifi-field-unit { width: 100%; }
   .wifi-sheet { width: 100vw; }
   .wifi-sheet-body { padding-inline: 14px; }
   .wifi-sheet .dwrt-kit-sheet-header { padding-inline: 14px; }
@@ -2044,6 +3266,16 @@
   .airview-ap-actions { grid-template-columns: 1fr; }
   .airview-ap-facts { padding: 14px; }
   .airview-spectrum-x span:nth-child(even) { display: none; }
+  /* 两枚表头胶囊的文案是「临时配对码」与「添加新 AP (发现向导)」，390px 下并排会
+   * 各自折成两行；让它们各占一行，读起来才是两个按钮而不是一团字。 */
+  .wifi-ap-header-actions .wifi-btn-pill,
+  .wifi-discovered-actions .wifi-btn-pill { flex: 1 1 100%; }
+  .wifi-scan-radar-box { padding: 18px 14px; }
+  .wifi-radar-pulse-ring { width: 58px; height: 58px; }
+  .wifi-radar-pulse-ring svg { width: 24px; height: 24px; }
+  .wifi-discovered-card { padding: 14px 16px; }
+  /* 候选卡的顶行是「名字 + 状态胶囊」，窄屏下胶囊挤掉名字，改成竖排。 */
+  .wifi-discovered-top { align-items: flex-start; flex-direction: column; gap: 8px; }
 }
 
 @media (prefers-reduced-motion: reduce) {
@@ -2054,4 +3286,169 @@
     transition-duration: .01ms !important;
     animation-duration: .01ms !important;
   }
+}
+
+/* ── Chamber layout for SSID sheet ─────────────────────────────── */
+.wifi-chamber {
+  background: var(--wifi-soft-line, rgba(128,128,128,0.08));
+  border: 1px solid var(--wifi-line, rgba(128,128,128,0.14));
+  border-radius: var(--app-radius-card, 16px);
+  padding: 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+.wifi-chamber.primary {
+  background: color-mix(in srgb, var(--wifi-accent) 8%, transparent);
+  border-color: color-mix(in srgb, var(--wifi-accent) 25%, transparent);
+}
+
+.wifi-chamber-label {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--wifi-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.wifi-chamber.primary .wifi-chamber-label {
+  color: var(--wifi-accent);
+}
+
+/* ── Band pill selector (3-column) ─────────────────────────────── */
+.wifi-band-pill-grid {
+  display: grid;
+  grid-template-columns: repeat(3, 1fr);
+  gap: 8px;
+}
+
+.wifi-chamber .wifi-band-pill {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 2px;
+  padding: 10px 6px;
+  background: rgba(128,128,128,0.08);
+  border: 1px solid var(--wifi-line);
+  border-radius: 12px;
+  cursor: pointer;
+  text-align: center;
+  transition: border-color 0.2s, background 0.2s, box-shadow 0.2s;
+  user-select: none;
+}
+
+.wifi-chamber .wifi-band-pill:hover {
+  background: rgba(128,128,128,0.14);
+}
+
+.wifi-chamber .wifi-band-pill.is-active {
+  border-color: var(--wifi-accent);
+  background: color-mix(in srgb, var(--wifi-accent) 12%, transparent);
+  box-shadow: 0 2px 8px color-mix(in srgb, var(--wifi-accent) 22%, transparent);
+}
+
+.wifi-chamber .wifi-band-pill b {
+  font-size: 13px;
+  font-weight: 700;
+  color: var(--wifi-text, inherit);
+}
+
+.wifi-chamber .wifi-band-pill span {
+  font-size: 10px;
+  color: var(--wifi-muted);
+}
+
+.wifi-chamber .wifi-band-pill.is-active span {
+  color: var(--wifi-text, inherit);
+  opacity: 0.8;
+}
+
+/* ── Toggle tile grid (2-column) ───────────────────────────────── */
+.wifi-toggle-grid {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+}
+
+.wifi-toggle-tile {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+  padding: 12px 14px;
+  background: rgba(128,128,128,0.08);
+  border: 1px solid var(--wifi-line);
+  border-radius: 14px;
+  cursor: pointer;
+  transition: border-color 0.2s, background 0.2s;
+}
+
+.wifi-toggle-tile:hover {
+  background: rgba(128,128,128,0.14);
+}
+
+.wifi-toggle-tile.is-highlight {
+  border-color: color-mix(in srgb, var(--wifi-accent) 30%, transparent);
+  background: color-mix(in srgb, var(--wifi-accent) 6%, transparent);
+}
+
+.wifi-toggle-tile-info {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 0;
+}
+
+.wifi-toggle-tile-info strong {
+  font-size: 12px;
+  font-weight: 700;
+}
+
+.wifi-toggle-tile-info small {
+  font-size: 10px;
+  color: var(--wifi-muted);
+  line-height: 1.3;
+}
+
+/* ── Enterprise collapsible section ────────────────────────────── */
+.wifi-enterprise-collapse {
+  background: rgba(128,128,128,0.05);
+  border: 1px solid var(--wifi-line);
+  border-radius: var(--app-radius-card, 16px);
+  padding: 14px 16px;
+  opacity: 0.85;
+}
+
+.wifi-enterprise-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  cursor: pointer;
+}
+
+.wifi-enterprise-header span {
+  font-size: 11px;
+  font-weight: 700;
+  color: var(--wifi-muted);
+  text-transform: uppercase;
+  letter-spacing: 0.5px;
+}
+
+.wifi-enterprise-header .wifi-enterprise-toggle {
+  font-size: 11px;
+  color: var(--wifi-muted);
+}
+
+.wifi-enterprise-well {
+  display: none;
+  flex-direction: column;
+  gap: 12px;
+  margin-top: 12px;
+  padding-top: 12px;
+  border-top: 1px solid var(--wifi-soft-line);
+}
+
+.wifi-enterprise-well.is-open {
+  display: flex;
 }

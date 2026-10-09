@@ -7,6 +7,7 @@
  * (json-c/stdint only); include them for both the production and the
  * standalone-test builds so the config wire step compiles either way. */
 #include "apd_config_executor.h"
+#include "apd_secret_executor.h"
 #include "apd_config_job_journal.h"
 #include "apd_config_recovery.h"
 
@@ -36,6 +37,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/socket.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <sys/types.h>
 #include <time.h>
@@ -222,10 +224,12 @@ const struct apd_backend_ops *apd_backend(void);
 int apd_backend_device_model_collect(struct apd_device_model *out);
 #else
 #include "apd_internal.h"
+#include "apd_audit_forward.h"
 #include <arpa/inet.h>
 #include <limits.h>
 #include <netdb.h>
 #include <pthread.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <openssl/pem.h>
 #include <openssl/ssl.h>
@@ -233,6 +237,7 @@ int apd_backend_device_model_collect(struct apd_device_model *out);
 #endif
 
 #include "../ap_control_wire.h"
+#include "../ap_control_log_rpc.h"
 
 #ifndef PATH_MAX
 #define PATH_MAX 4096
@@ -251,6 +256,23 @@ int apd_backend_device_model_collect(struct apd_device_model *out);
 #define APD_TRANSPORT_CA_PEM_MAX 65536U
 #ifndef APD_TRANSPORT_HEARTBEAT_SECONDS
 #define APD_TRANSPORT_HEARTBEAT_SECONDS 30
+#endif
+/* Job polls ride a much shorter cadence than the heartbeat.
+ *
+ * Every controller-initiated operation -- txpower mode read/write, config
+ * write transactions, secret rotation -- can only travel on a poll this side
+ * sends, because the wire is half duplex and apd always speaks first. While
+ * the polls sat inside the heartbeat body, the heartbeat interval *was* the
+ * operation latency: a Radio write or a 6 GHz txpower read waited 0-30 s for
+ * the next tick, which surfaced as "AP 未在等待窗口内回应" once the wait
+ * exceeded the controller's own deadline.
+ *
+ * Heartbeat and telemetry stay slow on purpose: apd_session_telemetry() runs
+ * the backend snapshot (a set of `iw` invocations) on every call before its
+ * digest gate can drop the send, so polling that at job cadence would multiply
+ * radio-facing work on the AP for nothing. */
+#ifndef APD_TRANSPORT_JOB_POLL_MS
+#define APD_TRANSPORT_JOB_POLL_MS 2000
 #endif
 #ifndef APD_TRANSPORT_BACKOFF_MIN_SECONDS
 #define APD_TRANSPORT_BACKOFF_MIN_SECONDS 1
@@ -314,6 +336,15 @@ struct apd_enrollment_metadata {
     char state[16];
 };
 
+struct apd_credentials_unpair_report {
+    int certificate_removed;
+    int enrollment_removed;
+    int bootstrap_removed;
+};
+
+int apd_credentials_unpair(struct apd_credentials_unpair_report *out);
+int apd_db_pairing_clear(void);
+
 enum apd_credentials_activate_result {
     APD_CREDENTIALS_ACTIVATE_OK = 0,
     APD_CREDENTIALS_ACTIVATE_CONTROLLER_INVALID = -1,
@@ -327,6 +358,9 @@ enum apd_credentials_activate_result {
     APD_CREDENTIALS_ACTIVATE_METADATA_COMMIT_FAILED = -9,
 };
 
+int apd_credentials_rotation_install(const char *, const char *, const unsigned char *, size_t, const char *, size_t);
+int apd_credentials_rotation_trust_commit(const char *, size_t);
+int apd_credentials_trust_fingerprint(unsigned char out[32]);
 const char *apd_credentials_pki_dir(void);
 int apd_credentials_bootstrap_load(struct apd_bootstrap_config *out);
 int apd_credentials_certificate_store(
@@ -382,10 +416,15 @@ static const char *const apd_fields_session_hello_v3[] = {
 };
 static const char *const apd_fields_session_ready[] = {
     "protocol", "kind", "controller_id", "certificate_id", "ap_id",
-    "session_epoch"
+    "session_epoch", "unbind_required", "unbind_request_id"
 };
 static const char *const apd_fields_session_ready_v3[] = {
-    "protocol", "kind", "controller_id", "certificate_id", "ap_id", "session_epoch", "capabilities"
+    "protocol", "kind", "controller_id", "certificate_id", "ap_id",
+    "session_epoch", "capabilities", "unbind_required", "unbind_request_id"
+};
+static const char *const apd_fields_unbind_ack[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "request_id",
+    "unpaired", "error_code"
 };
 static const char *const apd_fields_heartbeat[] = {
     "protocol", "kind", "ap_id", "session_epoch", "sequence", "timestamp"
@@ -399,6 +438,19 @@ static const char *const apd_fields_telemetry_snapshot[] = {
 };
 static const char *const apd_fields_telemetry_ack[] = {
     "protocol", "kind", "ap_id", "session_epoch", "sequence", "accepted"
+};
+static const char *const apd_fields_audit_event[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence",
+    "schema_version", "events"
+};
+static const char *const apd_fields_audit_event_ack[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence",
+    "event_id", "accepted", "persisted"
+};
+static const char *const apd_audit_event_fields[] = {
+    "event_id", "occurred_at", "actor", "actor_session", "source_ip",
+    "action", "risk", "target", "result", "failure_reason",
+    "request_id"
 };
 static const char *const apd_fields_radio_job_reconcile[] = {
     "protocol", "kind", "ap_id", "session_epoch", "sequence", "job_id",
@@ -485,6 +537,7 @@ struct apd_transport_state {
     int running;
     int stop;
     int connected;
+    int audit_ready;
     int write_capable;
     int active_fd;
     uint64_t sequence;
@@ -493,16 +546,31 @@ struct apd_transport_state {
 };
 
 static struct apd_transport_state g_apd_transport = {
-    PTHREAD_MUTEX_INITIALIZER, PTHREAD_COND_INITIALIZER, (pthread_t)0,
-    0, 0, 0, 0, -1, 0, "not_started", {0, {0}, 0, {0}}
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+    .condition = PTHREAD_COND_INITIALIZER,
+    .active_fd = -1,
+    .reason = "not_started"
 };
 static _Thread_local const char *g_apd_wire_protocol = APD_TRANSPORT_PROTOCOL_V1;
 
 static _Thread_local char g_apd_transport_reason_copy[64];
 
+const char *apd_transport_reason(void);
+
+/* The reason is the only thing that distinguishes one retry from another, so it
+ * travels with the event.  Without it a session that never establishes logs an
+ * unbroken run of `connect_retry` and says nothing about why. */
 static void apd_transport_log(const char *event)
 {
-    if (event)
+    const char *reason;
+
+    if (!event)
+        return;
+    reason = apd_transport_reason();
+    if (reason && reason[0])
+        fprintf(stderr, "[dreamingwrt-apd] transport event=%s reason=%s\n",
+                event, reason);
+    else
         fprintf(stderr, "[dreamingwrt-apd] transport event=%s\n", event);
 }
 
@@ -631,9 +699,23 @@ static int apd_telemetry_digest(
     unsigned char digest[SHA256_DIGEST_LENGTH])
 {
     struct json_object *stable = apd_telemetry_stable_copy(snapshot);
+    struct json_object *sources = json_object_object_get(snapshot, "sources");
+    struct json_object *hostapd = json_object_object_get(sources, "hostapd");
+    const char *const observations[] = {
+        "beacon_reports", "probe_observations", "btm_responses", "auth_failures"
+    };
     const char *encoded;
+    size_t i;
     int rc = -1;
 
+    /* Report timestamps identify new measurements/responses, unlike routine
+     * snapshot timestamps. Do not suppress them with the noisy sources tree. */
+    for (i = 0; stable && i < sizeof(observations) / sizeof(observations[0]); i++) {
+        struct json_object *events = json_object_object_get(hostapd, observations[i]);
+
+        if (events && json_object_is_type(events, json_type_array))
+            json_object_object_add(stable, observations[i], json_object_get(events));
+    }
     if (stable && (encoded = json_object_to_json_string_ext(
             stable, JSON_C_TO_STRING_PLAIN)) &&
         SHA256((const unsigned char *)encoded, strlen(encoded), digest))
@@ -654,10 +736,26 @@ static int apd_transport_stopping(void)
 
 static void apd_transport_set_connected(int connected)
 {
+    int disconnected = 0;
+
     pthread_mutex_lock(&g_apd_transport.lock);
     g_apd_transport.connected = connected ? 1 : 0;
-    if (!connected)
+    if (!connected) {
+        disconnected = g_apd_transport.audit_ready;
+        g_apd_transport.audit_ready = 0;
         g_apd_transport.write_capable = 0;
+    }
+    pthread_cond_broadcast(&g_apd_transport.condition);
+    pthread_mutex_unlock(&g_apd_transport.lock);
+    if (disconnected)
+        apd_audit_forward_fail_active("controller_disconnected");
+}
+
+static void apd_transport_set_audit_ready(int ready)
+{
+    pthread_mutex_lock(&g_apd_transport.lock);
+    g_apd_transport.audit_ready = ready ? 1 : 0;
+    pthread_cond_broadcast(&g_apd_transport.condition);
     pthread_mutex_unlock(&g_apd_transport.lock);
 }
 
@@ -724,6 +822,34 @@ static int apd_transport_wait_seconds(unsigned int seconds)
                 return -1;
         }
     }
+}
+
+/* 1 means an audit request woke the session, 0 means heartbeat deadline. */
+static int apd_transport_wait_session_ms(int64_t timeout_ms)
+{
+    struct timespec deadline;
+    int wait_rc = 0;
+    int result = 0;
+
+    if (timeout_ms < 0 || clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+        return -1;
+    deadline.tv_sec += timeout_ms / 1000;
+    deadline.tv_nsec += (long)(timeout_ms % 1000) * 1000000L;
+    if (deadline.tv_nsec >= 1000000000L) {
+        deadline.tv_sec++;
+        deadline.tv_nsec -= 1000000000L;
+    }
+    pthread_mutex_lock(&g_apd_transport.lock);
+    while (!g_apd_transport.stop && !apd_audit_forward_pending() &&
+           wait_rc == 0)
+        wait_rc = pthread_cond_timedwait(&g_apd_transport.condition,
+                                         &g_apd_transport.lock, &deadline);
+    if (g_apd_transport.stop)
+        result = -1;
+    else if (apd_audit_forward_pending())
+        result = 1;
+    pthread_mutex_unlock(&g_apd_transport.lock);
+    return result;
 }
 
 static int apd_transport_endpoint_values_set(const char *host, uint16_t port,
@@ -803,6 +929,17 @@ static int apd_json_add_int64(struct json_object *object, const char *name,
     return 0;
 }
 
+static int apd_json_add_boolean(struct json_object *object, const char *name,
+                                int value)
+{
+    struct json_object *member;
+
+    if (!object || !name || !(member = json_object_new_boolean(value)))
+        return -1;
+    json_object_object_add(object, name, member);
+    return 0;
+}
+
 static int apd_json_add_hex(struct json_object *object, const char *name,
                             const unsigned char *data, size_t length)
 {
@@ -870,7 +1007,7 @@ static int apd_message_expect(struct json_object *object,
 
     if (!object || !kind || apd_message_is_error(object) ||
         ap_control_json_object_exact(object, fields, field_count, fields,
-                                     field_count) != AP_CONTROL_WIRE_OK ||
+            !strcmp(kind, "session_ready") ? field_count - 2 : field_count) != AP_CONTROL_WIRE_OK ||
         ap_control_json_get_string(object, "protocol", &protocol,
                                    strlen(g_apd_wire_protocol),
                                    strlen(g_apd_wire_protocol)) !=
@@ -1093,6 +1230,21 @@ done:
     return rc;
 }
 
+static int apd_tls_trust_bundle(X509_STORE *store, const char *path)
+{
+    unsigned char *pem = NULL; size_t length = 0;
+    BIO *bio = NULL; X509 *ca = NULL; int count = 0, rc = -1;
+    if (apd_secure_read(path, APD_TRANSPORT_CA_PEM_MAX, &pem, &length) ||
+        !(bio = BIO_new_mem_buf(pem, (int)length))) goto done;
+    while ((ca = PEM_read_bio_X509(bio, NULL, NULL, NULL))) {
+        if (++count > 2 || X509_check_ca(ca) <= 0 || X509_STORE_add_cert(store, ca) != 1) goto done;
+        X509_free(ca); ca = NULL;
+    }
+    if (count > 0) rc = 0;
+done:
+    X509_free(ca); BIO_free(bio); free(pem); return rc;
+}
+
 static SSL_CTX *apd_tls_context_new(const char *ca_path, int client_auth)
 {
     unsigned char ca_fingerprint[SHA256_DIGEST_LENGTH] = {0};
@@ -1109,7 +1261,7 @@ static SSL_CTX *apd_tls_context_new(const char *ca_path, int client_auth)
     SSL_CTX_set_verify(context, SSL_VERIFY_PEER, NULL);
     SSL_CTX_set_verify_depth(context, 2);
     store = SSL_CTX_get_cert_store(context);
-    if (!store || X509_STORE_add_cert(store, ca) != 1 ||
+    if (!store || apd_tls_trust_bundle(store, ca_path) != 0 ||
         (client_auth && apd_client_certificate_load(context) != 0))
         goto fail;
     X509_free(ca);
@@ -1557,6 +1709,31 @@ static struct json_object *apd_identity_message_new(
     return object;
 }
 
+static int apd_unbind_ack_send(SSL *ssl,
+                               const struct apd_enrollment_metadata *metadata,
+                               const char *session_epoch,
+                               const char *request_id, int unpaired,
+                               const char *error_code)
+{
+    struct json_object *ack = apd_message_new("unbind_ack");
+    int rc = -1;
+
+    if (ack && apd_json_add_string(ack, "ap_id", metadata->ap_id) == 0 &&
+        apd_json_add_string(ack, "session_epoch", session_epoch) == 0 &&
+        apd_json_add_string(ack, "request_id", request_id) == 0 &&
+        apd_json_add_boolean(ack, "unpaired", unpaired) == 0 &&
+        apd_json_add_string(ack, "error_code", error_code ? error_code : "") == 0 &&
+        ap_control_json_object_exact(ack, apd_fields_unbind_ack,
+            APD_ARRAY_SIZE(apd_fields_unbind_ack),
+            apd_fields_unbind_ack, APD_ARRAY_SIZE(apd_fields_unbind_ack)) ==
+            AP_CONTROL_WIRE_OK &&
+        ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, ack) ==
+            AP_CONTROL_WIRE_OK)
+        rc = 0;
+    json_object_put(ack);
+    return rc;
+}
+
 static int apd_metadata_fingerprint(
     const struct apd_enrollment_metadata *metadata,
     unsigned char out[SHA256_DIGEST_LENGTH])
@@ -1833,6 +2010,138 @@ done:
     return rc;
 }
 
+static int apd_session_logs(SSL *ssl,
+    const struct apd_enrollment_metadata *metadata, const char *session_epoch)
+{
+    static const char *const ack_fields[] = {
+        "protocol", "kind", "ap_id", "session_epoch", "sequence", "persisted", "error"
+    };
+    struct json_object *batch = ap_log_rpc("ap_log_peek", NULL);
+    struct json_object *events = batch ? json_object_object_get(batch, "events") : NULL;
+    struct json_object *request = NULL, *response = NULL, *persisted = NULL, *local_ack = NULL;
+    const char *text;
+    int64_t sequence, reply_sequence;
+    int rc = 0;
+    if (!ap_log_batch_valid(events)) goto done;
+    sequence = (int64_t)apd_transport_next_sequence();
+    request = apd_message_new("log_batch");
+    if (!request || apd_json_add_string(request, "ap_id", metadata->ap_id) != 0 ||
+        apd_json_add_string(request, "session_epoch", session_epoch) != 0 ||
+        apd_json_add_int64(request, "sequence", sequence) != 0) { rc = -1; goto done; }
+    json_object_object_add(request, "events", json_object_get(events));
+    if (ap_control_ssl_write_json(ssl, 3000, request) != AP_CONTROL_WIRE_OK ||
+        ap_control_ssl_read_json(ssl, 3000, &response) != AP_CONTROL_WIRE_OK ||
+        apd_message_expect(response, ack_fields, APD_ARRAY_SIZE(ack_fields), "log_batch_ack") != 0 ||
+        ap_control_json_get_string(response, "ap_id", &text, 36, 36) != AP_CONTROL_WIRE_OK ||
+        strcmp(text, metadata->ap_id) ||
+        ap_control_json_get_string(response, "session_epoch", &text, 64, 64) != AP_CONTROL_WIRE_OK ||
+        strcmp(text, session_epoch) ||
+        ap_control_json_get_int64(response, "sequence", 1, INT64_MAX, &reply_sequence) != AP_CONTROL_WIRE_OK ||
+        reply_sequence != sequence ||
+        !json_object_object_get_ex(response, "persisted", &persisted) ||
+        !json_object_is_type(persisted, json_type_boolean) ||
+        !ap_log_string(response, "error", 0, 127)) { rc = -1; goto done; }
+    /* No local deletion on timeout, negative ACK or a malformed response. */
+    if (json_object_get_boolean(persisted))
+        local_ack = ap_log_rpc("ap_log_ack", batch);
+done:
+    json_object_put(local_ack);
+    json_object_put(response);
+    json_object_put(request);
+    json_object_put(batch);
+    return rc;
+}
+
+static int apd_session_audit_event(
+    SSL *ssl, const struct apd_enrollment_metadata *metadata,
+    const char *session_epoch)
+{
+    struct apd_audit_event event;
+    struct json_object *request = NULL;
+    struct json_object *events = NULL;
+    struct json_object *wire_event = NULL;
+    struct json_object *response = NULL;
+    struct json_object *accepted = NULL;
+    struct json_object *persisted = NULL;
+    const char *value = NULL;
+    int64_t sequence;
+    int64_t acknowledged = 0;
+    int rc = -1;
+
+    memset(&event, 0, sizeof(event));
+    if (apd_audit_forward_take(&event) != 0)
+        return 1;
+    sequence = (int64_t)apd_transport_next_sequence();
+    request = apd_message_new("audit_event");
+    events = json_object_new_array();
+    wire_event = json_object_new_object();
+    if (!request || !events || !wire_event ||
+        apd_json_add_string(wire_event, "event_id", event.event_id) != 0 ||
+        apd_json_add_int64(wire_event, "occurred_at", event.occurred_at) != 0 ||
+        apd_json_add_string(wire_event, "actor", event.actor) != 0 ||
+        apd_json_add_string(wire_event, "actor_session", event.actor_session) != 0 ||
+        apd_json_add_string(wire_event, "source_ip", event.source_ip) != 0 ||
+        apd_json_add_string(wire_event, "action", event.action) != 0 ||
+        apd_json_add_string(wire_event, "risk", event.risk) != 0 ||
+        apd_json_add_string(wire_event, "target", event.target) != 0 ||
+        apd_json_add_string(wire_event, "result", event.result) != 0 ||
+        apd_json_add_string(wire_event, "failure_reason",
+                            event.failure_reason) != 0 ||
+        apd_json_add_string(wire_event, "request_id", event.request_id) != 0 ||
+        ap_control_json_object_exact(wire_event, apd_audit_event_fields,
+                APD_ARRAY_SIZE(apd_audit_event_fields),
+                apd_audit_event_fields,
+                APD_ARRAY_SIZE(apd_audit_event_fields)) !=
+                    AP_CONTROL_WIRE_OK)
+        goto done;
+    json_object_array_add(events, wire_event);
+    wire_event = NULL;
+    if (apd_json_add_string(request, "ap_id", metadata->ap_id) != 0 ||
+        apd_json_add_string(request, "session_epoch", session_epoch) != 0 ||
+        apd_json_add_int64(request, "sequence", sequence) != 0 ||
+        apd_json_add_int64(request, "schema_version",
+                           APD_AUDIT_SCHEMA_VERSION) != 0)
+        goto done;
+    json_object_object_add(request, "events", events);
+    events = NULL;
+    if (ap_control_json_object_exact(request, apd_fields_audit_event,
+            APD_ARRAY_SIZE(apd_fields_audit_event), apd_fields_audit_event,
+            APD_ARRAY_SIZE(apd_fields_audit_event)) != AP_CONTROL_WIRE_OK ||
+        ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, request) !=
+            AP_CONTROL_WIRE_OK)
+        goto done;
+    if (apd_message_receive(ssl, apd_fields_audit_event_ack,
+            APD_ARRAY_SIZE(apd_fields_audit_event_ack), "audit_event_ack",
+            &response) != 0 ||
+        ap_control_json_get_string(response, "ap_id", &value, 36, 36) !=
+            AP_CONTROL_WIRE_OK || strcmp(value, metadata->ap_id) != 0 ||
+        ap_control_json_get_string(response, "session_epoch", &value, 64, 64) !=
+            AP_CONTROL_WIRE_OK || strcmp(value, session_epoch) != 0 ||
+        ap_control_json_get_int64(response, "sequence", sequence, sequence,
+                                  &acknowledged) != AP_CONTROL_WIRE_OK ||
+        ap_control_json_get_string(response, "event_id", &value, 36, 36) !=
+            AP_CONTROL_WIRE_OK || strcmp(value, event.event_id) != 0 ||
+        !json_object_object_get_ex(response, "accepted", &accepted) ||
+        !accepted || !json_object_is_type(accepted, json_type_boolean) ||
+        !json_object_get_boolean(accepted) ||
+        !json_object_object_get_ex(response, "persisted", &persisted) ||
+        !persisted || !json_object_is_type(persisted, json_type_boolean) ||
+        !json_object_get_boolean(persisted))
+        goto done;
+    rc = 0;
+done:
+    apd_audit_forward_complete(event.event_id, rc == 0,
+                               rc == 0 ? "persisted" :
+                               "controller_ack_failed");
+    json_object_put(request);
+    json_object_put(events);
+    json_object_put(wire_event);
+    json_object_put(response);
+    OPENSSL_cleanse(&event, sizeof(event));
+    return rc;
+}
+
+
 static int apd_session_telemetry(SSL *ssl,
                                  const struct apd_enrollment_metadata *metadata,
                                  const char *session_epoch,
@@ -2062,6 +2371,219 @@ static int apd_v2_request_base(
         apd_json_add_string(request, "ap_id", metadata->ap_id) == 0 &&
         apd_json_add_string(request, "session_epoch", session_epoch) == 0 &&
         apd_json_add_int64(request, "sequence", *sequence) == 0 ? 0 : -1;
+}
+
+#ifndef APD_TRANSPORT_TEST_STANDALONE
+struct apd_txpower_ubus_reply {
+    struct json_object *json;
+};
+
+static void apd_txpower_ubus_cb(struct ubus_request *req, int type,
+                                struct blob_attr *msg)
+{
+    struct apd_txpower_ubus_reply *reply = req ? req->priv : NULL;
+    char *text;
+
+    (void)type;
+    if (!reply || !msg)
+        return;
+    text = blobmsg_format_json(msg, true);
+    if (text) {
+        reply->json = json_tokener_parse(text);
+        free(text);
+    }
+}
+#endif
+
+/* Keep these definitions before apd_txpower_wire_step(), which uses
+ * APD_ARRAY_SIZE and therefore requires complete array types. */
+static const char *const apd_fields_txpower_mode_poll[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence"
+};
+static const char *const apd_fields_txpower_mode_idle[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "reply_to"
+};
+static const char *const apd_fields_txpower_mode_offer[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "reply_to",
+    "operation", "mode", "confirm"
+};
+static const char *const apd_fields_txpower_mode_finish[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence",
+    "operation", "mode", "confirm", "result"
+};
+static const char *const apd_fields_txpower_mode_finish_ack[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "reply_to"
+};
+
+static struct json_object *apd_txpower_method_absent(void)
+{
+    struct json_object *root = json_object_new_object();
+
+    if (!root)
+        return NULL;
+    json_object_object_add(root, "ok", json_object_new_boolean(0));
+    json_object_object_add(root, "error",
+                           json_object_new_string("apd_method_absent"));
+    json_object_object_add(root, "reason",
+                           json_object_new_string("apd_method_absent"));
+    return root;
+}
+
+#ifndef APD_TRANSPORT_TEST_STANDALONE
+static struct json_object *apd_txpower_transport_error(const char *reason)
+{
+    struct json_object *root = json_object_new_object();
+
+    if (!root)
+        return NULL;
+    json_object_object_add(root, "ok", json_object_new_boolean(0));
+    json_object_object_add(root, "error",
+                           json_object_new_string("apd_method_call_failed"));
+    json_object_object_add(root, "reason", json_object_new_string(
+                               reason ? reason : "apd_ubus_call_failed"));
+    return root;
+}
+#endif
+
+static struct json_object *apd_txpower_ubus_call(const char *operation,
+                                                  const char *mode, int confirm)
+{
+#ifdef APD_TRANSPORT_TEST_STANDALONE
+    (void)operation;
+    (void)mode;
+    (void)confirm;
+    return apd_txpower_method_absent();
+#else
+    struct apd_txpower_ubus_reply reply = {0};
+    struct blob_buf blob = {0};
+    struct ubus_context *ctx;
+    uint32_t id;
+    const char *method;
+    int rc;
+
+    if (!operation)
+        return apd_txpower_transport_error("apd_operation_invalid");
+    method = !strcmp(operation, "get") ? "txpower_mode" :
+             !strcmp(operation, "set") ? "txpower_mode_set" : NULL;
+    if (!method)
+        return apd_txpower_transport_error("apd_operation_invalid");
+    ctx = ubus_connect(NULL);
+    if (!ctx)
+        return apd_txpower_transport_error("apd_ubus_unavailable");
+    rc = ubus_lookup_id(ctx, "dreamingwrt.apd", &id);
+    if (rc != UBUS_STATUS_OK)
+        rc = ubus_lookup_id(ctx, "dreamingos.apd", &id);
+    if (rc != UBUS_STATUS_OK) {
+        ubus_free(ctx);
+        return apd_txpower_method_absent();
+    }
+    blob_buf_init(&blob, 0);
+    if (!strcmp(operation, "set")) {
+        blobmsg_add_string(&blob, "mode", mode);
+        blobmsg_add_u8(&blob, "confirm", confirm ? 1 : 0);
+    }
+    rc = ubus_invoke(ctx, id, method, blob.head, apd_txpower_ubus_cb,
+                     &reply, AP_CONTROL_IO_TIMEOUT_MS);
+    blob_buf_free(&blob);
+    ubus_free(ctx);
+    if (rc == UBUS_STATUS_METHOD_NOT_FOUND) {
+        json_object_put(reply.json);
+        return apd_txpower_method_absent();
+    }
+    if (rc != UBUS_STATUS_OK || !reply.json) {
+        json_object_put(reply.json);
+        return apd_txpower_transport_error("apd_ubus_call_failed");
+    }
+    return reply.json;
+#endif
+}
+
+static int apd_txpower_mode_valid(const char *mode)
+{
+    return mode && (!strcmp(mode, "calibrated") ||
+                    !strcmp(mode, "regulatory"));
+}
+
+static int apd_txpower_wire_step(
+    SSL *ssl, const struct apd_enrollment_metadata *metadata,
+    const char *session_epoch)
+{
+    struct json_object *request = NULL;
+    struct json_object *response = NULL;
+    struct json_object *result = NULL;
+    const char *kind = NULL;
+    const char *operation = NULL;
+    const char *mode = NULL;
+    char operation_copy[4] = {0};
+    char mode_copy[11] = {0};
+    int confirm = 0;
+    int64_t sequence = 0;
+    int rc = -1;
+
+    request = apd_message_new("txpower_mode_poll");
+    if (!request ||
+        apd_v2_request_base(request, metadata, session_epoch, &sequence) != 0 ||
+        ap_control_json_object_exact(request, apd_fields_txpower_mode_poll,
+            APD_ARRAY_SIZE(apd_fields_txpower_mode_poll),
+            apd_fields_txpower_mode_poll,
+            APD_ARRAY_SIZE(apd_fields_txpower_mode_poll)) != AP_CONTROL_WIRE_OK ||
+        ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, request) !=
+            AP_CONTROL_WIRE_OK ||
+        ap_control_ssl_read_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, &response) !=
+            AP_CONTROL_WIRE_OK ||
+        ap_control_json_get_string(response, "kind", &kind, 1, 64) !=
+            AP_CONTROL_WIRE_OK)
+        goto done;
+    if (!strcmp(kind, "txpower_mode_idle")) {
+        rc = apd_message_expect(response, apd_fields_txpower_mode_idle,
+                APD_ARRAY_SIZE(apd_fields_txpower_mode_idle), kind) == 0 &&
+             apd_v2_response_identity(response, metadata, session_epoch,
+                                      sequence) == 0 ? 0 : -1;
+        goto done;
+    }
+    if (strcmp(kind, "txpower_mode_offer") ||
+        apd_message_expect(response, apd_fields_txpower_mode_offer,
+            APD_ARRAY_SIZE(apd_fields_txpower_mode_offer), kind) != 0 ||
+        apd_v2_response_identity(response, metadata, session_epoch, sequence) != 0 ||
+        ap_control_json_get_string(response, "operation", &operation, 3, 3) !=
+            AP_CONTROL_WIRE_OK || (strcmp(operation, "get") &&
+                                   strcmp(operation, "set")) ||
+        ap_control_json_get_string(response, "mode", &mode, 0, 10) !=
+            AP_CONTROL_WIRE_OK ||
+        (!strcmp(operation, "set") && !apd_txpower_mode_valid(mode)) ||
+        (!strcmp(operation, "get") && mode[0]) ||
+        apd_v2_boolean(response, "confirm", &confirm) != 0)
+        goto done;
+    snprintf(operation_copy, sizeof(operation_copy), "%s", operation);
+    snprintf(mode_copy, sizeof(mode_copy), "%s", mode);
+    result = apd_txpower_ubus_call(operation_copy, mode_copy, confirm);
+    json_object_put(request);
+    json_object_put(response);
+    request = apd_message_new("txpower_mode_finish");
+    response = NULL;
+    if (!result || !request ||
+        apd_v2_request_base(request, metadata, session_epoch, &sequence) != 0 ||
+        apd_json_add_string(request, "operation", operation_copy) != 0 ||
+        apd_json_add_string(request, "mode", mode_copy) != 0 ||
+        apd_json_add_boolean(request, "confirm", confirm) != 0 ||
+        !(json_object_object_add(request, "result", json_object_get(result)), 1) ||
+        ap_control_json_object_exact(request, apd_fields_txpower_mode_finish,
+            APD_ARRAY_SIZE(apd_fields_txpower_mode_finish),
+            apd_fields_txpower_mode_finish,
+            APD_ARRAY_SIZE(apd_fields_txpower_mode_finish)) != AP_CONTROL_WIRE_OK ||
+        ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, request) !=
+            AP_CONTROL_WIRE_OK ||
+        apd_message_receive(ssl, apd_fields_txpower_mode_finish_ack,
+            APD_ARRAY_SIZE(apd_fields_txpower_mode_finish_ack),
+            "txpower_mode_finish_ack", &response) != 0 ||
+        apd_v2_response_identity(response, metadata, session_epoch, sequence) != 0)
+        goto done;
+    rc = 0;
+done:
+    json_object_put(request);
+    json_object_put(response);
+    json_object_put(result);
+    return rc;
 }
 
 static int apd_v2_finish_id(char out[APD_RADIO_JOB_UUID_LEN + 1])
@@ -2408,7 +2930,291 @@ static int apd_config_executor_enabled(void)
 static int apd_config_wire_step(
     SSL *ssl, const struct apd_enrollment_metadata *metadata,
     const char *session_epoch);
+static int apd_secret_wire_step(
+    SSL *ssl, const struct apd_enrollment_metadata *metadata,
+    const char *session_epoch);
 static void apd_config_paths_default(struct apd_config_paths *paths);
+
+static const char *const apd_fields_secret_job_poll[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence"
+};
+static const char *const apd_fields_secret_job_idle[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "reply_to"
+};
+static const char *const apd_fields_secret_job_offer[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "reply_to", "job_id",
+    "request_digest", "ssid_id", "secret_version", "sections", "secret"
+};
+static const char *const apd_fields_secret_job_prepare[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence", "job_id",
+    "request_digest", "outcome", "error_code", "secret_version",
+    "secret_configured"
+};
+static const char *const apd_fields_secret_job_prepare_ack[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "reply_to", "job_id",
+    "accepted", "commit_required"
+};
+static const char *const apd_fields_secret_job_commit[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence", "job_id",
+    "request_digest", "secret_version", "secret_configured"
+};
+static const char *const apd_fields_secret_job_commit_ack[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "reply_to", "job_id",
+    "accepted"
+};
+
+static int apd_secret_response_boolean(struct json_object *object,
+                                       const char *name, int *out)
+{
+    struct json_object *value = NULL;
+
+    if (!object || !out ||
+        !json_object_object_get_ex(object, name, &value) || !value ||
+        !json_object_is_type(value, json_type_boolean))
+        return -1;
+    *out = json_object_get_boolean(value) ? 1 : 0;
+    return 0;
+}
+
+static int apd_secret_result_fields(struct json_object *result,
+                                    const char **outcome,
+                                    const char **error_code,
+                                    int *secret_configured)
+{
+    struct json_object *ok = NULL;
+    struct json_object *reason = NULL;
+    int succeeded;
+
+    if (!result || !outcome || !error_code || !secret_configured ||
+        !json_object_object_get_ex(result, "ok", &ok) || !ok ||
+        !json_object_is_type(ok, json_type_boolean))
+        return -1;
+    succeeded = json_object_get_boolean(ok) ? 1 : 0;
+    *outcome = succeeded ? "completed" : "failed";
+    *secret_configured = succeeded;
+    *error_code = "";
+    if (!succeeded) {
+        if (!json_object_object_get_ex(result, "reason", &reason) || !reason ||
+            !json_object_is_type(reason, json_type_string))
+            return -1;
+        *error_code = json_object_get_string(reason);
+    }
+    return 0;
+}
+
+static int apd_secret_wire_step(
+    SSL *ssl, const struct apd_enrollment_metadata *metadata,
+    const char *session_epoch)
+{
+    struct json_object *request = NULL;
+    struct json_object *response = NULL;
+    struct json_object *sections = NULL;
+    struct json_object *result = NULL;
+    struct apd_secret_transaction *transaction = NULL;
+    const char *kind = NULL;
+    const char *job_id_value = NULL;
+    const char *request_digest_value = NULL;
+    const char *ssid_id_value = NULL;
+    const char *secret = NULL;
+    unsigned char *secret_copy = NULL;
+    const char *outcome = NULL;
+    const char *error_code = NULL;
+    int64_t secret_version = 0;
+    int64_t sequence = 0;
+    int accepted = 0;
+    int commit_required = 0;
+    int secret_configured = 0;
+    int already_committed = 0;
+    size_t secret_len = 0;
+    char job_id[37] = {0};
+    char request_digest[77] = {0};
+    char ssid_id[65] = {0};
+    size_t i;
+    int rc = -1;
+
+    request = apd_message_new("secret_job_poll");
+    if (!request ||
+        apd_v2_request_base(request, metadata, session_epoch, &sequence) != 0 ||
+        ap_control_json_object_exact(request, apd_fields_secret_job_poll,
+            APD_ARRAY_SIZE(apd_fields_secret_job_poll),
+            apd_fields_secret_job_poll,
+            APD_ARRAY_SIZE(apd_fields_secret_job_poll)) != AP_CONTROL_WIRE_OK ||
+        ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, request) !=
+            AP_CONTROL_WIRE_OK ||
+        ap_control_ssl_read_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, &response) !=
+            AP_CONTROL_WIRE_OK ||
+        ap_control_json_get_string(response, "kind", &kind, 15, 16) !=
+            AP_CONTROL_WIRE_OK ||
+        apd_v2_response_identity(response, metadata, session_epoch, sequence) != 0)
+        goto done;
+    json_object_put(request);
+    request = NULL;
+    if (!strcmp(kind, "secret_job_idle")) {
+        rc = apd_message_expect(response, apd_fields_secret_job_idle,
+            APD_ARRAY_SIZE(apd_fields_secret_job_idle), "secret_job_idle");
+        goto done;
+    }
+    if (strcmp(kind, "secret_job_offer") ||
+        apd_message_expect(response, apd_fields_secret_job_offer,
+            APD_ARRAY_SIZE(apd_fields_secret_job_offer),
+            "secret_job_offer") != 0 ||
+        ap_control_json_get_string(response, "job_id", &job_id_value, 36, 36) !=
+            AP_CONTROL_WIRE_OK || !apd_uuid4_valid(job_id_value) ||
+        ap_control_json_get_string(response, "request_digest", &request_digest_value,
+            12, 76) != AP_CONTROL_WIRE_OK ||
+        strncmp(request_digest_value, "hmac-sha256:", 12) ||
+        ap_control_json_get_string(response, "ssid_id", &ssid_id_value, 1, 64) !=
+            AP_CONTROL_WIRE_OK ||
+        ap_control_json_get_int64(response, "secret_version", 1, INT64_MAX,
+            &secret_version) != AP_CONTROL_WIRE_OK ||
+        ap_control_json_get_string(response, "secret", &secret, 8, 64) !=
+            AP_CONTROL_WIRE_OK ||
+        !json_object_object_get_ex(response, "sections", &sections) ||
+        !sections || !json_object_is_type(sections, json_type_array) ||
+        json_object_array_length(sections) == 0 ||
+        json_object_array_length(sections) > 16)
+        goto done;
+    snprintf(job_id, sizeof(job_id), "%s", job_id_value);
+    snprintf(request_digest, sizeof(request_digest), "%s", request_digest_value);
+    snprintf(ssid_id, sizeof(ssid_id), "%s", ssid_id_value);
+    secret_len = strlen(secret);
+    secret_copy = OPENSSL_malloc(secret_len + 1);
+    if (!secret_copy)
+        goto done;
+    memcpy(secret_copy, secret, secret_len + 1);
+    (void)mlock(secret_copy, secret_len + 1);
+    ap_control_json_scrub_string(response, "secret");
+    secret = NULL;
+    for (i = 0; i < json_object_array_length(sections); i++) {
+        struct json_object *entry = json_object_array_get_idx(sections, i);
+
+        if (!entry || !json_object_is_type(entry, json_type_string) ||
+            json_object_get_string_len(entry) <= 0 ||
+            json_object_get_string_len(entry) > 32)
+            goto done;
+    }
+    already_committed = apd_secret_job_committed(job_id, request_digest,
+                                                 secret_version);
+    if (already_committed < 0) {
+        result = json_object_new_object();
+        if (result) {
+            json_object_object_add(result, "ok", json_object_new_boolean(0));
+            json_object_object_add(result, "secret_configured",
+                                   json_object_new_boolean(0));
+            json_object_object_add(result, "reason",
+                                   json_object_new_string("idempotency_conflict"));
+        }
+    } else if (already_committed == 1) {
+        result = json_object_new_object();
+        json_object_object_add(result, "ok", json_object_new_boolean(1));
+        json_object_object_add(result, "secret_configured",
+                               json_object_new_boolean(1));
+    } else {
+        (void)apd_secret_transaction_begin(job_id, request_digest, ssid_id,
+            secret_version, sections, secret_copy, secret_len,
+            &transaction, &result);
+    }
+    OPENSSL_cleanse(secret_copy, secret_len + 1);
+    (void)munlock(secret_copy, secret_len + 1);
+    OPENSSL_free(secret_copy);
+    secret_copy = NULL;
+    secret_len = 0;
+    if (apd_secret_result_fields(result, &outcome, &error_code,
+                                 &secret_configured) != 0)
+        goto rollback;
+    json_object_put(response);
+    response = NULL;
+    request = apd_message_new("secret_job_prepare");
+    if (!request ||
+        apd_v2_request_base(request, metadata, session_epoch, &sequence) != 0 ||
+        apd_json_add_string(request, "job_id", job_id) != 0 ||
+        apd_json_add_string(request, "request_digest", request_digest) != 0 ||
+        apd_json_add_string(request, "outcome", outcome) != 0 ||
+        apd_json_add_string(request, "error_code", error_code) != 0 ||
+        apd_json_add_int64(request, "secret_version", secret_version) != 0)
+        goto rollback;
+    json_object_object_add(request, "secret_configured",
+                           json_object_new_boolean(secret_configured));
+    if (ap_control_json_object_exact(request, apd_fields_secret_job_prepare,
+            APD_ARRAY_SIZE(apd_fields_secret_job_prepare),
+            apd_fields_secret_job_prepare,
+            APD_ARRAY_SIZE(apd_fields_secret_job_prepare)) != AP_CONTROL_WIRE_OK ||
+        ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, request) !=
+            AP_CONTROL_WIRE_OK ||
+        apd_message_receive(ssl, apd_fields_secret_job_prepare_ack,
+            APD_ARRAY_SIZE(apd_fields_secret_job_prepare_ack),
+            "secret_job_prepare_ack", &response) != 0 ||
+        apd_v2_response_identity(response, metadata, session_epoch, sequence) != 0 ||
+        ap_control_json_get_string(response, "job_id", &kind, 36, 36) !=
+            AP_CONTROL_WIRE_OK || strcmp(kind, job_id) ||
+        apd_secret_response_boolean(response, "accepted", &accepted) != 0 ||
+        !accepted || apd_secret_response_boolean(response, "commit_required",
+                                                 &commit_required) != 0)
+        goto rollback;
+    json_object_put(request);
+    json_object_put(response);
+    request = NULL;
+    response = NULL;
+    if (!secret_configured) {
+        rc = commit_required ? -1 : 0;
+        goto done;
+    }
+    if (!commit_required)
+        goto rollback;
+    if (!already_committed &&
+        (apd_secret_job_record_commit(job_id, request_digest, secret_version) != 0 ||
+         apd_secret_transaction_commit(transaction) != 0))
+        goto rollback;
+    apd_secret_transaction_free(transaction);
+    transaction = NULL;
+    request = apd_message_new("secret_job_commit");
+    if (!request ||
+        apd_v2_request_base(request, metadata, session_epoch, &sequence) != 0 ||
+        apd_json_add_string(request, "job_id", job_id) != 0 ||
+        apd_json_add_string(request, "request_digest", request_digest) != 0 ||
+        apd_json_add_int64(request, "secret_version", secret_version) != 0)
+        goto done;
+    json_object_object_add(request, "secret_configured",
+                           json_object_new_boolean(1));
+    if (ap_control_json_object_exact(request, apd_fields_secret_job_commit,
+            APD_ARRAY_SIZE(apd_fields_secret_job_commit),
+            apd_fields_secret_job_commit,
+            APD_ARRAY_SIZE(apd_fields_secret_job_commit)) != AP_CONTROL_WIRE_OK ||
+        ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, request) !=
+            AP_CONTROL_WIRE_OK ||
+        apd_message_receive(ssl, apd_fields_secret_job_commit_ack,
+            APD_ARRAY_SIZE(apd_fields_secret_job_commit_ack),
+            "secret_job_commit_ack", &response) != 0 ||
+        apd_v2_response_identity(response, metadata, session_epoch, sequence) != 0 ||
+        ap_control_json_get_string(response, "job_id", &kind, 36, 36) !=
+            AP_CONTROL_WIRE_OK || strcmp(kind, job_id) ||
+        apd_secret_response_boolean(response, "accepted", &accepted) != 0 ||
+        !accepted)
+        goto done;
+    rc = 0;
+    goto done;
+
+rollback:
+    if (transaction) {
+        struct json_object *rollback_result = NULL;
+
+        (void)apd_secret_transaction_rollback(transaction, &rollback_result);
+        json_object_put(rollback_result);
+    }
+done:
+    if (secret)
+        OPENSSL_cleanse((void *)secret, secret_len);
+    if (secret_copy) {
+        OPENSSL_cleanse(secret_copy, secret_len + 1);
+        (void)munlock(secret_copy, secret_len + 1);
+        OPENSSL_free(secret_copy);
+    }
+    apd_secret_transaction_free(transaction);
+    json_object_put(result);
+    json_object_put(request);
+    json_object_put(response);
+    return rc;
+}
 
 static int apd_v2_jobs_step(
     SSL *ssl, const struct apd_enrollment_metadata *metadata,
@@ -2647,7 +3453,8 @@ static const char *const apd_fields_config_job_idle[] = {
 static const char *const apd_fields_config_job_offer[] = {
     "protocol", "kind", "ap_id", "session_epoch", "reply_to", "job_id",
     "attempt_id", "dispatch_generation", "request_digest",
-    "candidate_digest", "candidate", "controller_state"
+    "candidate_digest", "candidate", "operation", "rollback_of_job_id",
+    "controller_state"
 };
 static const char *const apd_fields_config_job_ack[] = {
     "protocol", "kind", "ap_id", "session_epoch", "reply_to", "job_id",
@@ -2659,7 +3466,6 @@ static const char *const apd_fields_config_job_finish_ack[] = {
     "attempt_id", "dispatch_generation", "request_digest", "finish_id",
     "controller_state"
 };
-
 static void apd_config_paths_default(struct apd_config_paths *paths)
 {
     paths->uci = APD_CONFIG_UCI_PATH;
@@ -2687,6 +3493,8 @@ static int apd_config_assignment_parse(
     const char *request_digest = NULL;
     const char *candidate_digest = NULL;
     const char *candidate = NULL;
+    const char *operation = NULL;
+    const char *rollback_of_job_id = NULL;
     int64_t dispatch_generation = 0;
 
     memset(job, 0, sizeof(*job));
@@ -2704,7 +3512,14 @@ static int apd_config_assignment_parse(
             &candidate_digest, APD_CONFIG_JOB_DIGEST_LEN,
             APD_CONFIG_JOB_DIGEST_LEN) != AP_CONTROL_WIRE_OK ||
         ap_control_json_get_string(response, "candidate", &candidate, 1,
-            APD_CONFIG_JOB_CANDIDATE_MAX_BYTES) != AP_CONTROL_WIRE_OK)
+            APD_CONFIG_JOB_CANDIDATE_MAX_BYTES) != AP_CONTROL_WIRE_OK ||
+        ap_control_json_get_string(response, "operation", &operation, 5, 8) !=
+            AP_CONTROL_WIRE_OK ||
+        (strcmp(operation, "apply") && strcmp(operation, "rollback")) ||
+        ap_control_json_get_string(response, "rollback_of_job_id",
+            &rollback_of_job_id, 0, 36) != AP_CONTROL_WIRE_OK ||
+        (!strcmp(operation, "rollback") ?
+            strlen(rollback_of_job_id) != 36 : rollback_of_job_id[0] != '\0'))
         return -1;
     snprintf(job->job_id, sizeof(job->job_id), "%s", job_id);
     snprintf(job->attempt_id, sizeof(job->attempt_id), "%s", attempt_id);
@@ -2716,6 +3531,9 @@ static int apd_config_assignment_parse(
     snprintf(job->ap_id, sizeof(job->ap_id), "%s", metadata->ap_id);
     snprintf(job->session_epoch, sizeof(job->session_epoch), "%s",
              session_epoch);
+    snprintf(job->operation, sizeof(job->operation), "%s", operation);
+    snprintf(job->rollback_of_job_id, sizeof(job->rollback_of_job_id), "%s",
+             rollback_of_job_id);
     *candidate_out = strdup(candidate);
     return *candidate_out ? 0 : -1;
 }
@@ -2868,6 +3686,105 @@ done:
     return rc;
 }
 
+static const char *apd_config_restore_verified(
+    const struct apd_config_paths *paths, const char *previous_json,
+    char **readback_json)
+{
+    struct json_object *previous = NULL;
+    struct json_object *result = NULL;
+    struct json_object *match = NULL;
+    const char *error = NULL;
+
+    if (readback_json) {
+        free(*readback_json);
+        *readback_json = NULL;
+    }
+    previous = previous_json ? json_tokener_parse(previous_json) : NULL;
+    if (!previous) {
+        error = "rollback_reference_unparseable";
+        goto done;
+    }
+    if (apd_config_rollback(paths, previous, &result) != 0) {
+        error = "rollback_failed";
+        goto done;
+    }
+    json_object_put(result);
+    result = NULL;
+    if (apd_config_rollback_readback(paths, previous, &result) != 0 ||
+        !result || !json_object_object_get_ex(result, "match", &match) ||
+        !json_object_get_boolean(match)) {
+        error = "rollback_readback_failed";
+    }
+    if (result && readback_json)
+        *readback_json = strdup(json_object_to_json_string_ext(
+            result, JSON_C_TO_STRING_PLAIN));
+    if (!error && readback_json && !*readback_json)
+        error = "rollback_readback_serialize_failed";
+done:
+    json_object_put(previous);
+    json_object_put(result);
+    return error;
+}
+
+static const char *apd_config_execute_rollback(
+    const struct apd_config_paths *paths,
+    const struct apd_config_job_assignment *job, char **readback_json)
+{
+    struct apd_config_job_journal_entry entry;
+    char *previous_json = NULL;
+    const char *error;
+
+    if (apd_config_job_previous_get(job, &previous_json) !=
+            APD_CONFIG_JOB_JOURNAL_OK || !previous_json)
+        return "rollback_reference_unavailable";
+    if (apd_config_job_mark_applying(job, previous_json, apd_now_s(),
+                                     &entry) < 0) {
+        free(previous_json);
+        return "rollback_journal_applying_failed";
+    }
+    error = apd_config_restore_verified(paths, previous_json, readback_json);
+    free(previous_json);
+    return error;
+}
+
+static const char *apd_config_execute_runtime_action(
+    const struct apd_config_job_assignment *job, struct json_object *candidate,
+    char **readback_json)
+{
+    const struct apd_backend_ops *backend = apd_backend();
+    struct apd_config_job_journal_entry entry;
+    struct json_object *result = NULL;
+    const char *error = NULL;
+
+    if (!backend || !backend->validate || !backend->apply ||
+        backend->validate(candidate, &result) != 0) {
+        error = "hostapd_action_validation_failed";
+        goto done;
+    }
+    json_object_put(result);
+    result = NULL;
+    /* Runtime frames cannot be undone. Recovery reports uncertainty without
+     * re-executing a frame or invoking a wireless configuration rollback. */
+    if (apd_config_job_mark_applying(job, "[]", apd_now_s(), &entry) !=
+        APD_CONFIG_JOB_JOURNAL_OK) {
+        error = "hostapd_action_already_started";
+        goto done;
+    }
+    if (backend->apply(candidate, &result) != 0 || !result ||
+        !json_object_get_boolean(json_object_object_get(result, "ok"))) {
+        error = "hostapd_action_failed";
+    } else if (apd_config_job_mark_applied(job, apd_now_s(), &entry) !=
+               APD_CONFIG_JOB_JOURNAL_OK) {
+        error = "hostapd_action_journal_failed";
+    }
+    if (result)
+        *readback_json = strdup(json_object_to_json_string_ext(
+            result, JSON_C_TO_STRING_PLAIN));
+done:
+    json_object_put(result);
+    return error;
+}
+
 /* Execute the leased candidate through the durable state machine.  Any
  * failure after 'applying' rolls back and reports rolled_back; readback
  * mismatch is treated the same.  The finish outcome is recorded in the
@@ -2892,8 +3809,27 @@ static int apd_config_execute(
 
     apd_config_paths_default(&paths);
     memset(&finish, 0, sizeof(finish));
+    if (!strcmp(job->operation, "rollback")) {
+        error_code = apd_config_execute_rollback(&paths, job,
+                                                 &readback_json);
+        if (!error_code) {
+            outcome = "rolled_back";
+            error_code = "transaction_peer_failed";
+        }
+        goto finish;
+    }
     if (!candidate) {
         error_code = "candidate_unparseable";
+        goto finish;
+    }
+    if (apd_config_candidate_has_actions(candidate)) {
+        const char *action_error = apd_config_execute_runtime_action(
+            job, candidate, &readback_json);
+
+        if (action_error)
+            error_code = action_error;
+        else
+            outcome = "applied";
         goto finish;
     }
     /* stage into the private candidate directory. */
@@ -2936,16 +3872,16 @@ static int apd_config_execute(
 
         json_object_put(previous);
         if (apply_rc != 0) {
-            struct json_object *rolled = NULL;
-
-            outcome = "rolled_back";
-            error_code = "apply_failed";
-            if (result &&
-                json_object_object_get_ex(result, "rolled_back", &rolled) &&
-                json_object_get_boolean(rolled))
-                error_code = "apply_failed_rolled_back";
             json_object_put(result);
             result = NULL;
+            error_code = apd_config_restore_verified(&paths, previous_json,
+                                                     &readback_json);
+            if (error_code) {
+                outcome = "failed";
+            } else {
+                outcome = "rolled_back";
+                error_code = "apply_failed_rolled_back";
+            }
             goto finish;
         }
     }
@@ -2982,15 +3918,15 @@ static int apd_config_execute(
     goto finish;
 rollback:
     {
-        struct json_object *previous = previous_json ?
-            json_tokener_parse(previous_json) : NULL;
-        struct json_object *rollback_result = NULL;
+        const char *rollback_error = apd_config_restore_verified(
+            &paths, previous_json, &readback_json);
 
-        outcome = "rolled_back";
-        if (previous)
-            apd_config_rollback(&paths, previous, &rollback_result);
-        json_object_put(previous);
-        json_object_put(rollback_result);
+        if (rollback_error) {
+            outcome = "failed";
+            error_code = rollback_error;
+        } else {
+            outcome = "rolled_back";
+        }
     }
 finish:
     if (apd_v2_finish_id(finish_id) != 0)
@@ -3008,6 +3944,7 @@ finish:
     if (rc == 0)
         apd_config_job_finish_ack(job, finish_id, apd_now_s(), &entry);
 done:
+    json_object_put(result);
     json_object_put(candidate);
     free(previous_json);
     free(readback_json);
@@ -3067,6 +4004,44 @@ done:
     return rc;
 }
 
+/* Returns one only after a validated local slot/trust change or a controller
+ * request to reconnect. The caller closes this session and reloads metadata. */
+static int apd_certificate_wire_step(SSL *ssl, const struct apd_enrollment_metadata *metadata,
+                                     const char *session_epoch)
+{
+    static const char *const fields[] = {"protocol","kind","ap_id","session_epoch","sequence","command"};
+    struct json_object *request = apd_message_new("certificate_poll"), *response = NULL, *command = NULL;
+    unsigned char csr[2048], csr_digest[32], trust[32], *der = NULL; size_t csr_len = 0, der_len = 0;
+    const char *action = NULL, *task = NULL, *certificate = NULL, *pem = NULL;
+    int64_t sequence = 0; int rc = -1;
+    if (!request || apd_enrollment_csr_create(csr, sizeof(csr), &csr_len, csr_digest) ||
+        apd_credentials_trust_fingerprint(trust) ||
+        apd_v2_request_base(request, metadata, session_epoch, &sequence) ||
+        apd_json_add_hex(request, "csr_der", csr, csr_len) ||
+        apd_json_add_hex(request, "trust_fingerprint", trust, sizeof(trust)) ||
+        ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, request) ||
+        apd_message_receive(ssl, fields, APD_ARRAY_SIZE(fields), "certificate_reply", &response) ||
+        apd_v2_response_identity(response, metadata, session_epoch, sequence) ||
+        !json_object_object_get_ex(response, "command", &command) ||
+        !json_object_is_type(command, json_type_object) ||
+        ap_control_json_get_string(command, "action", &action, 1, 32)) goto done;
+    if (!strcmp(action, "idle")) { rc = 0; goto done; }
+    if (!strcmp(action, "reconnect")) { rc = 1; goto done; }
+    if (ap_control_json_get_string(command, "task_id", &task, 36, 36) ||
+        ap_control_json_get_string(command, "certificate_id", &certificate, 36, 36) ||
+        ap_control_json_get_string(command, "trust_pem", &pem, 1, APD_TRANSPORT_CA_PEM_MAX)) goto done;
+    if (!strcmp(action, "install")) {
+        if (apd_json_get_hex_alloc(command, "certificate_der", APD_TRANSPORT_CERT_DER_MAX, &der, &der_len) ||
+            apd_credentials_rotation_install(task, certificate, der, der_len, pem, strlen(pem))) goto done;
+        rc = 1;
+    } else if (!strcmp(action, "trust_commit") && !strcmp(certificate, metadata->certificate_id)) {
+        if (apd_credentials_rotation_trust_commit(pem, strlen(pem))) goto done;
+        rc = 1;
+    }
+done:
+    free(der); json_object_put(request); json_object_put(response); return rc;
+}
+
 static int apd_session_run(const struct apd_enrollment_metadata *metadata)
 {
     struct apd_transport_endpoint endpoint;
@@ -3080,7 +4055,13 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
     int rc = -1;
     struct apd_telemetry_gate telemetry_gate;
     struct ap_control_capabilities peer_capabilities = {0};
+    int logs_capable = 0;
     struct ap_control_capabilities local_capabilities = {0};
+    int64_t next_heartbeat_at = 0;
+    int64_t next_job_poll_at = 0;
+    int unbind_required = 0;
+    const char *unbind_request_id_text = NULL;
+    char unbind_request_id[37] = {0};
 
     memset(&connection, 0, sizeof(connection));
     connection.fd = -1;
@@ -3099,10 +4080,12 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
         local_capabilities.apply = local_capabilities.config_executor;
         local_capabilities.readback = local_capabilities.config_executor;
         local_capabilities.rollback = local_capabilities.config_executor;
+        local_capabilities.secret_executor = apd_secret_executor_available();
+        local_capabilities.certificate_executor = 1;
     }
     if (!(request = apd_identity_message_new("session_hello", metadata, 0)) ||
         (connection.protocol_version == 3 &&
-         ap_control_capabilities_add(request, &local_capabilities) != AP_CONTROL_WIRE_OK) ||
+         ap_log_capabilities_add(request, &local_capabilities) != AP_CONTROL_WIRE_OK) ||
         ap_control_json_object_exact(request,
                 connection.protocol_version == 3 ? apd_fields_session_hello_v3 : apd_fields_session_hello,
                 connection.protocol_version == 3 ? APD_ARRAY_SIZE(apd_fields_session_hello_v3) : APD_ARRAY_SIZE(apd_fields_session_hello),
@@ -3129,12 +4112,40 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
         snprintf(session_epoch, sizeof(session_epoch), "%s", session_epoch_text) >=
             (int)sizeof(session_epoch))
         goto done;
+    {
+        struct json_object *unbind_value = NULL;
+
+        if (json_object_object_get_ex(response, "unbind_required", &unbind_value)) {
+            if (!unbind_value || !json_object_is_type(unbind_value, json_type_boolean) ||
+                ap_control_json_get_string(response, "unbind_request_id",
+                                           &unbind_request_id_text, 0, 36) !=
+                    AP_CONTROL_WIRE_OK)
+                goto done;
+            unbind_required = json_object_get_boolean(unbind_value) ? 1 : 0;
+            if (unbind_required && (!unbind_request_id_text[0] ||
+                                    !apd_uuid4_valid(unbind_request_id_text)))
+                goto done;
+            if (!unbind_required && unbind_request_id_text[0])
+                goto done;
+            if (snprintf(unbind_request_id, sizeof(unbind_request_id), "%s",
+                         unbind_request_id_text) >= (int)sizeof(unbind_request_id))
+                goto done;
+        } else if (json_object_object_get_ex(response, "unbind_request_id",
+                                            &unbind_value)) {
+            goto done;
+        }
+    }
     if (connection.protocol_version == 3) {
         struct json_object *capabilities = NULL;
 
         if (!json_object_object_get_ex(response, "capabilities", &capabilities) ||
             ap_control_capabilities_parse(capabilities, &peer_capabilities) != AP_CONTROL_WIRE_OK)
             goto done;
+        struct json_object *logs = NULL;
+        if (json_object_object_get_ex(capabilities, AP_LOG_CAPABILITY, &logs)) {
+            if (!json_object_is_type(logs, json_type_boolean)) goto done;
+            logs_capable = json_object_get_boolean(logs);
+        }
     }
     pthread_mutex_lock(&g_apd_transport.lock);
     g_apd_transport.write_capable =
@@ -3146,12 +4157,47 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
     response = NULL;
     ready = 1;
     apd_transport_set_reason("session_ready");
+    if (unbind_required) {
+        struct apd_credentials_unpair_report report;
+        const char *error_code = "";
+
+        memset(&report, 0, sizeof(report));
+        if (apd_db_pairing_clear() != 0)
+            error_code = "pairing_state_clear_failed";
+        else if (apd_credentials_unpair(&report) != 0)
+            error_code = "credentials_unpair_failed";
+        if (apd_unbind_ack_send(connection.ssl, metadata, session_epoch,
+                                unbind_request_id, error_code[0] == '\0',
+                                error_code) != 0) {
+            rc = 1;
+            goto done;
+        }
+        rc = error_code[0] == '\0' ? 0 : 1;
+        goto done;
+    }
+    if (peer_capabilities.certificate_executor) {
+        int changed = apd_certificate_wire_step(connection.ssl, metadata, session_epoch);
+        if (changed) { rc = 1; goto done; }
+    }
     if (apd_session_telemetry(connection.ssl, metadata, session_epoch,
                               &telemetry_gate, 1) < 0) {
         rc = 1;
         goto done;
     }
-    if (connection.protocol_version == 2 &&
+    if (connection.protocol_version >= 2 &&
+        apd_txpower_wire_step(connection.ssl, metadata, session_epoch) != 0) {
+        rc = 1;
+        goto done;
+    }
+    /*
+     * radio job 的 poll/accept/finish 只有 v2 一套实现，AC 侧
+     * ac_radio_message_handle() 也不按协议版本挡 radio_job_poll。这里原先写
+     * == 2，于是协商到 v3 的会话根本不发 poll，AC 每 300 秒入队的 survey 作业
+     * 永远停在 queued（lease_owner 空、dispatch_generation 0），而两侧的
+     * scan_dispatch / scan_execution 都还声明为 true。与上面
+     * apd_txpower_wire_step 的 >= 2 对齐；v3 专属步骤仍各自按 == 3 判定。
+     */
+    if (connection.protocol_version >= 2 &&
         apd_v2_jobs_step(connection.ssl, metadata, session_epoch) != 0) {
         rc = 1;
         goto done;
@@ -3167,19 +4213,84 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
         rc = 1;
         goto done;
     }
+    if (connection.protocol_version == 3 && g_apd_transport.write_capable &&
+        local_capabilities.secret_executor &&
+        peer_capabilities.secret_executor &&
+        apd_secret_wire_step(connection.ssl, metadata, session_epoch) != 0) {
+        rc = 1;
+        goto done;
+    }
+    next_heartbeat_at = apd_transport_monotonic_ms();
+    if (next_heartbeat_at < 0) {
+        rc = 1;
+        goto done;
+    }
+    next_job_poll_at = next_heartbeat_at + APD_TRANSPORT_JOB_POLL_MS;
+    next_heartbeat_at += (int64_t)APD_TRANSPORT_HEARTBEAT_SECONDS * 1000;
+    apd_transport_set_audit_ready(1);
     while (!apd_transport_stopping()) {
-        if (apd_transport_wait_seconds(APD_TRANSPORT_HEARTBEAT_SECONDS) != 0)
+        int64_t now = apd_transport_monotonic_ms();
+        int64_t deadline;
+        int64_t wait_ms;
+        int wake_reason;
+
+        if (now < 0) {
+            rc = 1;
+            goto done;
+        }
+        deadline = next_job_poll_at < next_heartbeat_at ? next_job_poll_at
+                                                       : next_heartbeat_at;
+        wait_ms = deadline > now ? deadline - now : 0;
+        wake_reason = apd_transport_wait_session_ms(wait_ms);
+        if (wake_reason < 0)
             break;
-        if (apd_session_heartbeat(connection.ssl, metadata, session_epoch) != 0) {
+        if (wake_reason > 0) {
+            if (apd_session_audit_event(connection.ssl, metadata,
+                                        session_epoch) < 0) {
+                rc = 1;
+                goto done;
+            }
+            continue;
+        }
+        now = apd_transport_monotonic_ms();
+        if (now < 0) {
             rc = 1;
             goto done;
         }
-        if (apd_session_telemetry(connection.ssl, metadata, session_epoch,
-                                  &telemetry_gate, 0) < 0) {
+        if (now >= next_heartbeat_at) {
+            if (apd_session_heartbeat(connection.ssl, metadata,
+                                      session_epoch) != 0) {
+                rc = 1;
+                goto done;
+            }
+            if (apd_session_telemetry(connection.ssl, metadata, session_epoch,
+                                      &telemetry_gate, 0) < 0) {
+                rc = 1;
+                goto done;
+            }
+            now = apd_transport_monotonic_ms();
+            if (now < 0) {
+                rc = 1;
+                goto done;
+            }
+            next_heartbeat_at = now +
+                (int64_t)APD_TRANSPORT_HEARTBEAT_SECONDS * 1000;
+        }
+        if (peer_capabilities.certificate_executor) {
+            int changed = apd_certificate_wire_step(connection.ssl, metadata, session_epoch);
+            if (changed) { rc = 1; goto done; }
+        }
+        if (logs_capable && apd_session_logs(connection.ssl, metadata, session_epoch) != 0) {
             rc = 1;
             goto done;
         }
-        if (connection.protocol_version == 2 &&
+        if (connection.protocol_version >= 2 &&
+            apd_txpower_wire_step(connection.ssl, metadata, session_epoch) != 0) {
+            rc = 1;
+            goto done;
+        }
+        /* 同一个门的第二处调用点，理由见上面 session 建立时那一处。 */
+        if (connection.protocol_version >= 2 &&
             apd_v2_jobs_step(connection.ssl, metadata, session_epoch) != 0) {
             rc = 1;
             goto done;
@@ -3190,9 +4301,25 @@ static int apd_session_run(const struct apd_enrollment_metadata *metadata)
             rc = 1;
             goto done;
         }
+        if (connection.protocol_version == 3 &&
+            g_apd_transport.write_capable &&
+            local_capabilities.secret_executor &&
+            peer_capabilities.secret_executor &&
+            apd_secret_wire_step(connection.ssl, metadata, session_epoch) != 0) {
+            rc = 1;
+            goto done;
+        }
+        now = apd_transport_monotonic_ms();
+        if (now < 0) {
+            rc = 1;
+            goto done;
+        }
+        next_job_poll_at = now + APD_TRANSPORT_JOB_POLL_MS;
     }
     rc = apd_transport_stopping() ? 0 : (ready ? 1 : -1);
 done:
+    apd_transport_set_audit_ready(0);
+    apd_audit_forward_fail_active("controller_disconnected");
     json_object_put(request);
     json_object_put(response);
     apd_tls_close(&connection);
@@ -3252,8 +4379,16 @@ static int apd_transport_cycle(void)
         goto done;
     }
     rc = apd_session_run(&metadata);
-    if (rc != 0)
-        apd_transport_set_reason("session_disconnected");
+    if (rc != 0) {
+        const char *current = apd_transport_reason();
+
+        /* apd_session_run() sets a reason of its own on the paths that have
+         * one; only label the remainder, or the specific value is lost. */
+        if (!current || !current[0] || !strcmp(current, "session_ready") ||
+            !strcmp(current, "session_connecting") ||
+            !strcmp(current, "unknown"))
+            apd_transport_set_reason("session_disconnected");
+    }
 done:
     apd_credentials_bootstrap_cleanse(&bootstrap);
     apd_credentials_metadata_cleanse(&metadata);
@@ -3296,6 +4431,7 @@ int apd_transport_start(void)
     }
     g_apd_transport.stop = 0;
     g_apd_transport.connected = 0;
+    g_apd_transport.audit_ready = 0;
     g_apd_transport.active_fd = -1;
     g_apd_transport.sequence = 0;
     snprintf(g_apd_transport.reason, sizeof(g_apd_transport.reason),
@@ -3317,6 +4453,7 @@ void apd_transport_stop(void)
     if (g_apd_transport.running) {
         g_apd_transport.stop = 1;
         g_apd_transport.connected = 0;
+        g_apd_transport.audit_ready = 0;
         if (g_apd_transport.active_fd >= 0)
             shutdown(g_apd_transport.active_fd, SHUT_RDWR);
         pthread_cond_broadcast(&g_apd_transport.condition);
@@ -3324,6 +4461,7 @@ void apd_transport_stop(void)
         join = 1;
     }
     pthread_mutex_unlock(&g_apd_transport.lock);
+    apd_audit_forward_fail_active("service_stopping");
     if (join)
         pthread_join(thread, NULL);
     pthread_mutex_lock(&g_apd_transport.lock);
@@ -3344,6 +4482,24 @@ int apd_transport_connected(void)
     connected = g_apd_transport.connected;
     pthread_mutex_unlock(&g_apd_transport.lock);
     return connected;
+}
+
+int apd_transport_audit_ready(void)
+{
+    int ready;
+
+    pthread_mutex_lock(&g_apd_transport.lock);
+    ready = g_apd_transport.running && !g_apd_transport.stop &&
+            g_apd_transport.connected && g_apd_transport.audit_ready;
+    pthread_mutex_unlock(&g_apd_transport.lock);
+    return ready;
+}
+
+void apd_transport_wake(void)
+{
+    pthread_mutex_lock(&g_apd_transport.lock);
+    pthread_cond_broadcast(&g_apd_transport.condition);
+    pthread_mutex_unlock(&g_apd_transport.lock);
 }
 
 int apd_transport_adopted(void)

@@ -22,6 +22,7 @@
 #include <fcntl.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#include <spawn.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <json-c/json.h>
@@ -214,35 +215,41 @@ fail:
 
 char *get_interface_status_buf(char *ifname)
 {
+    extern char **environ;
     char *const argv[] = { (char *)JMX_IFSTATUS_PATH, ifname, NULL };
     char *buffer = NULL;
     size_t capacity = 4096, used = 0;
     int descriptors[2] = { -1, -1 };
     int status = 0;
     pid_t child;
+    posix_spawn_file_actions_t actions;
+    int spawn_rc;
 
     if (!jmx_interface_name_valid(ifname, 0) || pipe(descriptors) != 0)
         return NULL;
-    child = fork();
-    if (child < 0) {
+    spawn_rc = posix_spawn_file_actions_init(&actions);
+    if (spawn_rc != 0) {
         close(descriptors[0]);
         close(descriptors[1]);
         return NULL;
     }
-    if (child == 0) {
-        int null_fd;
-
+    /* Keep the ifstatus contract without fork() copying the core's large,
+     * actively written heap/page tables on every WAN read. */
+    spawn_rc = posix_spawn_file_actions_addclose(&actions, descriptors[0]);
+    if (!spawn_rc)
+        spawn_rc = posix_spawn_file_actions_adddup2(&actions, descriptors[1], STDOUT_FILENO);
+    if (!spawn_rc && descriptors[1] != STDOUT_FILENO)
+        spawn_rc = posix_spawn_file_actions_addclose(&actions, descriptors[1]);
+    if (!spawn_rc)
+        spawn_rc = posix_spawn_file_actions_addopen(&actions, STDERR_FILENO,
+                                                    "/dev/null", O_WRONLY, 0);
+    if (!spawn_rc)
+        spawn_rc = posix_spawn(&child, JMX_IFSTATUS_PATH, &actions, NULL, argv, environ);
+    posix_spawn_file_actions_destroy(&actions);
+    if (spawn_rc != 0) {
         close(descriptors[0]);
-        if (dup2(descriptors[1], STDOUT_FILENO) < 0)
-            _exit(126);
         close(descriptors[1]);
-        null_fd = open("/dev/null", O_WRONLY | O_CLOEXEC);
-        if (null_fd >= 0) {
-            (void)dup2(null_fd, STDERR_FILENO);
-            close(null_fd);
-        }
-        execv(JMX_IFSTATUS_PATH, argv);
-        _exit(127);
+        return NULL;
     }
     close(descriptors[1]);
     descriptors[1] = -1;

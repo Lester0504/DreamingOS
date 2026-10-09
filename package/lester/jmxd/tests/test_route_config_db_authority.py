@@ -42,7 +42,9 @@ def test_apply_is_transactional_and_clears_stale_wans() -> None:
     assert "jmx_route_nl_wan_unregister(fd, (uint8_t)i)" in apply
     assert "route_sync_network_wans" in apply
     assert "route_kernel_state_counts" in apply
-    assert '"--", (char *)url' in runtime
+    assert '"ip", "route", "replace", "default", "via", (char *)gateway' in runtime
+    assert '"dev", (char *)ifname, "table", table_buf' in runtime
+    assert '"ip", "route", "replace", "default", "dev", (char *)ifname' in runtime
     assert "jmx_route_cleanup_system_route(table_id);" in runtime
     assert "jmx_route_cleanup_untracked_system_routes" not in runtime
 

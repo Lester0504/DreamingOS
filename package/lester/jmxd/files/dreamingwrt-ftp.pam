@@ -1,0 +1,5 @@
+# Only the private listener uses this service. The helper validates the locked
+# shared identity and receives its password through stdin, never argv or a log.
+auth required pam_exec.so quiet quiet_log expose_authtok /usr/bin/dreamingwrt-core --file-share-ftp auth
+auth required pam_permit.so
+account required pam_permit.so

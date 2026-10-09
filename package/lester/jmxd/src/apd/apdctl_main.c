@@ -26,18 +26,23 @@
 #include <json-c/json.h>
 #include <libubox/blobmsg_json.h>
 #include <libubus.h>
+#include <openssl/crypto.h>
+#include <openssl/pem.h>
+#include <openssl/x509.h>
+#include <openssl/x509v3.h>
 
 #include "apd_paircode.h"
+#include "apd_bootstrap_write.h"
 #include "apd_qr.h"
 
 #define APDCTL_VERSION "0.1.0"
 #define APDCTL_UBUS_TIMEOUT_MS 8000
 #define APDCTL_OBJECT "dreamingwrt.apd"
 #define APDCTL_OBJECT_ALIAS "dreamingos.apd"
-#define APDCTL_PKI_DIR "/etc/dreamingwrt/apd-pki"
-#define APDCTL_BOOTSTRAP_PATH APDCTL_PKI_DIR "/bootstrap.json"
-#define APDCTL_CA_PATH APDCTL_PKI_DIR "/controller-ca.pem"
 #define APDCTL_LINE_MAX 1024
+#define APDCTL_PKI_DIR APD_BOOTSTRAP_PKI_DIR
+#define APDCTL_BOOTSTRAP_PATH APD_BOOTSTRAP_PATH
+#define APDCTL_CA_PATH APD_BOOTSTRAP_CA_PATH
 
 /* Terminal columns we refuse to draw a QR into; below this the matrix wraps
  * and nothing can scan it, so we fall back to text. */
@@ -124,6 +129,7 @@ static void usage(FILE *out)
         "  apdctl status              查看配对/采纳状态、控制器地址、证书有效期\n"
         "  apdctl pair                交互式配对向导\n"
         "  apdctl pair --code <配对码> 用控制器给的配对码直接配对\n"
+        "  apdctl pair --bundle <JSON> 用含控制器 CA 的一次性引导包配对\n"
         "  apdctl pair --show         输出可粘贴的配对信息与二维码（供 Web 绑定）\n"
         "  apdctl unpair              解除采纳（高危，需二次确认）\n"
         "  apdctl doctor              自检：控制器可达性、证书有效期、时钟偏差\n"
@@ -524,6 +530,25 @@ static int cmd_pair_show(struct apdctl_opts *opts)
                                json_object_new_int(ap.mgmt_port));
         json_object_object_add(root, "contains_credential",
                                json_object_new_boolean(0));
+        /* Also generate binding QR for App scanning. */
+        {
+            struct apd_binding_qr bqr;
+            char binding_json[APD_BINDING_QR_MAX];
+
+            memset(&bqr, 0, sizeof(bqr));
+            strncpy(bqr.ap_id, ap.ap_id, sizeof(bqr.ap_id) - 1);
+            strncpy(bqr.key_id, ap.key_id, sizeof(bqr.key_id) - 1);
+            strncpy(bqr.mac, ap.mac, sizeof(bqr.mac) - 1);
+            strncpy(bqr.model, ap.model, sizeof(bqr.model) - 1);
+            strncpy(bqr.mgmt_ip, ap.mgmt_ip, sizeof(bqr.mgmt_ip) - 1);
+            bqr.mgmt_port = ap.mgmt_port;
+            bqr.expires_at = time(NULL) + 300;
+            if (apd_binding_qr_generate_nonce(bqr.nonce, APD_BINDING_NONCE_LEN) == 0 &&
+                apd_binding_qr_encode(&bqr, binding_json, sizeof(binding_json)) == 0) {
+                json_object_object_add(root, "binding_qr",
+                                       json_object_new_string(binding_json));
+            }
+        }
         printf("%s\n", json_object_to_json_string_ext(
             root, JSON_C_TO_STRING_PRETTY));
         json_object_put(root);
@@ -547,6 +572,36 @@ static int cmd_pair_show(struct apdctl_opts *opts)
     printf("\n");
     printf("  说明: 此配对码只包含身份声明与连接信息，不含任何密钥或凭据；\n");
     printf("        真正的信任仍由 CSR/mTLS 建立。\n\n");
+
+    /* If AP is not adopted, also show the binding QR for App scanning. */
+    {
+        struct apd_binding_qr bqr;
+        char binding_json[APD_BINDING_QR_MAX];
+
+        memset(&bqr, 0, sizeof(bqr));
+        strncpy(bqr.ap_id, ap.ap_id, sizeof(bqr.ap_id) - 1);
+        strncpy(bqr.key_id, ap.key_id, sizeof(bqr.key_id) - 1);
+        strncpy(bqr.mac, ap.mac, sizeof(bqr.mac) - 1);
+        strncpy(bqr.model, ap.model, sizeof(bqr.model) - 1);
+        strncpy(bqr.mgmt_ip, ap.mgmt_ip, sizeof(bqr.mgmt_ip) - 1);
+        bqr.mgmt_port = ap.mgmt_port;
+        bqr.expires_at = time(NULL) + 300;
+
+        if (apd_binding_qr_generate_nonce(bqr.nonce, APD_BINDING_NONCE_LEN) == 0 &&
+            apd_binding_qr_encode(&bqr, binding_json, sizeof(binding_json)) == 0) {
+            if (opts->json) {
+                /* Already printed JSON above; add binding_qr field. */
+            } else {
+                apdctl_heading("App 扫码绑定（推荐）");
+                printf("  使用 DreamingWrt App 扫描以下二维码绑定此 AP 到指定网关:\n\n");
+                apdctl_print_qr(binding_json, opts->no_color);
+                printf("\n");
+                printf("  二维码有效期: 5 分钟\n");
+                printf("  说明: 此二维码包含 AP 身份和一次性防重放 nonce，\n");
+                printf("        不含长期凭据。绑定流程仍由 CSR/mTLS 保护。\n\n");
+            }
+        }
+    }
     return 0;
 }
 
@@ -556,22 +611,11 @@ static int apdctl_write_bootstrap(const struct apd_paircode_controller *cfg,
                                   char *reason, size_t reason_size)
 {
     struct json_object *root;
-    const char *text;
-    /* Exactly the constant it always holds, so the reason strings below cannot
-     * be told they might be formatting half a kilobyte of path. */
-    char temporary[sizeof(APDCTL_BOOTSTRAP_PATH ".tmp")];
-    int fd;
-    ssize_t written;
-    size_t length;
 
-    if (mkdir(APDCTL_PKI_DIR, 0700) != 0 && errno != EEXIST) {
-        snprintf(reason, reason_size, "无法创建 %s: %s", APDCTL_PKI_DIR,
-                 strerror(errno));
-        return -1;
-    }
-    if (access(APDCTL_CA_PATH, R_OK) != 0) {
+    if (access(APD_BOOTSTRAP_CA_PATH, R_OK) != 0) {
         snprintf(reason, reason_size,
-                 "缺少控制器 CA 证书 %s，请先从控制器获取", APDCTL_CA_PATH);
+                 "缺少控制器 CA 证书 %s，请先从控制器获取",
+                 APD_BOOTSTRAP_CA_PATH);
         return -1;
     }
 
@@ -592,46 +636,199 @@ static int apdctl_write_bootstrap(const struct apd_paircode_controller *cfg,
                                                   cfg->site_id : "default"));
     json_object_object_add(root, "hardware_digest", json_object_new_string(""));
     json_object_object_add(root, "ca_cert_pem_path",
-                           json_object_new_string(APDCTL_CA_PATH));
-    text = json_object_to_json_string(root);
-    length = strlen(text);
+                           json_object_new_string(APD_BOOTSTRAP_CA_PATH));
 
-    /* Write via a temporary file and rename, so the daemon never observes a
-     * half-written bootstrap. 0600 because this file carries the token. */
-    snprintf(temporary, sizeof(temporary), "%s.tmp", APDCTL_BOOTSTRAP_PATH);
-    fd = open(temporary, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
-    if (fd < 0) {
-        snprintf(reason, reason_size, "无法写入 %s: %s", temporary,
-                 strerror(errno));
+    if (apd_bootstrap_write_json(root, APD_BOOTSTRAP_PATH) != 0) {
+        snprintf(reason, reason_size, "写入 bootstrap 失败");
         json_object_put(root);
         return -1;
     }
-    written = write(fd, text, length);
-    if (written < 0 || (size_t)written != length) {
-        snprintf(reason, reason_size, "写入 bootstrap 失败: %s",
-                 strerror(errno));
+    json_object_put(root);
+    return 0;
+}
+
+static int apdctl_ca_pem_valid(const char *pem)
+{
+    BIO *bio;
+    X509 *certificate;
+    int ok;
+
+    if (!pem || !pem[0])
+        return 0;
+    bio = BIO_new_mem_buf(pem, -1);
+    if (!bio)
+        return 0;
+    certificate = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+    ok = certificate != NULL && X509_check_ca(certificate) > 0;
+    X509_free(certificate);
+    BIO_free(bio);
+    return ok;
+}
+
+static int apdctl_read_file(const char *path, unsigned char **out,
+                            size_t *out_len)
+{
+    struct stat st;
+    unsigned char *data;
+    size_t offset = 0;
+    int fd;
+
+    if (!out || !out_len)
+        return -1;
+    *out = NULL;
+    *out_len = 0;
+    fd = open(path, O_RDONLY | O_NOFOLLOW | O_CLOEXEC);
+    if (fd < 0)
+        return errno == ENOENT ? 1 : -1;
+    if (fstat(fd, &st) != 0 || st.st_size < 0 || st.st_size > 1024 * 1024) {
         close(fd);
-        unlink(temporary);
-        json_object_put(root);
         return -1;
     }
-    if (fsync(fd) != 0) {
-        snprintf(reason, reason_size, "落盘失败: %s", strerror(errno));
+    data = calloc(1, (size_t)st.st_size + 1);
+    if (!data) {
         close(fd);
-        unlink(temporary);
-        json_object_put(root);
         return -1;
+    }
+    while (offset < (size_t)st.st_size) {
+        ssize_t got = read(fd, data + offset, (size_t)st.st_size - offset);
+
+        if (got < 0 && errno == EINTR)
+            continue;
+        if (got <= 0) {
+            OPENSSL_clear_free(data, (size_t)st.st_size + 1);
+            close(fd);
+            return -1;
+        }
+        offset += (size_t)got;
     }
     close(fd);
-    json_object_put(root);
-
-    if (rename(temporary, APDCTL_BOOTSTRAP_PATH) != 0) {
-        snprintf(reason, reason_size, "无法启用 bootstrap: %s",
-                 strerror(errno));
-        unlink(temporary);
-        return -1;
-    }
+    *out = data;
+    *out_len = offset;
     return 0;
+}
+
+static int apdctl_pair_with_bundle(struct apdctl_opts *opts,
+                                   const char *raw)
+{
+    struct json_object *bundle = NULL;
+    struct json_object *value = NULL;
+    struct apd_paircode_controller cfg;
+    unsigned char *old_ca = NULL;
+    size_t old_ca_len = 0;
+    const char *code;
+    const char *ca_pem;
+    char reason[256];
+    struct json_object *pairing = NULL;
+    int64_t expires_at;
+    int adopted;
+    int had_old_ca;
+    int rc = 1;
+
+    memset(&cfg, 0, sizeof(cfg));
+    bundle = json_tokener_parse(raw);
+    if (!bundle || !json_object_is_type(bundle, json_type_object)) {
+        apdctl_error("引导包不是有效 JSON 对象。");
+        goto done;
+    }
+    json_object_object_foreach(bundle, key, ignored) {
+        (void)ignored;
+        if (strcmp(key, "version") && strcmp(key, "bootstrap_code") &&
+            strcmp(key, "ca_cert_pem") && strcmp(key, "display_once") &&
+            strcmp(key, "expires_at")) {
+            apdctl_error("引导包包含不允许的字段: %s。", key);
+            goto done;
+        }
+    }
+    if (!json_object_object_get_ex(bundle, "version", &value) || !value ||
+        !json_object_is_type(value, json_type_int) ||
+        json_object_get_int(value) != 1) {
+        apdctl_error("引导包版本无效。");
+        goto done;
+    }
+    if (!json_object_object_get_ex(bundle, "display_once", &value) || !value ||
+        !json_object_is_type(value, json_type_boolean) ||
+        !json_object_get_boolean(value)) {
+        apdctl_error("引导包缺少一次性展示标记。");
+        goto done;
+    }
+    if (!json_object_object_get_ex(bundle, "bootstrap_code", &value) ||
+        !value || !json_object_is_type(value, json_type_string)) {
+        apdctl_error("引导包缺少 bootstrap_code。");
+        goto done;
+    }
+    code = json_object_get_string(value);
+    if (apd_paircode_controller_decode(code, &cfg) != APD_PAIRCODE_OK) {
+        apdctl_error("引导包中的控制器配对码无效。");
+        goto done;
+    }
+    if (!json_object_object_get_ex(bundle, "ca_cert_pem", &value) ||
+        !value || !json_object_is_type(value, json_type_string)) {
+        apdctl_error("引导包缺少 ca_cert_pem。");
+        goto done;
+    }
+    ca_pem = json_object_get_string(value);
+    if (!apdctl_ca_pem_valid(ca_pem)) {
+        apdctl_error("引导包中的控制器 CA 证书无效。");
+        goto done;
+    }
+    if (!json_object_object_get_ex(bundle, "expires_at", &value) || !value ||
+        !json_object_is_type(value, json_type_int) ||
+        (expires_at = json_object_get_int64(value)) <= (int64_t)time(NULL)) {
+        apdctl_error("引导包已过期或缺少有效 expires_at。");
+        goto done;
+    }
+    pairing = apdctl_call("pairing_status", NULL);
+    if (!pairing) {
+        apdctl_daemon_unreachable();
+        goto done;
+    }
+    adopted = apdctl_json_bool(pairing, "adopted", 0);
+    json_object_put(pairing);
+    pairing = NULL;
+    if (adopted && !opts->force) {
+        apdctl_error("本机已被采纳。");
+        apdctl_hint("如需重新配对，先运行 `jmctl ap unpair`，或加 --force。");
+        goto done;
+    }
+
+    had_old_ca = apdctl_read_file(APD_BOOTSTRAP_CA_PATH, &old_ca,
+                                  &old_ca_len);
+    if (had_old_ca < 0) {
+        apdctl_error("无法备份现有控制器 CA。");
+        goto done;
+    }
+    if (apd_bootstrap_write_bytes(ca_pem, strlen(ca_pem),
+                                  APD_BOOTSTRAP_CA_PATH) != 0) {
+        apdctl_error("写入控制器 CA 失败。");
+        goto done;
+    }
+    if (apdctl_write_bootstrap(&cfg, reason, sizeof(reason)) != 0) {
+        int rollback_ok = had_old_ca == 0 ?
+            apd_bootstrap_write_bytes(old_ca, old_ca_len,
+                                      APD_BOOTSTRAP_CA_PATH) == 0 :
+            (unlink(APD_BOOTSTRAP_CA_PATH) == 0 || errno == ENOENT);
+
+        if (rollback_ok)
+            apdctl_error("%s；控制器 CA 已回滚。", reason);
+        else
+            apdctl_error("%s；控制器 CA 回滚失败，请人工检查 %s。",
+                         reason, APD_BOOTSTRAP_CA_PATH);
+        goto done;
+    }
+
+    printf("\n  已写入控制器 CA 和 bootstrap 配置。\n");
+    apdctl_hint("重启 apd 以开始 enrollment:  /etc/init.d/dreamingwrt-apd restart");
+    apdctl_hint("随后用 `jmctl ap status` 或 `apdctl status` 查看结果。");
+    rc = 0;
+done:
+    apd_paircode_controller_cleanse(&cfg);
+    if (old_ca)
+        OPENSSL_clear_free(old_ca, old_ca_len + 1);
+    if (bundle)
+        json_object_put(bundle);
+    if (pairing)
+        json_object_put(pairing);
+    return rc;
 }
 
 static int apdctl_pair_with_code(struct apdctl_opts *opts, const char *raw)
@@ -702,6 +899,13 @@ static int cmd_pair(struct apdctl_opts *opts, int argc, char **argv)
     for (i = 0; i < argc; i++) {
         if (strcmp(argv[i], "--show") == 0)
             return cmd_pair_show(opts);
+        if (strcmp(argv[i], "--bundle") == 0) {
+            if (i + 1 >= argc) {
+                apdctl_error("--bundle 需要一个 JSON 引导包参数。");
+                return 1;
+            }
+            return apdctl_pair_with_bundle(opts, argv[i + 1]);
+        }
         if (strcmp(argv[i], "--code") == 0) {
             if (i + 1 >= argc) {
                 apdctl_error("--code 需要一个配对码参数。");

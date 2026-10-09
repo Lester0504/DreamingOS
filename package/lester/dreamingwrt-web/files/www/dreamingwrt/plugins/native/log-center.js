@@ -1,5 +1,5 @@
-const VERSION = '20260817-audit-log-localization-03';
-const LEGACY_CONTROLLER_URL = '/static/js/log-center.js?v=20260817-audit-log-localization-03';
+const VERSION = '20261006-log-center-workbench-06';
+const LEGACY_CONTROLLER_URL = '/static/js/log-center.js?v=20261006-log-center-workbench-06';
 
 let controllerPromise = null;
 
@@ -33,6 +33,11 @@ export async function mount(context = {}) {
   const root = context.root;
   if (!(root instanceof HTMLElement)) return { unmount() {} };
 
+  for (const href of ['/static/desktop/dwrt-rail.css', '/static/css/log-center.css?v=20261006-log-center-workbench-06']) {
+    if (!document.querySelector(`link[data-log-style="${href}"]`)) {
+      const link=document.createElement('link'); link.rel='stylesheet'; link.href=href; link.dataset.logStyle=href; document.head.append(link);
+    }
+  }
   const legacy = await loadLegacyController();
   if (context.signal?.aborted) return { unmount() {} };
 
@@ -47,6 +52,9 @@ export async function mount(context = {}) {
     formatBytes: context.utils?.formatBytes,
     formatInteger: context.utils?.formatInteger,
     formatRate: context.utils?.formatRate,
+    formatDateTime: context.utils?.formatDateTime,
+    formatDate: context.utils?.formatDate,
+    formatTime: context.utils?.formatTime,
     authHeaders: context.api?.authHeaders,
     routeTo: context.api?.routeTo
   });

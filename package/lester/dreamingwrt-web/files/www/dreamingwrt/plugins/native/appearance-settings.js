@@ -7,7 +7,11 @@ const ACCENT_PRESETS = Object.freeze([
   ['indigo', '靛蓝', '#5856D6'],
   ['cyan', '青色', '#0891B2'],
   ['teal', '蓝绿', '#0F766E'],
-  ['slate', '灰蓝', '#475569']
+  ['slate', '灰蓝', '#475569'],
+  ['#0A84FF', '经典蓝', '#0A84FF'],
+  ['#30D158', '极光绿', '#30D158'],
+  ['#FF9F0A', '晚霞橙', '#FF9F0A'],
+  ['#5AC8FA', '晴空青', '#5AC8FA']
 ]);
 
 const READABILITY_LEVELS = Object.freeze([
@@ -18,10 +22,22 @@ const READABILITY_LEVELS = Object.freeze([
 
 const MATERIAL_MODES = Object.freeze([
   ['shader', '折射'],
-  ['standard', '标准'],
-  ['prominent', '强调'],
-  ['polar', '极光']
+  ['standard', '标准毛玻璃'],
+  ['prominent', '强调高反光'],
+  ['polar', '极光漫反射']
 ]);
+
+/*
+ * 主题族 theme_family：界面材质族，与 material_glass.mode 正交。
+ * mode 是液态玻璃族内部的渲染精度档，只在 liquid-glass 下有意义；
+ * 换族只重定义 theme-families.css 里的复合令牌，业务 CSS 一行不改。
+ */
+const THEME_FAMILIES = Object.freeze([
+  ['liquid-glass', '液态玻璃'],
+  ['frosted-glass', '毛玻璃'],
+  ['traditional', '传统']
+]);
+const THEME_FAMILY_KEYS = Object.freeze(THEME_FAMILIES.map(([key]) => key));
 
 /*
  * 材质控件的取值区间必须与后端校验一致，否则会做出"点了就失败"的控件。
@@ -112,6 +128,24 @@ const WALLPAPER_INTERVALS = Object.freeze([
   ['long', '长']
 ]);
 
+const DESKTOP_STORAGE_KEY = 'dreamingos.desktop.preferences.v1';
+const DESKTOP_OPTIONS = Object.freeze({
+  launcher: [['dock', '底部 Dock 栏'], ['sidebar', '左侧边栏']],
+  windowStyle: [['macos', 'macOS 红绿灯'], ['dwrt', '默认简约']],
+  openGesture: [['single', '单击打开'], ['double', '双击打开']]
+});
+const WALLPAPER_PAIRS = ['mode', 'image', 'interval'];
+
+function desktopPreferences() {
+  let saved = {};
+  try { saved = JSON.parse(localStorage.getItem(DESKTOP_STORAGE_KEY) || '{}'); } catch (_) {}
+  const result = { launcher: 'dock', windowStyle: 'dwrt', openGesture: 'single' };
+  Object.keys(result).forEach((key) => {
+    if (DESKTOP_OPTIONS[key].some(([value]) => value === saved[key])) result[key] = saved[key];
+  });
+  return result;
+}
+
 const clone = (value) => {
   try { return structuredClone(value); } catch (_) { return JSON.parse(JSON.stringify(value ?? null)); }
 };
@@ -191,7 +225,8 @@ export function normalizeAppearanceSettings(payload = {}) {
       border_color: textValue(material.border_color, '#25FFFFFF'),
       highlight: numberValue(material.highlight, 0.28, 0, 0.65),
       highlight_angle: numberValue(material.highlight_angle, 135, 0, 360),
-      preserve_center: booleanValue(material.preserve_center, true)
+      preserve_center: booleanValue(material.preserve_center, true),
+      theme_family: THEME_FAMILY_KEYS.includes(material.theme_family) ? material.theme_family : 'liquid-glass'
     },
     wallpaper: {
       ...clone(wallpaper),
@@ -214,14 +249,6 @@ export function normalizeAppearanceSettings(payload = {}) {
   };
 }
 
-function mergeDeep(base, patch) {
-  if (!patch || typeof patch !== 'object' || Array.isArray(patch)) return clone(patch);
-  const next = base && typeof base === 'object' && !Array.isArray(base) ? clone(base) : {};
-  Object.entries(patch).forEach(([key, value]) => {
-    next[key] = value && typeof value === 'object' && !Array.isArray(value) ? mergeDeep(next[key], value) : clone(value);
-  });
-  return next;
-}
 
 function setPath(target, path, value) {
   const parts = String(path).split('.').filter(Boolean);
@@ -284,12 +311,20 @@ export function mount(context = {}) {
     previewWallpaperScope: 'wallpaper',
     contrastFrame: 0,
     feedback: '',
-    feedbackTone: 'neutral'
+    feedbackTone: 'neutral',
+    desktopBaseline: desktopPreferences(),
+    desktopDraft: desktopPreferences(),
+    desktopTouched: new Set(),
+    wallpaperLinked: false,
+    previewImage: '',
+    openGroups: new Map(),
+    hexInvalid: false,
+    hexDraft: null
   };
 
   const icon = (name) => window.DWRT_UI_KIT?.lucideIcon?.(name, { size: 18, strokeWidth: 1.8 }) || '';
-  const writable = (name) => capabilities.appearance !== false && state.settingsSnapshot?.value?.capabilities?.[name] !== false;
-  const dirty = () => state.touched.size > 0;
+  const writable = (name) => capabilities.appearance !== false && window.DWRT_SESSION?.tokens?.().role !== 'viewer' && state.settingsSnapshot?.value?.capabilities?.[name] !== false;
+  const dirty = () => state.touched.size > 0 || state.desktopTouched.size > 0;
 
   /*
    * 会话闸门适配器：见 dwrt-session-gate.js 的 DWRT_REQUEST。裸 fetch 会绕过 token 刷新，
@@ -320,6 +355,7 @@ export function mount(context = {}) {
     const normalized = normalizeAppearanceSettings(state.settingsSnapshot.value);
     state.baseline = normalized;
     state.draft = clone(normalized);
+    state.wallpaperLinked = WALLPAPER_PAIRS.every((key) => normalized.wallpaper[key] === normalized.wallpaper[`login_${key}`]);
     return true;
   }
 
@@ -331,7 +367,7 @@ export function mount(context = {}) {
       if (snapshot.status === 'unavailable') return { name: 'unavailable', title: '外观设置接口不可用', detail: '当前固件没有提供页面所需的权威配置合同。' };
       return { name: 'error', title: '无法读取外观设置', detail: textValue(snapshot.error?.message, '保留当前页面后重试。') };
     }
-    if (!state.draft) return { name: 'loading', title: '正在读取外观设置', detail: '页面骨架已就绪，等待外观权威快照。' };
+    if (!state.draft) return { name: 'loading', title: '正在读取外观设置', detail: '正在读取当前主题、壁纸和桌面偏好。' };
     return null;
   }
 
@@ -361,7 +397,8 @@ export function mount(context = {}) {
   }
 
   function disclosure(id, title, summary, content, open = false) {
-    return `<section data-dwrt-component="disclosure" data-appearance-disclosure="${escapeHtml(id)}" data-adaptive-sample><button type="button" data-dwrt-disclosure-trigger aria-expanded="${open ? 'true' : 'false'}"><span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(summary)}</small></span>${icon('chevron-down')}</button><div data-dwrt-disclosure-panel ${open ? '' : 'hidden'}>${content}</div></section>`;
+    open = state.openGroups.has(id) ? state.openGroups.get(id) : open;
+    return `<section data-dwrt-component="disclosure" data-appearance-disclosure="${escapeHtml(id)}" data-adaptive-sample ${id === 'material-advanced' ? '' : 'data-dwrt-surface="stable-glass"'}><button type="button" data-dwrt-disclosure-trigger aria-expanded="${open ? 'true' : 'false'}"><span><strong>${escapeHtml(title)}</strong><small>${escapeHtml(summary)}</small></span>${icon('chevron-down')}</button><div data-dwrt-disclosure-panel ${open ? '' : 'hidden'}>${content}</div></section>`;
   }
 
   /*
@@ -397,7 +434,12 @@ export function mount(context = {}) {
   function themeGroup() {
     const disabled = !writable('appearance_accent_write');
     const active = state.draft.accent_color;
-    return disclosure('theme', '主题', '设置界面的强调色', `<div class="appearance-accent-field" role="radiogroup" aria-label="强调色">${ACCENT_PRESETS.map(([id, label, color]) => `<button type="button" class="appearance-accent-option ${active === id || accentHex(active) === color ? 'is-active' : ''}" data-appearance-accent="${escapeHtml(id)}" role="radio" aria-checked="${active === id || accentHex(active) === color ? 'true' : 'false'}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}" style="--appearance-swatch:${escapeHtml(color)}" ${disabled ? 'disabled' : ''}><span aria-hidden="true"></span></button>`).join('')}</div>`, true);
+    const hex = accentHex(active);
+    return disclosure('theme', '主题与色彩', '系统强调色 · 自由调色', `<div class="appearance-color-row"><div class="appearance-accent-field" role="radiogroup" aria-label="强调色">${ACCENT_PRESETS.map(([id, label, color]) => `<button type="button" class="appearance-accent-option ${hex === color ? 'is-active' : ''}" data-appearance-accent="${escapeHtml(id)}" role="radio" aria-checked="${hex === color ? 'true' : 'false'}" aria-label="${escapeHtml(label)}" title="${escapeHtml(label)}" style="--appearance-swatch:${escapeHtml(color)}" ${disabled ? 'disabled' : ''}><span aria-hidden="true"></span></button>`).join('')}</div><div class="appearance-custom-color"><input type="color" aria-label="自定义强调色" data-appearance-color value="${hex}" ${disabled ? 'disabled' : ''}><span aria-hidden="true">#</span><input type="text" aria-label="强调色 HEX" data-appearance-hex maxlength="7" value="${escapeHtml(state.hexDraft ?? hex.slice(1))}" aria-invalid="${state.hexInvalid}" spellcheck="false" autocomplete="off" ${disabled ? 'disabled' : ''}></div></div><p class="appearance-color-caption" data-appearance-color-caption>${escapeHtml(ACCENT_PRESETS.find(([, , color]) => color === hex)?.[1] || '自定义色')} · ${hex}</p><small class="appearance-color-error" data-appearance-color-error role="alert" ${state.hexInvalid ? '' : 'hidden'}>请输入六位十六进制颜色，例如 AF52DE。</small>`, true);
+  }
+
+  function themeFamilyField() {
+    return `<div data-dwrt-component="field"><span data-dwrt-field-label>界面风格</span>${segmented('material_glass.theme_family', state.draft.material_glass.theme_family, THEME_FAMILIES, '主题族', !writable('appearance_glass_write'))}</div>`;
   }
 
   function wallpaperSource(prefix, title, enabled, mode, image, interval, disabled) {
@@ -419,60 +461,55 @@ export function mount(context = {}) {
       : '展开后按需读取壁纸目录';
     const admin = wallpaperSource('wallpaper', '后台壁纸', wallpaper.enabled, wallpaper.mode, wallpaper.image, wallpaper.interval, disabled);
     const login = wallpaperSource('login', '登录页壁纸', wallpaper.login_enabled, wallpaper.login_mode, wallpaper.login_image, wallpaper.login_interval, disabled);
-    return disclosure('wallpaper', '壁纸', status, `<div class="appearance-wallpaper-grid">${admin}${login}</div>`);
+    return disclosure('wallpaper', '壁纸来源与同步', status, `${switchRow('wallpaper-sync', '登录页与后台壁纸同步', '使用相同的图片、选择方式和轮换间隔；关闭后可独立设置。', state.wallpaperLinked, disabled)}<div class="appearance-wallpaper-grid">${admin}<div data-appearance-login-fields>${login}</div></div>`);
   }
 
   function readabilityGroup() {
     const disabled = !writable('appearance_glass_write');
     const material = state.draft.material_glass;
+    /* mode 与折射参数只在液态玻璃族有意义；非液态族置灰，避免"点了没反应"。 */
+    const nonLiquid = (material.theme_family || 'liquid-glass') !== 'liquid-glass';
+    const modeDisabled = disabled || nonLiquid;
     const summary = disabled
       ? '当前账号不可修改材质参数'
       : `模糊 ${materialFieldText('base_blur', material.base_blur)} · 吸收 ${materialFieldText('neutral_density', material.neutral_density)} · 饱和 ${materialFieldText('saturation', material.saturation)}`;
     const reason = disabled
-      ? `<p class="appearance-locked-note" data-appearance-locked>固件未开放 <code>appearance_glass_write</code> 能力位，材质参数只读。</p>`
+      ? `<p class="appearance-locked-note" data-appearance-locked>当前账号或设备不允许修改材质参数。</p>`
       : '';
-    const modeField = `<div data-dwrt-component="field"><span data-dwrt-field-label>材质模式</span>${segmented('material_glass.mode', material.mode, MATERIAL_MODES, '材质模式', disabled)}<small data-dwrt-field-description>折射模式使用壁纸采样渲染器；标准模式只用 CSS 材质，开销更低。</small></div>`;
-    const presets = `<div class="appearance-density-presets" role="group" aria-label="吸收强度预设">${READABILITY_LEVELS.map((level) => `<button type="button" data-dwrt-component="button" data-variant="ghost" data-appearance-density-preset="${level.density}" aria-pressed="${Math.abs(numberValue(material.neutral_density, 0.06, 0.025, 0.18) - level.density) < 0.0005 ? 'true' : 'false'}" ${disabled ? 'disabled' : ''}>${escapeHtml(level.label)}</button>`).join('')}</div>`;
+    const modeHint = nonLiquid
+      ? '当前风格不使用壁纸采样折射，材质模式仅在液态玻璃族生效。'
+      : '折射模式使用壁纸采样渲染器；标准模式只用 CSS 材质，开销更低。';
+    const modeField = `<div data-dwrt-component="field"><span data-dwrt-field-label>材质模式</span>${segmented('material_glass.mode', material.mode, MATERIAL_MODES, '材质模式', modeDisabled)}<small data-dwrt-field-description>${escapeHtml(modeHint)}</small></div>`;
+    const presets = `<div class="appearance-density-presets" role="group" aria-label="吸收强度预设">${READABILITY_LEVELS.map((level) => `<button type="button" data-dwrt-component="button" data-variant="ghost" data-appearance-density-preset="${level.density}" aria-pressed="${Math.abs(numberValue(material.neutral_density, 0.06, 0.025, 0.18) - level.density) < 0.0005 ? 'true' : 'false'}" ${disabled ? 'disabled' : ''}>${escapeHtml(level.label)} · ${Math.round(level.density * 1000) / 10}%</button>`).join('')}</div>`;
     const basic = MATERIAL_FIELDS.filter((field) => !field.advanced)
       .map((field) => materialSlider(field, material[field.key], disabled) + (field.key === 'neutral_density' ? presets : ''))
       .join('');
     const advanced = MATERIAL_FIELDS.filter((field) => field.advanced)
-      .map((field) => materialSlider(field, material[field.key], disabled))
+      .map((field) => materialSlider(field, material[field.key], modeDisabled))
       .join('');
-    const readOnly = `<dl class="appearance-material-readonly"><dt>吸收色</dt><dd>${escapeHtml(textValue(material.neutral_color, '10 16 25'))}</dd><dt>边缘光颜色</dt><dd>${escapeHtml(textValue(material.border_color, '#25FFFFFF'))}</dd><dt>中心保留</dt><dd>${material.preserve_center ? '开启' : '关闭'}</dd></dl><small data-dwrt-field-description>这三项仍由共享令牌与合同默认值提供，本页暂未开放编辑，后端已能存储。</small>`;
-    return disclosure('readability', '可读性', summary, `${reason}<div class="appearance-field-stack">${modeField}${basic}${contrastNoticeMarkup()}</div>${disclosure('material-advanced', '高级材质参数', '折射、高光与边缘光', `<div class="appearance-field-stack">${advanced}${readOnly}</div>`)}`);
+    const readOnly = `<dl class="appearance-material-readonly"><dt>吸收色</dt><dd>${escapeHtml(textValue(material.neutral_color, '10 16 25'))}</dd><dt>边缘光颜色</dt><dd>${escapeHtml(textValue(material.border_color, '#25FFFFFF'))}</dd><dt>中心保留</dt><dd>${material.preserve_center ? '开启' : '关闭'}</dd></dl><small data-dwrt-field-description>吸收色、边缘光颜色与中心保留沿用当前配置。</small>`;
+    return disclosure('readability', '玻璃材质与可读性', summary, `${reason}<div class="appearance-field-stack">${themeFamilyField()}${modeField}${basic}</div>${disclosure('material-advanced', '高级材质参数', '折射、高光与边缘光', `<div class="appearance-field-stack">${advanced}${readOnly}</div>`)}`, true);
   }
 
   function motionGroup() {
-    const disabled = !writable('appearance_runtime_apply');
-    return disclosure('motion', '动效', '设置界面反馈的运动强度', `<div data-dwrt-component="field"><span data-dwrt-field-label>交互动画</span>${segmented('dashboard.animation_level', state.draft.dashboard.animation_level, ANIMATION_LEVELS, '交互动画', disabled)}<small data-dwrt-field-description>系统的“减少动态效果”偏好始终优先。</small></div>`);
+    const desktopField = (key, label) => `<div data-dwrt-component="field"><span data-dwrt-field-label>${label}</span>${segmented(`desktop.${key}`, state.desktopDraft[key], DESKTOP_OPTIONS[key], label)}</div>`;
+    return disclosure('motion', '桌面与窗口偏好', '桌面布局、启动手势与动效', `<div class="appearance-desktop-grid">${desktopField('launcher', '应用栏位置')}${desktopField('windowStyle', '窗口风格')}${desktopField('openGesture', '图标启动方式')}<div data-dwrt-component="field"><span data-dwrt-field-label>动效物理反馈</span>${segmented('dashboard.animation_level', state.draft.dashboard.animation_level, ANIMATION_LEVELS, '交互动画', !writable('appearance_runtime_apply'))}</div></div><small data-dwrt-field-description>桌面偏好保存在当前浏览器。系统“减少动态效果”优先。</small>`, true);
   }
 
   function previewMarkup() {
-    const level = readabilityLevel(state.draft.material_glass);
-    /*
-     * 预览卡的材质必须来自共享令牌，但采样归属只能有一个。
-     *
-     * 它不能带 `data-dwrt-surface="stable-glass"`，也不能带 `.dwrt-kit-glass-surface`：
-     * 两者都命中 menu-shell 的 PAGE_GLASS_SELECTOR（:6892、:6895），会把这张卡注册成
-     * **页面级**采样目标。页面级采样量的是桌面壁纸，而这张卡浮在预览台自己的那张图上，
-     * 场景不同却共写同一个 `--adaptive-region-luma`：30.1 实测本页写 0.296、
-     * 宿主随后改写 0.134，等待时长不同结果还会翻覆，对比度提示的趋势因此与真实渲染相反。
-     *
-     * 所以这里用页面自己的 `.appearance-preview-glass`，其材质在 CSS 里**只引用**
-     * 共享令牌（--dwrt-glass-surface / --dwrt-glass-edge / --dwrt-glass-shadow-raised
-     * 与 --dwrt-glass-backdrop），不新增任何档位或私有玻璃参数。令牌由外观页设置驱动，
-     * 所以拖滑块时这张卡仍与整个控制台同步变化。
-     */
-    return `<section class="appearance-preview" aria-labelledby="appearance-preview-title"><header data-adaptive-sample><span data-appearance-preview-context>后台预览</span><strong id="appearance-preview-title">实时预览</strong><small>主题、可读性与动效共用宿主外观合同。</small></header><div class="appearance-preview-stage"><img data-appearance-preview-image alt=""><div class="appearance-preview-glass"><span class="appearance-preview-kicker">Dreaming OS</span><strong>网络运行正常</strong><p>主文本、辅助信息和交互控件在同一材质上保持清晰。</p><div class="appearance-preview-controls"><span class="appearance-preview-toggle" aria-hidden="true"><i></i></span><span class="appearance-preview-action">保存设置</span><span class="appearance-preview-status"><i></i>已应用</span></div></div></div><footer><span>吸收强度</span><strong data-appearance-preview-level>${escapeHtml(READABILITY_LEVELS[level].label)}</strong><span data-appearance-preview-readout>${escapeHtml(previewReadoutText())}</span></footer></section>`;
+    return `<aside class="appearance-preview" aria-labelledby="appearance-preview-title"><div class="appearance-preview-stage"><img data-appearance-preview-image alt=""><div class="appearance-preview-window"><header class="appearance-sandbox-header"><span class="appearance-traffic-lights" aria-hidden="true"><i></i><i></i><i></i></span><strong id="appearance-preview-title">实时材质预览</strong><span class="appearance-preview-live">● 预览</span></header><div class="appearance-preview-glass"><span class="appearance-preview-kicker">Dreaming OS</span><strong>让桌面呈现你的风格</strong><p>在这里查看正文、辅助信息与交互控件的显示效果。</p><div class="appearance-preview-controls"><button type="button" class="appearance-preview-toggle" data-appearance-sample-toggle role="switch" aria-checked="true" aria-label="预览开关"><i></i></button><button type="button" class="appearance-preview-action" data-appearance-sample-action>试试动效</button></div><span class="appearance-preview-status">仅作外观预览</span></div><div class="appearance-sandbox-bottom"><span data-appearance-preview-context>后台预览</span><div class="appearance-preview-launcher" aria-hidden="true">${['layout-grid', 'folder', 'settings', 'image'].map((name) => `<span>${icon(name)}</span>`).join('')}</div><div class="appearance-preview-wallpapers"><span>换张壁纸看效果</span><button type="button" data-dwrt-component="button" data-variant="ghost" data-appearance-action="preview-media">浏览壁纸</button><div class="appearance-bg-swatches" data-appearance-bg-swatches></div></div></div></div></div><div class="appearance-preview-info"><span data-appearance-preview-readout>${escapeHtml(previewReadoutText())}</span><strong data-appearance-preview-level>${escapeHtml(READABILITY_LEVELS[readabilityLevel(state.draft.material_glass)].label)}</strong>${contrastNoticeMarkup()}</div><div class="appearance-feedback is-${escapeHtml(state.feedbackTone)}" data-appearance-feedback ${state.feedback ? '' : 'hidden'} role="status">${escapeHtml(state.feedback)}</div>${savebarMarkup()}</aside>`;
   }
 
   function shellMarkup(content) {
-    return `<main class="appearance-page-shell" data-dwrt-component="page-shell" data-dwrt-page-shell="settings-workbench" data-dwrt-surface="stable-glass"><header class="appearance-page-header" data-adaptive-sample><div><h1>外观</h1><p>统一后台、登录页与原生插件的主题和材质。</p></div><span data-appearance-status>${state.settingsSnapshot?.stale ? '使用最近一次配置' : '配置已同步'}</span></header>${content}</main>`;
+    return `<main class="appearance-page-shell" data-dwrt-component="page-shell" data-dwrt-page-shell="settings-workbench" data-dwrt-surface="none">${content}</main>`;
+  }
+
+  function headerMarkup() {
+    return `<header class="appearance-page-header" data-adaptive-sample><div><h1>外观与材质工坊</h1><p>调配主题色与玻璃质感，定义桌面和窗口的交互方式。</p></div><span data-appearance-status>${state.settingsSnapshot?.stale ? '使用最近一次配置' : '配置已同步'}</span></header>`;
   }
 
   function savebarMarkup() {
-    return window.DWRT_UI_KIT?.floatingSavebarMarkup?.({ visible: dirty(), busy: state.saving, message: state.feedback || '外观配置已修改，请保存生效' }) || '';
+    return window.DWRT_UI_KIT?.floatingSavebarMarkup?.({ visible: dirty() || state.hexInvalid, busy: state.saving, message: dirty() ? '外观配置尚未保存' : '调整后保存并应用' }) || '';
   }
 
   function render() {
@@ -483,13 +520,16 @@ export function mount(context = {}) {
     root.hidden = false;
     root.innerHTML = shellMarkup(view
       ? statePanel(view)
-      : `<div class="appearance-workbench"><div class="appearance-groups">${themeGroup()}${wallpaperGroup()}${readabilityGroup()}${motionGroup()}</div>${previewMarkup()}</div><div class="appearance-feedback is-${escapeHtml(state.feedbackTone)}" data-appearance-feedback ${state.feedback ? '' : 'hidden'}>${escapeHtml(state.feedback)}</div>${savebarMarkup()}`);
+      : `<div class="appearance-workbench"><div class="appearance-groups">${headerMarkup()}${themeGroup()}${readabilityGroup()}${motionGroup()}${wallpaperGroup()}</div>${previewMarkup()}</div>`);
     if (typeof ui.mountAll === 'function') ui.mountAll(root);
     else window.DWRT_UI_KIT?.mountAll?.(root);
     if (!view) {
       syncMaterialSliders();
       syncDensityPresets();
       syncPreview();
+      syncSavebar();
+      syncWallpaperDependencies();
+      syncPreviewSwatches();
     }
     ui.scheduleAdaptiveForegroundSample?.(0, root);
   }
@@ -608,9 +648,11 @@ export function mount(context = {}) {
     if (preview) {
       preview.style.setProperty('--appearance-preview-accent', accentHex(state.draft.accent_color));
       preview.dataset.animationLevel = state.draft.dashboard.animation_level;
+      preview.dataset.windowStyle = state.desktopDraft.windowStyle;
+      preview.dataset.launcher = state.desktopDraft.launcher;
     }
     const image = root.querySelector('[data-appearance-preview-image]');
-    const url = activeWallpaperUrl();
+    const url = state.previewImage || activeWallpaperUrl();
     if (image) {
       image.onload = () => {
         if (state.mounted && image === root.querySelector('[data-appearance-preview-image]')) samplePreviewForeground(image);
@@ -700,14 +742,16 @@ export function mount(context = {}) {
   }
 
   function syncSavebar() {
+    const controls = root.querySelector('.appearance-groups');
+    if (controls) { controls.inert = state.saving; controls.setAttribute('aria-busy', String(state.saving)); }
     const bar = root.querySelector('[data-dwrt-savebar]');
     if (!bar) return;
-    bar.classList.toggle('is-hidden', !dirty());
+    bar.classList.toggle('is-hidden', !dirty() && !state.hexInvalid);
     const message = bar.querySelector(':scope > span');
-    if (message) message.textContent = state.feedback || '外观配置已修改，请保存生效';
-    bar.querySelectorAll('button').forEach((button) => { button.disabled = state.saving; });
+    if (message) message.textContent = state.feedback || (dirty() ? '有未保存的更改' : '调整后保存并应用');
+    bar.querySelector('[data-dwrt-savebar-discard]').disabled = state.saving || (!dirty() && !state.hexInvalid);
     const save = bar.querySelector('[data-dwrt-savebar-save]');
-    if (save) save.textContent = state.saving ? '保存中...' : '保存并应用';
+    if (save) { save.disabled = state.saving || !dirty() || state.hexInvalid; save.textContent = state.saving ? '保存中...' : '保存并应用外观'; }
   }
 
   function syncFeedback() {
@@ -729,10 +773,34 @@ export function mount(context = {}) {
 
   function syncAccentControls() {
     root.querySelectorAll('[data-appearance-accent]').forEach((button) => {
-      const active = button.dataset.appearanceAccent === state.draft.accent_color;
+      const active = accentHex(button.dataset.appearanceAccent) === accentHex(state.draft.accent_color);
       button.classList.toggle('is-active', active);
       button.setAttribute('aria-checked', active ? 'true' : 'false');
     });
+  }
+
+  function syncColorFields() {
+    const hex = accentHex(state.draft.accent_color);
+    root.querySelector('[data-appearance-color]').value = hex;
+    const input = root.querySelector('[data-appearance-hex]');
+    input.setAttribute('aria-invalid', String(state.hexInvalid));
+    if (document.activeElement !== input) input.value = hex.slice(1);
+    root.querySelector('[data-appearance-color-caption]').textContent = `${ACCENT_PRESETS.find(([, , color]) => color === hex)?.[1] || '自定义色'} · ${hex}`;
+  }
+
+  function syncPreviewSwatches() {
+    const target = root.querySelector('[data-appearance-bg-swatches]');
+    if (!target) return;
+    target.innerHTML = state.media.slice(0, 8).map((entry) => `<button type="button" class="appearance-bg-swatch" data-appearance-preview-wallpaper="${escapeHtml(entry.url)}" aria-label="预览壁纸：${escapeHtml(entry.label)}" aria-pressed="${entry.url === (state.previewImage || activeWallpaperUrl())}"><img src="${escapeHtml(entry.url)}" alt="" loading="lazy"></button>`).join('');
+    const button = root.querySelector('[data-appearance-action="preview-media"]');
+    if (button) button.textContent = !state.mediaRequested ? '浏览壁纸' : state.mediaSnapshot?.status === 'loading' ? '读取中…' : state.media.length ? '当前壁纸' : '暂无壁纸';
+  }
+
+  function syncLinkedWallpaper() {
+    if (!state.wallpaperLinked) return;
+    WALLPAPER_PAIRS.forEach((key) => markTouched(`wallpaper.login_${key}`, state.draft.wallpaper[key]));
+    syncMediaSelects();
+    syncWallpaperDependencies();
   }
 
   function syncMediaSelects() {
@@ -760,8 +828,17 @@ export function mount(context = {}) {
   function syncWallpaperDependencies() {
     root.querySelectorAll('[data-appearance-wallpaper-source]').forEach((source) => {
       const prefix = source.dataset.appearanceWallpaperSource;
+      if (prefix === 'login') source.querySelector('.appearance-field-stack').hidden = state.wallpaperLinked;
       const modePath = prefix === 'login' ? 'wallpaper.login_mode' : 'wallpaper.mode';
       const mode = valueAt(state.draft, modePath);
+      source.querySelectorAll('[data-dwrt-component="segmented"]').forEach((group) => {
+        const value = valueAt(state.draft, group.dataset.appearanceField);
+        group.dataset.dwrtValue = value;
+        group.querySelectorAll('[data-dwrt-segment]').forEach((button) => {
+          const active = button.dataset.value === value;
+          button.classList.toggle('is-active', active); button.setAttribute('aria-checked', String(active)); button.tabIndex = active ? 0 : -1;
+        });
+      });
       source.querySelectorAll('[data-appearance-wallpaper-dependent]').forEach((field) => {
         field.hidden = field.dataset.appearanceWallpaperDependent !== mode;
       });
@@ -769,10 +846,34 @@ export function mount(context = {}) {
   }
 
   function onClick(event) {
+    if (state.saving) return;
+    const swatch = event.target.closest('[data-appearance-preview-wallpaper]');
+    if (swatch) {
+      state.previewImage = swatch.dataset.appearancePreviewWallpaper;
+      syncPreview(); syncPreviewSwatches(); return;
+    }
+    if (event.target.closest('[data-appearance-action="preview-media"]')) {
+      state.previewImage = '';
+      loadMedia().then(syncPreviewSwatches);
+      syncPreview(); syncPreviewSwatches(); return;
+    }
+    const toggle = event.target.closest('[data-appearance-sample-toggle]');
+    if (toggle) { toggle.setAttribute('aria-checked', toggle.getAttribute('aria-checked') === 'true' ? 'false' : 'true'); return; }
+    const sample = event.target.closest('[data-appearance-sample-action]');
+    if (sample) {
+      if (state.draft.dashboard.animation_level !== 'off' && !matchMedia('(prefers-reduced-motion: reduce)').matches) sample.animate([{ transform: 'scale(1)' }, { transform: 'scale(.94)' }, { transform: 'scale(1)' }], { duration: state.draft.dashboard.animation_level === 'rich' ? 360 : 180 });
+      return;
+    }
+
     const accent = event.target.closest('[data-appearance-accent]');
     if (accent && !accent.disabled) {
       markTouched('accent_color', accent.dataset.appearanceAccent);
+      state.hexInvalid = false;
+      state.hexDraft = null;
+      root.querySelector('[data-appearance-color-error]').hidden = true;
+      root.querySelector('[data-appearance-hex]').value = accentHex(state.draft.accent_color).slice(1);
       syncAccentControls();
+      syncColorFields();
       syncPreview();
       syncSavebar();
       return;
@@ -796,6 +897,19 @@ export function mount(context = {}) {
   }
 
   function onInput(event) {
+    if (state.saving) return;
+    if (event.target.matches('[data-appearance-color], [data-appearance-hex]')) {
+      const value = event.target.value.replace(/^#/, '');
+      state.hexInvalid = !/^[0-9a-f]{6}$/i.test(value);
+      state.hexDraft = state.hexInvalid ? value.toUpperCase() : null;
+      event.target.setAttribute('aria-invalid', String(state.hexInvalid));
+      root.querySelector('[data-appearance-color-error]').hidden = !state.hexInvalid;
+      if (!state.hexInvalid) {
+        markTouched('accent_color', '#' + value.toUpperCase());
+        syncAccentControls(); syncColorFields(); syncPreview();
+      }
+      syncSavebar(); return;
+    }
     const slider = event.target.closest('[data-dwrt-component="slider"]');
     if (!slider || !state.draft) return;
     const key = slider.dataset.appearanceMaterialSlider;
@@ -834,27 +948,50 @@ export function mount(context = {}) {
   }
 
   function onChange(event) {
+    if (state.saving) return;
     const field = event.target.dataset.appearanceField;
     if (!field || !state.draft) return;
     const value = event.target.type === 'checkbox' ? event.target.checked : event.target.value;
+    if (field === 'wallpaper-sync') {
+      state.wallpaperLinked = value; syncLinkedWallpaper();
+      root.querySelector('[data-appearance-wallpaper-source="login"] .appearance-field-stack').hidden = value;
+      syncMediaSelects(); syncWallpaperDependencies(); syncPreview(); syncSavebar(); return;
+    }
     if (field.startsWith('wallpaper.login_')) state.previewWallpaperScope = 'login';
     else if (field.startsWith('wallpaper.')) state.previewWallpaperScope = 'wallpaper';
     /* 材质滑块的 change 已由 onInput 按类型写入，这里再按字符串写一次会把数值变成字符串。 */
     if (event.target.closest('[data-appearance-material-slider]')) return;
     markTouched(field, value);
+    if (field.startsWith('wallpaper.') && !field.startsWith('wallpaper.login_')) syncLinkedWallpaper();
     if (field.startsWith('wallpaper.') && field.endsWith('mode')) syncWallpaperDependencies();
     syncPreview();
     syncSavebar();
   }
 
   function onSegmentChange(event) {
+    if (state.saving) return;
     const field = event.target.dataset.appearanceField;
     if (!field || !state.draft) return;
     if (field.startsWith('wallpaper.login_')) state.previewWallpaperScope = 'login';
     else if (field.startsWith('wallpaper.')) state.previewWallpaperScope = 'wallpaper';
+    if (field.startsWith('desktop.')) {
+      const key = field.split('.')[1];
+      state.desktopDraft[key] = event.detail.value;
+      if (state.desktopDraft[key] === state.desktopBaseline[key]) state.desktopTouched.delete(key);
+      else state.desktopTouched.add(key);
+      state.feedback = ''; syncPreview(); syncSavebar(); return;
+    }
     markTouched(field, event.detail.value);
+    if (field.startsWith('wallpaper.') && !field.startsWith('wallpaper.login_')) syncLinkedWallpaper();
     /* material_glass.mode 也以 .mode 结尾，但它没有依赖字段；只有壁纸来源需要联动。 */
     if (field.startsWith('wallpaper.') && field.endsWith('mode')) syncWallpaperDependencies();
+    /* 换主题族要即时置灰/恢复材质模式与折射参数，需要整段重渲。preview 在重渲后补发。 */
+    if (field === 'material_glass.theme_family') {
+      render();
+      emitPreview('preview');
+      syncSavebar();
+      return;
+    }
     if (field.startsWith('material_glass.')) syncMaterialSummary();
     syncPreview();
     syncSavebar();
@@ -862,6 +999,7 @@ export function mount(context = {}) {
 
   function onDisclosureChange(event) {
     const disclosureRoot = event.target.closest('[data-appearance-disclosure]');
+    if (disclosureRoot) state.openGroups.set(disclosureRoot.dataset.appearanceDisclosure, event.detail.open);
     if (disclosureRoot?.dataset.appearanceDisclosure === 'wallpaper' && event.detail.open) loadMedia();
   }
 
@@ -869,6 +1007,12 @@ export function mount(context = {}) {
     if (!state.baseline) return;
     state.draft = clone(state.baseline);
     state.touched.clear();
+    state.desktopDraft = clone(state.desktopBaseline);
+    state.desktopTouched.clear();
+    state.hexInvalid = false;
+    state.hexDraft = null;
+    state.previewImage = '';
+    state.wallpaperLinked = WALLPAPER_PAIRS.every((key) => state.draft.wallpaper[key] === state.draft.wallpaper[`login_${key}`]);
     state.feedback = '';
     window.dispatchEvent(new CustomEvent('dwrt:appearance-preview', { detail: { action: 'rollback' } }));
     render();
@@ -885,64 +1029,68 @@ export function mount(context = {}) {
   }
 
   async function save() {
-    if (!dirty() || state.saving) return;
+    if (!dirty() || state.saving || state.hexInvalid) return;
     state.saving = true;
     state.feedback = '';
-    syncSavebar();
-    let result = null;
-    let saved = false;
-    let lastError = null;
-    for (const url of ['/api/v1/system/settings', '/api/v1/save_system_settings']) {
-      try {
-        result = typeof api.request === 'function'
-          ? await api.request('appearance-save', url, { method: 'POST', body: savePayload() })
-          : await sessionFetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(savePayload()), signal }).then(async (response) => {
-            const payload = await response.json().catch(() => ({}));
-            if (!response.ok || payload?.ok === false) throw new Error(payload?.error?.message || payload?.message || response.statusText);
-            return payload?.data ?? payload;
-          });
-        saved = true;
-        break;
-      } catch (error) {
-        lastError = error;
-      }
-    }
-    if (!saved) {
-      state.saving = false;
-      state.feedback = lastError?.message || '保存失败';
-      state.feedbackTone = 'error';
-      syncFeedback();
-      syncSavebar();
-      return;
-    }
     const localCommitted = clone(state.draft);
     const committedPaths = Array.from(state.touched);
-    let verified = false;
-    try {
-      registry?.invalidate?.('appearance.settings', { abort: false });
-      const snapshot = await registry?.request?.('appearance.settings', { force: true, signal });
-      if (snapshot?.value) {
-        state.settingsSnapshot = snapshot;
+    const desktopCommitted = clone(state.desktopDraft);
+    const desktopPaths = Array.from(state.desktopTouched);
+    const payload = savePayload();
+    syncSavebar();
+    const errors = [];
+    let deviceVerified = false;
+    if (committedPaths.length) {
+      try {
+        let result;
+        for (const url of ['/api/v1/system/settings', '/api/v1/save_system_settings']) {
+          try {
+            result = typeof api.request === 'function'
+              ? await api.request('appearance-save', url, { method: 'POST', body: payload })
+              : await sessionFetch(url, { method: 'POST', credentials: 'same-origin', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(payload), signal }).then(async (response) => {
+                const data = await response.json().catch(() => ({}));
+                if (!response.ok || data?.ok === false) { const error = new Error(data?.error?.message || data?.message || response.statusText); error.status = response.status; throw error; }
+                return data?.data ?? data;
+              });
+            break;
+          } catch (error) {
+            if (url.endsWith('save_system_settings') || ![404, 405].includes(Number(error.status))) throw error;
+          }
+        }
+        registry?.invalidate?.('appearance.settings', { abort: false });
+        const snapshot = await registry?.request?.('appearance.settings', { force: true, signal });
+        if (!snapshot?.value) throw new Error('保存后的配置暂时无法回读，请重试。');
         const readback = normalizeAppearanceSettings(snapshot.value);
-        verified = readbackMatches(readback, localCommitted, committedPaths);
-        state.baseline = verified ? readback : localCommitted;
-        state.draft = clone(state.baseline);
-      }
-    } catch (_) {}
-    if (!verified) {
-      const current = state.settingsSnapshot?.value || {};
-      registry?.patch?.('appearance.settings', mergeDeep(current, { dreamingwrt: localCommitted }));
-      state.baseline = localCommitted;
-      state.draft = clone(localCommitted);
+        if (!readbackMatches(readback, localCommitted, committedPaths)) throw new Error('回读配置与提交值不一致，已保留未确认的更改。');
+        state.settingsSnapshot = snapshot;
+        state.baseline = readback;
+        committedPaths.forEach((path) => {
+          if (JSON.stringify(valueAt(state.draft, path)) === JSON.stringify(valueAt(localCommitted, path))) state.touched.delete(path);
+        });
+        deviceVerified = true;
+        if (committedPaths.includes('material_glass.theme_family')) localStorage.setItem('dreamingwrt.web.themeFamily', readback.material_glass.theme_family);
+        emitPreview('commit');
+      } catch (error) { errors.push(error.message || '外观保存失败'); }
     }
-    state.touched.clear();
+    if (desktopPaths.length) {
+      try {
+        const existing = JSON.parse(localStorage.getItem(DESKTOP_STORAGE_KEY) || '{}');
+        desktopPaths.forEach((key) => { existing[key] = desktopCommitted[key]; });
+        localStorage.setItem(DESKTOP_STORAGE_KEY, JSON.stringify(existing));
+        const readback = desktopPreferences();
+        if (!desktopPaths.every((key) => readback[key] === desktopCommitted[key])) throw new Error('桌面偏好未能保存');
+        state.desktopBaseline = readback;
+        desktopPaths.forEach((key) => { if (state.desktopDraft[key] === desktopCommitted[key]) state.desktopTouched.delete(key); });
+      } catch (error) { errors.push(error.message || '当前浏览器无法保存桌面偏好'); }
+    }
     state.saving = false;
-    state.feedback = verified ? '已保存并完成回读' : '已保存，运行态未确认';
-    state.feedbackTone = verified ? 'success' : 'warning';
-    emitPreview('commit');
-    render();
+    state.feedback = errors.length ? errors.join('；') : deviceVerified ? '外观已保存，回读一致。' : '桌面偏好已保存。';
+    state.feedbackTone = errors.length ? 'error' : 'success';
+    syncFeedback(); syncSavebar();
   }
 
+  function beforeUnload(event) { if (dirty() || state.hexInvalid) { event.preventDefault(); event.returnValue = ''; } }
+  window.addEventListener('beforeunload', beforeUnload);
   root.addEventListener('click', onClick);
   root.addEventListener('input', onInput);
   root.addEventListener('change', onChange);
@@ -967,6 +1115,7 @@ export function mount(context = {}) {
       state.mediaSnapshot = snapshot;
       if (snapshot.value) state.media = normalizeMedia(snapshot.value);
       syncMediaSelects();
+      syncPreviewSwatches();
       syncPreview();
     }, { abortWhenUnused: true }));
   }
@@ -985,6 +1134,7 @@ export function mount(context = {}) {
       const previewImage = root.querySelector('[data-appearance-preview-image]');
       if (previewImage) previewImage.onload = null;
       unsubscribers.filter(Boolean).forEach((unsubscribe) => unsubscribe());
+      window.removeEventListener('beforeunload', beforeUnload);
       root.removeEventListener('click', onClick);
       root.removeEventListener('input', onInput);
       root.removeEventListener('change', onChange);

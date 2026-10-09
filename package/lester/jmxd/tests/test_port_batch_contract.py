@@ -3,7 +3,11 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEBD = (ROOT / "src/webd/jmx_app_api.c").read_text(encoding="utf-8")
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text, webd_function_text, webd_module_path
+WEBD = webd_dispatch_text()
+API_HEADER = webd_module_path("jmx_app_api.c").with_suffix(".h").read_text(encoding="utf-8")
 
 
 def section(start: str, end: str) -> str:
@@ -13,10 +17,7 @@ def section(start: str, end: str) -> str:
 
 
 def test_port_batch_reuses_single_port_executor() -> None:
-    batch = section(
-        "static struct json_object *webd_topology_port_batch_response(",
-        "static struct json_object *webd_topology_port_transaction_validate_response(",
-    )
+    batch = webd_function_text("api_ports.c", "webd_topology_port_batch_response")
 
     assert 'webd_topology_port_plan_response(req, request, 0' in batch
     assert 'webd_topology_port_plan_response(req, request, 1' in batch
@@ -28,7 +29,7 @@ def test_port_batch_reuses_single_port_executor() -> None:
     assert '"stop_on_error"' in batch
     assert '"partially_applied"' in batch
     assert '"stopped_after_error"' in batch
-    assert "WEBD_PORT_BATCH_MAX 64" in WEBD
+    assert "#define WEBD_PORT_BATCH_MAX 64" in API_HEADER
 
 
 def test_port_batch_routes_precede_generic_ports_route() -> None:

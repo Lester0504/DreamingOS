@@ -185,7 +185,7 @@ int main(void)
 def json_c_flags() -> list[str]:
     # 31.6 ships no json-c .pc file; the shared resolver falls back to the
     # staging_dir prefix instead of raising CalledProcessError.
-    return apd_test_deps.package_flags("json-c")
+    return apd_test_deps.package_flags("json-c", "openssl") + ["-lm"]
 
 
 def main() -> None:
@@ -198,7 +198,8 @@ def main() -> None:
             [
                 os.environ.get("CC", "cc"), "-std=c11", "-Wall", "-Wextra",
                 "-Werror", "-I", str(ROOT / "src/webd"), str(source),
-                str(ROOT / "src/webd/webd_wifi_aggregate.c"), *flags,
+                str(ROOT / "src/webd/webd_wifi_aggregate.c"),
+                str(ROOT / "src/wifi/wifi_channel_ai.c"), *flags,
                 "-o", str(executable),
             ],
             check=True,

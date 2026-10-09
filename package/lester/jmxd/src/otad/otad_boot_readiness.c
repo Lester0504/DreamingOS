@@ -120,24 +120,45 @@ int otad_boot_readiness_requires_rollback(
     return 0;
 }
 
+#define OTAD_REQUIRED_DATABASE_ROW(name, path, anchor) { name, anchor },
+struct otad_required_database {
+    const char *name;
+    const char *anchor;
+};
+
+static const struct otad_required_database g_otad_required_databases[] = {
+    OTAD_REQUIRED_DATABASES(OTAD_REQUIRED_DATABASE_ROW)
+};
+#undef OTAD_REQUIRED_DATABASE_ROW
+
+static const struct otad_required_database *required_database(
+    const char *database, unsigned int *index)
+{
+    size_t i;
+
+    for (i = 0; i < ARRAY_SIZE(g_otad_required_databases); i++) {
+        if (!strcmp(database, g_otad_required_databases[i].name)) {
+            if (index)
+                *index = (unsigned int)i;
+            return &g_otad_required_databases[i];
+        }
+    }
+    return NULL;
+}
+
 static const char *required_anchor(const char *database)
 {
-    if (!strcmp(database, "config")) return "web_users";
-    if (!strcmp(database, "apid")) return "web_sessions";
-    if (!strcmp(database, "core")) return "clients";
-    if (!strcmp(database, "logd")) return "log_events";
-    if (!strcmp(database, "notifyd")) return "notify_outbox";
-    return NULL;
+    const struct otad_required_database *entry =
+        required_database(database, NULL);
+
+    return entry ? entry->anchor : NULL;
 }
 
 static unsigned int required_database_bit(const char *database)
 {
-    if (!strcmp(database, "config")) return 1U << 0;
-    if (!strcmp(database, "apid")) return 1U << 1;
-    if (!strcmp(database, "core")) return 1U << 2;
-    if (!strcmp(database, "logd")) return 1U << 3;
-    if (!strcmp(database, "notifyd")) return 1U << 4;
-    return 0;
+    unsigned int index;
+
+    return required_database(database, &index) ? 1U << index : 0;
 }
 
 static int validate_required_databases(struct json_object *storage,
@@ -218,7 +239,7 @@ static int validate_required_databases(struct json_object *storage,
                                   "required_table_missing", subject);
         }
     }
-    if (required_seen != ((1U << 5) - 1))
+    if (required_seen != OTAD_REQUIRED_DATABASE_MASK)
         return readiness_fail(result, "storage_schema",
                               "required_database_set_incomplete", "storage");
     return 0;

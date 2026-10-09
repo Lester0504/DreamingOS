@@ -18,6 +18,7 @@ enum webd_session_idle_result {
     WEBD_SESSION_IDLE_TOKEN_INVALID = 1,
     WEBD_SESSION_IDLE_TIMEOUT = 2,
     WEBD_SESSION_IDLE_USER_NOT_FOUND = 3,
+    WEBD_SESSION_IDLE_REUSED = 4,
     WEBD_SESSION_IDLE_INVALID_ARGUMENT = -1,
     WEBD_SESSION_IDLE_DB_ERROR = -2,
 };
@@ -62,6 +63,20 @@ int webd_session_idle_refresh_issue(sqlite3 *config_db, sqlite3 *app_db,
                                     const char *new_access_token,
                                     int64_t access_expires_at, int64_t now,
                                     struct webd_session_idle_info *info);
+
+/* Rotating variant: consumes the presented refresh token and inserts a new
+ * refresh/access pair while preserving the family's absolute expiry. */
+int webd_session_idle_refresh_rotate(sqlite3 *config_db, sqlite3 *app_db,
+                                     const char *refresh_token,
+                                     const char *new_access_token,
+                                     const char *new_refresh_token,
+                                     int64_t access_expires_at, int64_t now,
+                                     struct webd_session_idle_info *info,
+                                     int64_t *refresh_expires_at);
+
+/* Bounded, idempotent cleanup of expired/revoked historical session rows. */
+int webd_session_idle_gc(sqlite3 *app_db, int64_t now, int64_t retention_s,
+                         int limit, int *deleted_out);
 
 const char *webd_session_idle_error(int result);
 

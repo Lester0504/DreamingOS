@@ -137,11 +137,32 @@ def client_context(directory: Path, mtls: bool = False,
 
 
 def connect(directory: Path, port: int, mtls: bool = False,
-            alpn: str = ALPN) -> ssl.SSLSocket:
-    raw = socket.create_connection(("127.0.0.1", port), timeout=5)
-    return client_context(directory, mtls=mtls, alpn=alpn).wrap_socket(
-        raw, server_hostname="127.0.0.1"
-    )
+            alpn: str = ALPN, retry_rate_limit: bool = True) -> ssl.SSLSocket:
+    # ac_transport.c accepts at AC_TRANSPORT_ACCEPT_PER_SECOND (8/s) with
+    # AC_TRANSPORT_ACCEPT_BURST (16) tokens, and a throttled connection is
+    # closed at the raw fd before the TLS handshake starts.  The client sees
+    # that as SSLEOFError, which is indistinguishable from a handshake
+    # regression.  This live contract opens 17+ connections, so on a fast host
+    # it exhausts the burst and the 17th connection fails; on a slower host the
+    # refill keeps up and it passes.  That is the whole story behind this test
+    # being intermittently red on macOS and green on 31.6.
+    #
+    # Wait for one refilled token and retry instead of sleeping at call sites.
+    # A genuine handshake regression still fails, because the retry only buys
+    # a token — it does not relax any TLS requirement.
+    attempts = 3 if retry_rate_limit else 1
+    for attempt in range(attempts):
+        raw = socket.create_connection(("127.0.0.1", port), timeout=5)
+        try:
+            return client_context(directory, mtls=mtls, alpn=alpn).wrap_socket(
+                raw, server_hostname="127.0.0.1"
+            )
+        except ssl.SSLEOFError:
+            raw.close()
+            if attempt == attempts - 1:
+                raise
+            time.sleep(1.0 / 8.0 + 0.05)  # one accept token, plus slack
+    raise AssertionError("unreachable")
 
 
 def enrollment_challenge(directory: Path, port: int) -> None:
@@ -747,6 +768,7 @@ def config_job_v3_session(directory: Path, port: int,
     capabilities = {
         "config_executor": True, "validate": True, "stage": True,
         "apply": True, "readback": True, "rollback": True,
+        "secret_executor": True,
     }
     with connect(directory, port, mtls=True, alpn=ALPN_V3) as connection:
         assert connection.selected_alpn_protocol() == ALPN_V3
@@ -953,7 +975,10 @@ def oversized_telemetry_rejected(directory: Path, port: int,
 
 def tls_gates(directory: Path, port: int) -> None:
     try:
-        with connect(directory, port, alpn="http/1.1"):
+        # retry_rate_limit=False: this connection is *meant* to fail, so
+        # burning accept tokens on retries would only starve the valid
+        # connection at the end of this function.
+        with connect(directory, port, alpn="http/1.1", retry_rate_limit=False):
             raise AssertionError("wrong ALPN accepted")
     except (ssl.SSLError, ConnectionError, OSError):
         pass

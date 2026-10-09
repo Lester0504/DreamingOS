@@ -1,0 +1,293 @@
+/* The desktop window owns the material; this document supplies geometry only.
+ * Every color/opacity here resolves to a shared --dwrt-* or --color-* token so
+ * the app follows light/dark x frosted/liquid/traditional without local blur. */
+:root {
+  --vm-ink: var(--dwrt-ink);
+  --vm-text: var(--dwrt-text);
+  --vm-muted: var(--dwrt-muted);
+  --vm-border: var(--color-border-subtle);
+  --vm-hover: var(--dwrt-interactive-hover-bg);
+  --vm-accent: var(--color-accent);
+  --vm-selected: color-mix(in srgb, var(--color-accent) 18%, transparent);
+  /* Content surfaces resolve to the shared raised-glass token (mirrors
+   * resource-manager --rm-surface/--rm-shadow) so cards/panels keep a readable
+   * per-family backing instead of a weak literal veil under frosted/traditional. */
+  --vm-surface: var(--dwrt-glass-surface-raised);
+  --vm-shadow: var(--dwrt-glass-shadow);
+  --vm-radius: var(--app-radius-compact, 8px);
+  --vm-rail-width: var(--dwrt-rail-width, 240px);
+}
+
+html,
+body {
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  overflow: hidden;
+  background: transparent;
+}
+
+html:not([data-desktop-app="true"]) body {
+  background: var(--color-surface-solid);
+}
+
+body {
+  color: var(--vm-ink);
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  font-size: 13px;
+  line-height: 1.45;
+  -webkit-font-smoothing: antialiased;
+}
+
+body *,
+body *::before,
+body *::after { box-sizing: border-box; }
+
+body [hidden] { display: none !important; }
+
+:where(.vm-shell, .vm-sheet, .vm-menu) :where(button, input, select, textarea) {
+  font: inherit;
+  letter-spacing: 0;
+}
+
+:where(.vm-shell, .vm-sheet, .vm-menu) :where(button, a, input, select, textarea, [tabindex]):focus-visible {
+  outline: 2px solid var(--dwrt-interactive-focus-ring);
+  outline-offset: -2px;
+}
+
+:where(.vm-shell, .vm-sheet, .vm-menu) svg {
+  width: 16px;
+  height: 16px;
+  flex-shrink: 0;
+  vertical-align: middle;
+}
+
+/* ---- shell grid: persistent left rail + main -------------------------- */
+.vm-shell {
+  display: grid;
+  grid-template-columns: var(--vm-rail-width) 1fr;
+  width: 100%;
+  height: 100%;
+  min-height: 0;
+}
+
+/* The sidebar IS the shared desktop rail (dwrt-rail.css): brand logo, a scrolling
+   .dwrt-rail-list of .dwrt-rail-item nav buttons, and a .dwrt-rail-foot service badge.
+   No local rail skin here — its material, the neutral "glass block" selected state, and
+   the per-family/adaptive ink all come from the standard. This app adds only the
+   narrow-window drawer close button (hidden on desktop; positioned in the @media block). */
+.vm-rail-close { display: none; }
+/* ---- main column: topbar + scrolling content ------------------------ */
+.vm-main {
+  display: flex;
+  flex-direction: column;
+  min-width: 0;
+  min-height: 0;
+}
+
+.vm-topbar {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border-bottom: 1px solid var(--vm-border);
+}
+.vm-page-title {
+  margin: 0;
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--vm-ink);
+  outline: none;
+}
+.vm-topbar-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-left: auto;
+}
+
+.vm-sidebar-toggle { display: none; }
+
+.vm-notice {
+  margin: 10px 14px 0;
+  padding: 8px 12px;
+  border-radius: var(--vm-radius);
+  border: 1px solid var(--vm-border);
+  background: var(--vm-hover);
+  color: var(--vm-text);
+  font-size: 12px;
+}
+.vm-notice[data-tone="err"] {
+  border-color: color-mix(in srgb, var(--color-danger, #c0392b) 45%, var(--vm-border));
+  color: var(--color-danger, #c0392b);
+}
+
+.vm-content {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow: auto;
+  padding: 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+}
+
+/* ---- stat cards / overview grid -------------------------------------- */
+.vm-stat-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 12px;
+}
+.vm-card {
+  border: 1px solid var(--vm-border);
+  border-radius: var(--vm-radius);
+  padding: 12px 14px;
+  background: var(--vm-surface);
+  box-shadow: var(--vm-shadow);
+}
+.vm-card h3 { margin: 0 0 6px; font-size: 12px; font-weight: 600; color: var(--vm-muted); }
+.vm-card .vm-metric { font-size: 22px; font-weight: 600; color: var(--vm-ink); }
+.vm-card .vm-sub { font-size: 12px; color: var(--vm-muted); }
+.vm-meter { height: 6px; border-radius: 3px; background: var(--vm-hover); overflow: hidden; margin-top: 8px; }
+.vm-meter > span { display: block; height: 100%; background: var(--vm-accent); }
+/* ---- list toolbar + table ------------------------------------------- */
+.vm-toolbar {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.vm-toolbar .vm-search {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex: 1 1 200px;
+  min-width: 160px;
+  padding: 4px 10px;
+  border: 1px solid var(--vm-border);
+  border-radius: var(--vm-radius);
+}
+.vm-toolbar .vm-search input { flex: 1; border: 0; background: transparent; color: inherit; outline: none; }
+.vm-toolbar .vm-spacer { flex: 1 1 auto; }
+
+.vm-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+.vm-table thead th {
+  position: sticky;
+  top: 0;
+  z-index: 1;
+  text-align: left;
+  font-weight: 600;
+  color: var(--vm-muted);
+  padding: 8px 10px;
+  background: var(--dwrt-glass-surface-raised);
+  backdrop-filter: var(--dwrt-glass-backdrop);
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop);
+  border-bottom: 1px solid var(--vm-border);
+}
+.vm-table tbody td { padding: 8px 10px; border-bottom: 1px solid var(--vm-border); }
+.vm-table tbody tr { cursor: pointer; }
+.vm-table tbody tr:hover { background: var(--vm-hover); }
+.vm-table tbody tr.is-selected { background: var(--vm-selected); }
+.vm-table .vm-num { text-align: right; font-variant-numeric: tabular-nums; }
+
+/* ---- status pill (never color-only: carries a text label) ------------ */
+.vm-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  border: 1px solid var(--vm-border);
+  color: var(--vm-text);
+}
+.vm-pill::before { content: ""; width: 7px; height: 7px; border-radius: 50%; background: var(--vm-muted); }
+.vm-pill[data-state="running"]::before { background: var(--color-success, #2e9e5b); }
+.vm-pill[data-state="paused"]::before { background: var(--color-warning, #d08a1a); }
+.vm-pill[data-state="shutoff"]::before,
+.vm-pill[data-state="stopped"]::before { background: var(--vm-muted); }
+.vm-pill[data-state="crashed"]::before,
+.vm-pill[data-state="unknown"]::before { background: var(--color-danger, #c0392b); }
+
+/* ---- centered state block (empty / not-installed / error) ------------ */
+.vm-state {
+  margin: auto;
+  max-width: 420px;
+  text-align: center;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  padding: 32px 28px;
+  color: var(--vm-text);
+  /* Give the centered state its own raised-glass backing (mirrors
+   * resource-manager .rm-empty) so the not-installed / empty / error copy —
+   * the only content shown while the daemon is firmware-gated — stays readable
+   * over any wallpaper instead of floating on the bare window veil. */
+  background: var(--vm-surface);
+  border: 1px dashed var(--vm-border);
+  border-radius: var(--vm-radius);
+}
+.vm-state svg { width: 40px; height: 40px; color: var(--vm-muted); }
+.vm-state h2 { margin: 0; font-size: 16px; color: var(--vm-ink); }
+.vm-state p { margin: 0; font-size: 13px; color: var(--vm-muted); }
+.vm-state .vm-state-actions { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; justify-content: center; }
+.vm-dep-list { display: flex; gap: 6px; flex-wrap: wrap; justify-content: center; }
+
+.vm-detail-tabs { display: flex; gap: 4px; border-bottom: 1px solid var(--vm-border); }
+.vm-detail-tabs button { border: 0; background: transparent; color: var(--vm-muted); padding: 8px 12px; cursor: pointer; border-bottom: 2px solid transparent; }
+.vm-detail-tabs button.is-active { color: var(--vm-ink); border-bottom-color: var(--vm-accent); font-weight: 600; }
+.vm-kv { display: grid; grid-template-columns: minmax(120px, max-content) 1fr; gap: 6px 16px; font-size: 13px; }
+.vm-kv dt { color: var(--vm-muted); }
+.vm-kv dd { margin: 0; color: var(--vm-text); }
+/* ---- create/import wizard sheet (Kit Sheet body geometry only) ------- */
+.vm-sheet .dwrt-kit-sheet-body { padding: 16px var(--dwrt-kit-sheet-padding-x, 20px); }
+.vm-wizard-form > [data-wiz="references"] { margin-bottom: 12px; }
+.vm-wizard { display: flex; flex-direction: column; gap: 14px; min-width: 0; }
+.vm-wizard-steps { display: flex; gap: 6px; flex-wrap: wrap; font-size: 12px; color: var(--vm-muted); }
+.vm-wizard-steps .is-active { color: var(--vm-ink); font-weight: 600; }
+.vm-wizard-steps .is-done { color: var(--vm-accent); }
+.vm-field { display: flex; flex-direction: column; gap: 4px; margin-bottom: 10px; }
+.vm-field > label { font-size: 12px; color: var(--vm-muted); }
+.vm-field-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr)); gap: 10px; }
+.vm-field-error { font-size: 12px; color: var(--color-danger, #c0392b); }
+.vm-warn { font-size: 12px; color: var(--color-warning, #d08a1a); }
+
+.vm-progress { height: 8px; border-radius: 4px; background: var(--vm-hover); overflow: hidden; }
+.vm-progress > span { display: block; height: 100%; background: var(--vm-accent); transition: width .3s ease; }
+
+/* ---- responsive: collapse the rail on narrow windows ----------------- */
+@media (max-width: 720px) {
+  .vm-shell { grid-template-columns: 1fr; }
+  .vm-sidebar {
+    position: absolute;
+    inset: 0 auto 0 0;
+    z-index: 20;
+    width: min(84vw, var(--vm-rail-width));
+    background: var(--color-surface-solid);
+    transform: translateX(-100%);
+    transition: transform .2s ease;
+  }
+  .vm-shell[data-rail="open"] .vm-sidebar { transform: none; }
+  .vm-rail-close {
+    display: inline-flex;
+    position: absolute;
+    top: 14px;
+    right: 12px;
+    z-index: 1;
+  }
+  .vm-sidebar-toggle { display: inline-flex; }
+  .vm-rail-backdrop {
+    position: absolute;
+    inset: 0;
+    z-index: 19;
+    border: 0;
+    background: color-mix(in srgb, #000 32%, transparent);
+  }
+}
+
+/* ---- disabled/gated action affordance -------------------------------- */
+.vm-shell [data-cap-off="true"] { opacity: .5; }
+.vm-cap-reason { font-size: 11px; color: var(--vm-muted); }
+.vm-actions { display: flex; gap: 8px; flex-wrap: wrap; }
+.vm-inline-actions { display: inline-flex; gap: 6px; }

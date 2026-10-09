@@ -25,7 +25,24 @@
 }
 
 * { box-sizing: border-box; }
-html, body { min-height: 100%; }
+html,
+body {
+  width: 100%;
+  height: 100%;
+  min-height: 100%;
+  background: #050710;
+  overscroll-behavior-y: none;
+}
+
+@supports (height: 100svh) {
+  html,
+  body { min-height: 100svh; }
+}
+
+@supports (height: 100dvh) {
+  html,
+  body { min-height: 100dvh; }
+}
 body {
   margin: 0;
   color: var(--text-primary);
@@ -39,6 +56,7 @@ body {
   position: relative;
   isolation: isolate;
   min-height: 100vh;
+  min-height: 100svh;
   min-height: 100dvh;
   display: grid;
   place-items: center;
@@ -290,6 +308,117 @@ h1 {
 }
 
 form { display: grid; gap: 18px; }
+
+/* ── Passkey 验证态 ──────────────────────────────────────────────────────
+ * 默认 hidden（HTML 属性），JS 在满足域名+HTTPS+已注册凭证时加 .has-passkey
+ * 展示 stage 并隐藏表单；取消/失败后加 .is-passkey-fallback，平滑淡回表单。
+ */
+.passkey-stage {
+  position: relative;
+  z-index: 2;
+  display: grid;
+  justify-items: center;
+  gap: 14px;
+  padding: 8px 0 4px;
+  opacity: 1;
+  transform: translateY(0);
+  transition: opacity 320ms cubic-bezier(0.22, 1, 0.36, 1), transform 320ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.passkey-stage[hidden] { display: none; }
+
+/* 只有在 passkey 主视图（has-passkey 且未降级）才隐藏表单。 */
+.login-shell.has-passkey:not(.is-passkey-fallback) #loginForm { display: none; }
+
+/* 降级后：淡出 stage、淡入表单，无闪烁。 */
+.login-shell.is-passkey-fallback .passkey-stage {
+  opacity: 0;
+  transform: translateY(-8px);
+  pointer-events: none;
+  height: 0;
+  padding: 0;
+  overflow: hidden;
+}
+
+.passkey-orb {
+  position: relative;
+  width: 72px;
+  height: 72px;
+  display: grid;
+  place-items: center;
+  border-radius: 50%;
+  background: radial-gradient(circle at 50% 38%, rgba(255,255,255,0.24), rgba(255,255,255,0.06) 70%);
+  box-shadow: inset 0 0 0 1px rgba(255,255,255,0.22), 0 8px 26px rgba(0,0,0,0.22);
+}
+
+.passkey-orb svg {
+  width: 34px;
+  height: 34px;
+  fill: var(--text-primary);
+  filter: drop-shadow(0 0 8px rgba(255,255,255,0.22));
+}
+
+.passkey-orb-spin {
+  position: absolute;
+  inset: -4px;
+  border-radius: 50%;
+  border: 2px solid transparent;
+  border-top-color: var(--text-primary);
+  border-right-color: rgba(255,255,255,0.4);
+  opacity: 0.7;
+  animation: passkeySpin 1.1s linear infinite;
+}
+
+@keyframes passkeySpin {
+  to { transform: rotate(360deg); }
+}
+
+.passkey-status {
+  margin: 0;
+  font-size: 17px;
+  font-weight: 600;
+  color: var(--text-primary);
+  text-align: center;
+}
+
+.passkey-hint {
+  margin: 0;
+  font-size: 13px;
+  color: var(--text-muted);
+  text-align: center;
+}
+
+.passkey-retry,
+.passkey-fallback {
+  border: 0;
+  background: transparent;
+  cursor: pointer;
+  font: inherit;
+  padding: 6px 4px;
+  transition: color 200ms ease, opacity 200ms ease;
+}
+
+.passkey-retry {
+  min-height: 44px;
+  align-self: stretch;
+  border-radius: 14px;
+  background: var(--login-field-bg);
+  border: 1px solid var(--login-field-edge);
+  color: var(--text-primary);
+  font-size: 15px;
+  font-weight: 600;
+}
+
+.passkey-retry:hover { border-color: var(--login-field-edge-focus); }
+
+.passkey-fallback {
+  color: var(--text-secondary);
+  font-size: 14px;
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+
+.passkey-fallback:hover { color: var(--text-primary); }
 
 /*
  * `display: grid` 的子项会忽略 `hidden` 属性（grid item 的 display 被容器重置），

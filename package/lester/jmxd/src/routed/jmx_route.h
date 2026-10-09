@@ -3,6 +3,7 @@
 #define __JMX_ROUTE_H__
 
 #include <stdint.h>
+#include <stddef.h>
 #include <json-c/json.h>
 
 #ifndef __packed
@@ -10,6 +11,7 @@
 #endif
 
 #define JMX_ROUTE_MAX_WAN_IFACES  8
+#define JMX_ROUTE_MAX_RULES       256
 
 enum jmx_carrier_id {
     JMX_CARRIER_ANY = 0,
@@ -27,10 +29,18 @@ enum jmx_carrier_id {
 #define JMX_NL_ACT_ROUTE_DEL       34
 #define JMX_NL_ACT_ROUTE_FLUSH     35
 #define JMX_NL_ACT_ROUTE_CLEAR_HITS 36
+#define JMX_NL_ACT_WAN_WEIGHT       37
+#define JMX_NL_ACT_WAN_REBIND       38
+#define JMX_NL_ACT_WAN_ADAPTIVE_WEIGHT 39
 #define JMX_NL_ACT_CARRIER_FLUSH    40
 #define JMX_NL_ACT_CARRIER_ADD      41
 #define JMX_NL_ACT_APPCAT_FLUSH     42
 #define JMX_NL_ACT_APPCAT_ADD       43
+#define JMX_NL_ACT_ROUTE_ADD_V2     44
+
+#define JMX_ROUTE_ENHANCEMENT_ADAPTIVE_PENALTY 0x00000001U
+#define JMX_ROUTE_ENHANCEMENT_KNOWN \
+    JMX_ROUTE_ENHANCEMENT_ADAPTIVE_PENALTY
 
 /*
  * appid -> category push.  The kernel needs the mapping to keep the per-WAN
@@ -60,7 +70,10 @@ enum jmx_route_sticky_mode {
 	JMX_STICKY_PRIMARY_BACKUP = 6,
 	JMX_STICKY_DOWNLOAD = 7,
 	JMX_STICKY_CONN_CNT = 8,
+	JMX_STICKY_ADAPTIVE_PENALTY = 9,
 };
+
+#define JMX_STICKY_MAX JMX_STICKY_ADAPTIVE_PENALTY
 
 struct jmx_wan_register_wire {
     int32_t  action;
@@ -89,6 +102,8 @@ struct jmx_route_rule_wire {
     uint8_t  sticky_mode;
     uint8_t  wan_count;
     uint8_t  wan_ids[JMX_ROUTE_MAX_WAN_IFACES];
+    /* Zero keeps legacy behaviour and uses the registered WAN weight. */
+    uint32_t wan_weights[JMX_ROUTE_MAX_WAN_IFACES];
     /*
      * Kernel jmx_route handler receives this payload as jmx_route_rule_t, not
      * as a shorter userspace-only struct.  Keep the wire size/layout equal to
@@ -100,12 +115,35 @@ struct jmx_route_rule_wire {
     uint64_t last_hit_jiffies;
 };
 
+_Static_assert(offsetof(struct jmx_route_rule_wire, wan_ids) == 31,
+               "jmx route wire wan_ids offset changed");
+_Static_assert(offsetof(struct jmx_route_rule_wire, wan_weights) == 40,
+               "jmx route wire wan_weights offset changed");
+_Static_assert(offsetof(struct jmx_route_rule_wire, hit_count) == 72,
+               "jmx route wire hit_count offset changed");
+_Static_assert(sizeof(struct jmx_route_rule_wire) == 88,
+               "jmx route wire layout changed");
+
+struct jmx_route_rule_wire_v2 {
+    int32_t action;
+    struct jmx_route_rule_wire rule;
+    uint32_t enhancements;
+} __packed;
+
+_Static_assert(sizeof(struct jmx_route_rule_wire_v2) == 96,
+               "jmx route v2 wire layout changed");
+
 int jmx_route_nl_wan_register(int nl_fd, uint8_t wan_id, const char *name,
                               uint32_t fwmark, uint32_t table_id, uint32_t gateway,
                               uint32_t weight);
 int jmx_route_nl_wan_unregister(int nl_fd, uint8_t wan_id);
 int jmx_route_nl_wan_health(int nl_fd, uint8_t wan_id, uint8_t health);
+int jmx_route_nl_wan_weight(int nl_fd, uint8_t wan_id, uint32_t weight);
+int jmx_route_nl_wan_adaptive_weight(int nl_fd, uint8_t wan_id, uint32_t weight);
+int jmx_route_nl_wan_rebind(int nl_fd, uint8_t wan_id, uint8_t mode);
 int jmx_route_nl_rule_add(int nl_fd, const struct jmx_route_rule_wire *rule);
+int jmx_route_nl_rule_add_v2(int nl_fd, const struct jmx_route_rule_wire *rule,
+                             uint32_t enhancements);
 int jmx_route_nl_rule_del(int nl_fd, uint16_t prio);
 int jmx_route_nl_rule_flush(int nl_fd);
 int jmx_route_nl_rule_clear_hits(int nl_fd, uint16_t prio);
@@ -127,6 +165,7 @@ struct json_object *jmx_api_route_reload(struct json_object *req_obj);
 struct json_object *jmx_api_route_config_get(struct json_object *req_obj);
 struct json_object *jmx_api_route_config_set(struct json_object *req_obj);
 struct json_object *jmx_api_route_policy_set(struct json_object *req_obj);
+struct json_object *jmx_api_route_sla_apply(struct json_object *req_obj);
 int jmx_route_sync_config(void);
 void jmx_route_health_tick(void);
 int jmx_route_counter_tick(void);

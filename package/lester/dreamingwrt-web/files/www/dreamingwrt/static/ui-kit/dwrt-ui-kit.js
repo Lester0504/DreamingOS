@@ -3,6 +3,7 @@
 
   const tabState = new WeakMap();
   const tabMemory = new Map();
+  const sidebarTabsState = new WeakMap();
   const sheetState = new WeakMap();
   const modalState = new WeakMap();
   const expandSearchState = new WeakMap();
@@ -121,6 +122,11 @@
   }
 
   function activeTab(root) {
+    if (root.classList.contains('dwrt-kit-sidebar-tabs')) {
+      const tabs = Array.from(root.querySelectorAll(':scope > .dwrt-kit-tab'))
+        .filter((tab) => !tab.matches(':disabled, [aria-disabled="true"]'));
+      return tabs.find((tab) => tab.matches('.is-active, [aria-selected="true"]')) || tabs[0];
+    }
     return root.querySelector('.dwrt-kit-tab.is-active, .dwrt-kit-tab[aria-selected="true"]') || root.querySelector('.dwrt-kit-tab');
   }
 
@@ -201,8 +207,10 @@
 
   function setActiveTab(root, value, notify = true) {
     const tabs = Array.from(root.querySelectorAll('.dwrt-kit-tab'));
-    const target = tabs.find((tab) => tab.dataset.value === value || tab.dataset.tab === value || tab.getAttribute('aria-controls') === value) || tabs[0];
-    if (!target) return '';
+    const sidebar = root.classList.contains('dwrt-kit-sidebar-tabs');
+    const target = tabs.find((tab) => tab.dataset.value === value || tab.dataset.tab === value || tab.getAttribute('aria-controls') === value)
+      || (sidebar ? activeTab(root) : tabs[0]);
+    if (!target || (sidebar && target.matches(':disabled, [aria-disabled="true"]'))) return '';
     tabs.forEach((tab) => {
       const active = tab === target;
       tab.classList.toggle('is-active', active);
@@ -219,7 +227,82 @@
     return target.dataset.value || target.dataset.tab || '';
   }
 
+  function mountSidebarTabs(root) {
+    const sync = () => {
+      mountLucide(root);
+      const tabs = Array.from(root.querySelectorAll(':scope > .dwrt-kit-tab'));
+      root.dataset.dwrtSidebarTabsIconsOnly = String(tabs.length >= 3);
+      const active = activeTab(root);
+      tabs.forEach((tab) => {
+        tab.classList.toggle('is-active', tab === active);
+        tab.setAttribute('aria-selected', String(tab === active));
+        tab.tabIndex = tab === active ? 0 : -1;
+        mountTooltip(tab);
+      });
+      updateTabs(root, true);
+    };
+    if (sidebarTabsState.has(root)) {
+      sync();
+      return;
+    }
+    root.dataset.dwrtTabsMounted = 'true';
+    const click = (event) => {
+      const tab = event.target.closest('.dwrt-kit-tab');
+      if (tab?.parentElement === root && !tab.matches(':disabled, [aria-disabled="true"]')) {
+        setActiveTab(root, tab.dataset.value);
+      }
+    };
+    const keydown = (event) => {
+      if (!['ArrowLeft', 'ArrowRight', 'Home', 'End'].includes(event.key)) return;
+      const tabs = Array.from(root.querySelectorAll(':scope > .dwrt-kit-tab'))
+        .filter((tab) => !tab.matches(':disabled, [aria-disabled="true"]'));
+      if (!tabs.length || !tabs.includes(event.target)) return;
+      const current = tabs.indexOf(event.target);
+      const direction = (event.key === 'ArrowRight' ? 1 : -1) * (getComputedStyle(root).direction === 'rtl' ? -1 : 1);
+      const index = event.key === 'Home' ? 0 : event.key === 'End' ? tabs.length - 1
+        : (current + direction + tabs.length) % tabs.length;
+      event.preventDefault();
+      tabs[index].focus();
+      setActiveTab(root, tabs[index].dataset.value);
+    };
+    // Only opted-in sidebars observe item/size changes; selection keeps the shared spring.
+    const observer = new MutationObserver((records) => {
+      records.forEach((record) => {
+        record.removedNodes.forEach((node) => {
+          if (node instanceof HTMLElement && node.matches('.dwrt-kit-tab')) unmountTooltip(node);
+        });
+      });
+      sync();
+    });
+    const resize = typeof ResizeObserver === 'function' ? new ResizeObserver(() => updateTabs(root, false)) : null;
+    root.addEventListener('click', click);
+    root.addEventListener('keydown', keydown);
+    sidebarTabsState.set(root, { click, keydown, observer, resize });
+    sync();
+    observer.observe(root, { childList: true, subtree: true, attributes: true, attributeFilter: ['disabled', 'aria-disabled'] });
+    resize?.observe(root);
+  }
+
+  function unmountSidebarTabs(root) {
+    const state = sidebarTabsState.get(root);
+    if (!state) return;
+    state.observer.disconnect();
+    state.resize?.disconnect();
+    root.removeEventListener('click', state.click);
+    root.removeEventListener('keydown', state.keydown);
+    const animation = tabState.get(root);
+    if (animation?.frame) cancelAnimationFrame(animation.frame);
+    if (animation) animation.frame = 0;
+    sidebarTabsState.delete(root);
+    tabState.delete(root);
+    delete root.dataset.dwrtTabsMounted;
+  }
+
   function mountTabs(root) {
+    if (root?.classList.contains('dwrt-kit-sidebar-tabs')) {
+      mountSidebarTabs(root);
+      return;
+    }
     if (!root || root.dataset.dwrtTabsMounted === 'true') return;
     root.dataset.dwrtTabsMounted = 'true';
     root.setAttribute('role', root.getAttribute('role') || 'tablist');
@@ -746,16 +829,60 @@
     const image = sheet?.querySelector?.('[data-dwrt-sheet-wallpaper-image]');
     if (!wallpaper || !image) return;
     const src = wallpaper.currentSrc || wallpaper.getAttribute('src') || '';
-    if (src && image.getAttribute('src') !== src) image.setAttribute('src', src);
+    const sourceChanged = src && image.getAttribute('src') !== src;
+    if (sourceChanged) {
+      sheet.dataset.dwrtWallpaperReady = 'false';
+      image.setAttribute('src', src);
+    }
     const style = getComputedStyle(wallpaper);
     image.style.objectFit = style.objectFit || 'cover';
     image.style.objectPosition = style.objectPosition || '50% 50%';
     image.style.filter = style.filter || 'none';
     image.style.opacity = style.opacity || '1';
     const rect = sheet.getBoundingClientRect();
-    image.style.right = 'auto';
-    image.style.left = `${-rect.left}px`;
+    const isSideSheet = sheet.matches('.dwrt-kit-sheet');
+    image.style.right = isSideSheet ? '0' : 'auto';
+    image.style.left = isSideSheet ? 'auto' : `${-rect.left}px`;
     image.style.top = `${-rect.top}px`;
+
+    if (!sourceChanged && image.complete && image.naturalWidth > 0) {
+      sheet.dataset.dwrtWallpaperReady = 'true';
+    } else if (sourceChanged || !image.complete || !src) {
+      sheet.dataset.dwrtWallpaperReady = 'false';
+    }
+  }
+
+  function settleSheetWallpaperComposite(sheet) {
+    if (!sheet?.isConnected) return;
+    const image = sheet.querySelector?.('[data-dwrt-sheet-wallpaper-image]');
+    if (!image) return;
+    // Force the portal/compositor to observe the final geometry, then realign once more.
+    void sheet.offsetWidth;
+    void image.offsetWidth;
+    requestAnimationFrame(() => {
+      if (!sheet.isConnected) return;
+      syncSheetWallpaper(sheet);
+      requestAnimationFrame(() => {
+        if (!sheet.isConnected) return;
+        syncSheetWallpaper(sheet);
+      });
+    });
+  }
+
+  function bindSheetWallpaperImage(sheet, image) {
+    if (!image || image.dataset.dwrtWallpaperEvents === 'true') return;
+    image.dataset.dwrtWallpaperEvents = 'true';
+    const onLoaded = () => {
+      sheet.dataset.dwrtWallpaperReady = 'true';
+      settleSheetWallpaperComposite(sheet);
+    };
+    image.addEventListener('load', onLoaded, { passive: true });
+    if (typeof image.decode === 'function') {
+      image.decode().then(onLoaded).catch(() => {});
+    }
+    image.addEventListener('error', () => {
+      sheet.dataset.dwrtWallpaperReady = 'false';
+    }, { passive: true });
   }
 
   function syncMountedGlassWallpapers() {
@@ -768,6 +895,8 @@
     if (sheet.dataset.dwrtSheetVariant === 'copilot' || explicitModalCopilot) {
       const materialReady = sheet.querySelector(':scope > .dwrt-kit-sheet-wallpaper') && sheet.querySelector(':scope > .dwrt-kit-sheet-material');
       if (materialReady) {
+        const existingImage = sheet.querySelector(':scope > .dwrt-kit-sheet-wallpaper [data-dwrt-sheet-wallpaper-image]');
+        bindSheetWallpaperImage(sheet, existingImage);
         syncSheetWallpaper(sheet);
         return;
       }
@@ -797,6 +926,9 @@
       sheet.prepend(material);
       sheet.prepend(wallpaper);
     }
+    const image = sheet.querySelector(':scope > .dwrt-kit-sheet-wallpaper [data-dwrt-sheet-wallpaper-image]');
+    sheet.dataset.dwrtWallpaperReady = 'false';
+    bindSheetWallpaperImage(sheet, image);
     syncSheetWallpaper(sheet);
     const appWallpaper = document.getElementById('appWallpaper');
     if (!sheetWallpaperObserver && appWallpaper && typeof MutationObserver !== 'undefined') {
@@ -823,6 +955,7 @@
     };
     // 先搬到 body 层再量宽度：在被重锚定的祖先里量出来的是错的
     elevateSheet(sheet, state);
+    settleSheetWallpaperComposite(sheet);
     const initialWidth = sheet.getBoundingClientRect().width;
     state.width = initialWidth;
     state.x = settleImmediately ? 0 : initialWidth;
@@ -2017,6 +2150,7 @@
 
   function unmount(context) {
     if (!context?.querySelectorAll) return;
+    matchingRoots(context, '.dwrt-kit-sidebar-tabs').forEach(unmountSidebarTabs);
     componentRoots(context, 'segmented').forEach(unmountSegmented);
     componentRoots(context, 'slider').forEach(unmountSlider);
     const sheets = matchingRoots(context, SHEET_SELECTOR);
@@ -2039,7 +2173,10 @@
     if (!layer || modalState.has(layer)) return;
     const dialog = layer.querySelector('.dwrt-kit-modal, [role="dialog"]');
     if (!(dialog instanceof HTMLElement)) return;
-    if (dialog.dataset.dwrtModalVariant === 'copilot') ensureSheetMaterial(dialog);
+    if (dialog.dataset.dwrtModalVariant === 'copilot') {
+      ensureSheetMaterial(dialog);
+      settleSheetWallpaperComposite(dialog);
+    }
     const recentTrigger = lastTrigger && performance.now() - lastTrigger.at < 1600 ? lastTrigger : null;
     const initiallyOpen = !layer.hidden;
     const state = {
@@ -2370,6 +2507,31 @@
       .replace(/>/g, '&gt;')
       .replace(/"/g, '&quot;')
       .replace(/'/g, '&#39;');
+  }
+
+  // icon accepts a Lucide name or trusted application icon markup, like overviewCardsMarkup.
+  // attribute is an optional per-item data-* alias; data-value remains the Kit event contract.
+  function sidebarTabsMarkup(options = {}) {
+    const items = Array.isArray(options.items) ? options.items : [];
+    const selected = items.find((item) => String(item.value) === String(options.value) && !item.disabled)
+      || items.find((item) => !item.disabled);
+    const className = String(options.className || '').replace(/[^A-Za-z0-9 _-]/g, '').trim();
+    const attribute = /^data-(?!dwrt-)[a-z][a-z0-9-]*$/.test(options.attribute || '') && options.attribute !== 'data-value'
+      ? options.attribute : '';
+    return `<nav class="dwrt-kit-tabs dwrt-kit-page-tabs dwrt-kit-sidebar-tabs${className ? ` ${className}` : ''}" data-dwrt-component="tabs" data-dwrt-sidebar-tabs-icons-only="${items.length >= 3}" role="tablist" aria-orientation="horizontal" aria-label="${escapeHtml(options.label || '视图')}">
+      <span class="dwrt-kit-tab-pill" aria-hidden="true"></span>
+      ${items.map((item) => {
+        const value = escapeHtml(item.value);
+        const label = escapeHtml(item.label);
+        const icon = String(item.icon || '').trim();
+        const iconMarkup = icon.startsWith('<') ? icon : `<i data-lucide="${escapeHtml(icon)}" aria-hidden="true"></i>`;
+        const active = item === selected;
+        return `<button class="dwrt-kit-tab${active ? ' is-active' : ''}" type="button" role="tab" data-value="${value}"${attribute ? ` ${attribute}="${value}"` : ''} aria-selected="${active}" tabindex="${active ? 0 : -1}" aria-label="${label}" data-dwrt-tooltip="${label}"${item.disabled ? ' disabled' : ''}>
+          <span class="dwrt-kit-sidebar-tab-icon" aria-hidden="true">${iconMarkup}</span>
+          <span class="dwrt-kit-sidebar-tab-label">${label}</span>
+        </button>`;
+      }).join('')}
+    </nav>`;
   }
 
   function overviewCardsMarkup(items = [], options = {}) {
@@ -2768,6 +2930,7 @@
     mountAll,
     updateTabs,
     setActiveTab,
+    sidebarTabsMarkup,
     openDateRangePicker,
     overviewCardsMarkup,
     floatingSavebarMarkup,

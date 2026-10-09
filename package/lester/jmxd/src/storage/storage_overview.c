@@ -3,9 +3,12 @@
 
 #include "storage_overview.h"
 #include "storage_blockdev.h"
+#include "storage_provider.h"
 
 #include "../jmx.h"
 #include "../jmx_db.h"
+#include "../jmx_strbuf.h"
+#include "../dw_business_event.h"
 
 #include <ctype.h>
 #include <dirent.h>
@@ -131,6 +134,7 @@ struct storage_smart_cache_entry {
     char disk_id[256];
     struct storage_smart smart;
     int64_t cached_ms;
+    char last_known_health[24];
 };
 
 static struct storage_io_cache_entry g_storage_io_cache[STORAGE_MAX_DISKS];
@@ -291,7 +295,11 @@ static void storage_transport(const char *name, char *out, size_t out_len)
     snprintf(path, sizeof(path), STORAGE_SYS_BLOCK "/%s/device/subsystem", name);
     if (realpath(path, resolved)) {
         base = strrchr(resolved, '/');
-        snprintf(out, out_len, "%s", base ? base + 1 : resolved);
+        /* A subsystem link resolves to a short bus name such as "scsi" or "nvme",
+         * but resolved[] is PATH_MAX, so bound the copy explicitly rather than
+         * letting an unexpected target overflow the caller's field. */
+        if (jmx_strbuf_copy(out, out_len, base ? base + 1 : resolved) != 0)
+            snprintf(out, out_len, "unknown");
         return;
     }
     snprintf(out, out_len, "unknown");
@@ -959,6 +967,34 @@ static struct storage_smart_cache_entry *storage_smart_cache_find(const char *di
     return NULL;
 }
 
+static void storage_smart_log_transition(const struct storage_disk *disk,
+                                         struct storage_smart_cache_entry *entry)
+{
+    const char *health = disk->smart.status;
+    int failed = !strcmp(health, "FAILED");
+
+    /* Missing/failed reads do not erase the last trustworthy health sample. */
+    if ((!failed && strcmp(health, "PASSED")) ||
+        !strcmp(entry->last_known_health, health))
+        return;
+    if (failed || entry->last_known_health[0]) {
+        struct json_object *detail = json_object_new_object();
+        json_object_object_add(detail, "object_id", json_object_new_string(disk->id));
+        json_object_object_add(detail, "object_name", json_object_new_string(disk->model));
+        json_object_object_add(detail, "path", json_object_new_string(disk->device));
+        json_object_object_add(detail, "result", json_object_new_string(failed ? "failed" : "success"));
+        json_object_object_add(detail, "smart_status", json_object_new_string(health));
+        json_object_object_add(detail, "previous_smart_status",
+                               json_object_new_string(entry->last_known_health));
+        json_object_object_add(detail, "failure_reason",
+                               json_object_new_string(failed ? "smart_health_check_failed" : ""));
+        dw_business_event("storage-health",
+            failed ? "STORAGE_SMART_FAILED" : "STORAGE_SMART_RECOVERED", detail);
+        json_object_put(detail);
+    }
+    snprintf(entry->last_known_health, sizeof(entry->last_known_health), "%s", health);
+}
+
 static void storage_smart_cache_store(const struct storage_disk *disk, int64_t now_ms)
 {
     struct storage_smart_cache_entry *entry = NULL;
@@ -975,7 +1011,9 @@ static void storage_smart_cache_store(const struct storage_disk *disk, int64_t n
     }
     if (!entry)
         entry = &g_storage_smart_cache[0];
-    memset(entry, 0, sizeof(*entry));
+    if (!entry->used || strcmp(entry->disk_id, disk->id))
+        memset(entry, 0, sizeof(*entry));
+    storage_smart_log_transition(disk, entry);
     entry->used = 1;
     snprintf(entry->disk_id, sizeof(entry->disk_id), "%s", disk->id);
     entry->smart = disk->smart;
@@ -1501,6 +1539,8 @@ struct json_object *jmx_storage_overview_get(const char *range)
     json_object_object_add(caps, "smart", json_object_new_boolean(storage_smartctl_path() != NULL));
     json_object_object_add(caps, "history", json_object_new_boolean(persist_ok));
     json_object_object_add(data, "capabilities", caps);
+    json_object_object_add(data, "storage_provider_status",
+                           jmx_storage_provider_status_json());
     free(disks);
     free(mounts);
     return jmx_gen_api_response_data(API_CODE_SUCCESS, data);

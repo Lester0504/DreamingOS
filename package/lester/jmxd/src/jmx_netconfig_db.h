@@ -62,6 +62,16 @@ typedef struct {
 typedef int (*jmx_client_nickname_cb)(const char *mac, const char *nickname,
                                       void *arg);
 
+typedef struct {
+    char carrier_key[16];
+    char carrier_name[32];
+    char carrier_source[32];
+    char carrier_evidence[96];
+    char carrier_reason[64];
+    char public_ip[48];
+    int confidence;
+} jmx_wan_carrier_contract_t;
+
 /* Legacy jmxd settings now owned by config.db. UCI is a one-time migration source only. */
 int jmx_legacy_settings_get(jmx_legacy_settings_t *settings);
 int jmx_legacy_settings_set_system(const char *lan_ifname, int theme_mode);
@@ -88,15 +98,26 @@ int jmx_work_mode_config_begin_apply(int target_mode, const char *rollback_id,
                                      int disable_dhcp, int disable_nat,
                                      int *previous_mode);
 int jmx_work_mode_config_finish_apply(int success, const char *error);
+/* Device role query. Returns "gateway" (default) or "ap". */
+int jmx_device_role_get(char *role, size_t role_len);
+/* Check if device is in AP mode (no local audit). */
+int jmx_device_role_is_ap(void);
 int jmx_work_mode_config_begin_rollback(const char *rollback_id,
                                         int *target_mode);
 int jmx_work_mode_config_finish_rollback(int success,
                                          const char *rollback_id,
                                          const char *error);
+/* Canonical shared-L2 uplink read model. Returns NULL outside side-router mode. */
+int jmx_netconfig_work_mode_is_side_router(void);
+struct json_object *jmx_netconfig_side_router_uplink(void);
 
 /* WAN CRUD */
 struct json_object *jmx_netconfig_wan_list(void);
 int jmx_netconfig_wan_configured(const char *id, const char *ifname);
+int jmx_netconfig_wan_carrier_resolve(const char *id, const char *ifname,
+                                      const char *runtime_device,
+                                      const char *public_ip,
+                                      jmx_wan_carrier_contract_t *out);
 struct json_object *jmx_netconfig_wan_get(const char *id);
 int  jmx_netconfig_wan_set(struct json_object *wan_json);
 int  jmx_netconfig_wan_set_enabled(const char *id, int enabled);
@@ -179,7 +200,11 @@ struct json_object *jmx_dhcp_service_get(void);
 int  jmx_dhcp_service_set(struct json_object *cfg);
 int  jmx_dhcp_reservation_delete(const char *id);
 int  jmx_dhcp_reservation_delete_resolve(const char *id, char *lan_id, size_t lan_id_len);
+const char *jmx_dhcp_service_set_failure_reason(void);
 int  jmx_dhcp_service_apply(const char *lan_id);
+/* Negative return codes identify the apply stage that failed. */
+const char *jmx_dhcp_service_apply_failure_reason(int rc);
+const char *jmx_dhcp_service_apply_failure_stage(int rc);
 
 /* UPnP IGD / miniupnpd */
 struct json_object *jmx_upnp_service_get(void);
@@ -222,6 +247,8 @@ struct json_object *jmx_flow_control_apply(struct json_object *cfg);
 struct json_object *jmx_flow_control_rule_test(struct json_object *cfg);
 int  jmx_flow_control_smart_set(struct json_object *cfg);
 int  jmx_flow_control_priority_set(struct json_object *cfg);
+int  jmx_flow_control_priority_last_rollback_attempted(void);
+int  jmx_flow_control_priority_last_rollback_ok(void);
 int  jmx_flow_control_group_carrier_set(struct json_object *cfg);
 char *jmx_netconfig_wan_csv(size_t *out_len);
 char *jmx_netconfig_lan_csv(size_t *out_len);
@@ -229,11 +256,11 @@ char *jmx_netconfig_lan_csv(size_t *out_len);
 /* AI history */
 #define JMX_AI_HISTORY_DELETE_OK 0
 #define JMX_AI_HISTORY_DELETE_NOT_FOUND 1
-struct json_object *jmx_ai_history_list(int limit, int offset);
-struct json_object *jmx_ai_history_get(const char *id);
-struct json_object *jmx_ai_history_save(struct json_object *req);
-int  jmx_ai_history_delete(const char *id);
-int  jmx_ai_history_clear(void);
+struct json_object *jmx_ai_history_list(const char *actor, int limit, int offset, const char *q);
+struct json_object *jmx_ai_history_get(const char *actor, const char *id);
+struct json_object *jmx_ai_history_save(const char *actor, struct json_object *req);
+int  jmx_ai_history_delete(const char *actor, const char *id);
+int  jmx_ai_history_clear(const char *actor);
 
 /* VPN config */
 struct json_object *jmx_vpn_config_get(void);
@@ -274,6 +301,11 @@ struct json_object *jmx_bulk_ip_transaction(struct json_object *cfg);
 struct json_object *jmx_bulk_ip_refresh(struct json_object *cfg);
 struct json_object *jmx_bulk_ip_import(struct json_object *cfg);
 struct json_object *jmx_bulk_ip_export(struct json_object *cfg);
+/* IP-table write contract implemented in netconfig/039_nc_ipam_contract.c. */
+struct json_object *jmx_ipam_static_reservation_transaction(struct json_object *req);
+struct json_object *jmx_ipam_import_preview(struct json_object *req);
+struct json_object *jmx_ipam_import_commit(struct json_object *req);
+struct json_object *jmx_ipam_import_job_get(struct json_object *req);
 struct json_object *jmx_network_control_apply(struct json_object *cfg);
 struct json_object *jmx_signature_db_status(struct json_object *cfg);
 struct json_object *jmx_netconfig_wan_status(const char *id);
@@ -309,6 +341,7 @@ int jmx_cellular_service_apply(int dry_run);
 struct json_object *jmx_wifi_config_get(void);
 int jmx_wifi_config_save(struct json_object *cfg);
 struct json_object *jmx_wifi_config_apply(struct json_object *cfg);
+struct json_object *jmx_wifi_ssids_delete(struct json_object *cfg);
 struct json_object *jmx_wifi_status_get(void);
 struct json_object *jmx_wifi_scan(struct json_object *cfg);
 
@@ -327,6 +360,10 @@ struct json_object *jmx_setup_reset_wizard(struct json_object *cfg);
 struct json_object *jmx_setup_support_bundle(struct json_object *cfg);
 struct json_object *jmx_setup_detect_wan_start(struct json_object *cfg);
 struct json_object *jmx_setup_detect_wan_status(struct json_object *cfg);
+struct json_object *jmx_setup_import_config_start(struct json_object *cfg);
+struct json_object *jmx_setup_import_config_status(struct json_object *cfg);
+struct json_object *jmx_setup_import_config_stop(struct json_object *cfg);
+int jmx_setup_import_harvest_worker_main(const char *sid, const char *port, const char *timeout_s);
 struct json_object *jmx_setup_assist_mode(struct json_object *cfg);
 struct json_object *jmx_setup_security_ssh_set(struct json_object *cfg);
 
@@ -349,6 +386,33 @@ struct json_object *jmx_aegis_app_block_delete(struct json_object *cfg);
 int jmx_network_control_rules_bulk_delete(struct json_object *cfg);
 struct json_object *jmx_network_control_status(void);
 struct json_object *jmx_network_control_rule_test(struct json_object *cfg);
+
+/*
+ * MAC allowlist mode (deny-by-default). Enabling stages the change and starts a
+ * confirmation window; jmx_network_control_mac_allowlist_boot_check() restores
+ * the previous state when jmxd restarts while a window is still open.
+ */
+struct json_object *jmx_network_control_mac_allowlist_set(struct json_object *cfg);
+struct json_object *jmx_network_control_mac_allowlist_members_set(struct json_object *cfg);
+struct json_object *jmx_network_control_mac_allowlist_confirm(void);
+struct json_object *jmx_network_control_mac_allowlist_get(void);
+void jmx_network_control_mac_allowlist_boot_check(void);
+
+/*
+ * Rule expiry. The generated ruleset already omits expired rules, but nothing
+ * rebuilt it on a schedule, so a lapsed rule kept blocking until the next write
+ * touched the module. These arm a deadline timer in jmxd's uloop instead:
+ *
+ *   jmx_network_control_expiry_sync()        after any network-control write, so
+ *                                           a new or edited expires is picked up
+ *   jmx_network_control_expiry_boot_check()  once at startup, to clear rules that
+ *                                           lapsed while jmxd was not running
+ *
+ * Both are idempotent and cheap when no rule has an expiry: the timer is only
+ * armed when one does, and it sleeps until that deadline rather than polling.
+ */
+void jmx_network_control_expiry_sync(void);
+void jmx_network_control_expiry_boot_check(void);
 
 /* Client rate limit helpers */
 int nc_client_rate_limit_set(const char *mac, const char *ip,
@@ -385,6 +449,8 @@ int jmx_log_center_channels_set(struct json_object *cfg);
 struct json_object *jmx_log_center_channels_get(void);
 struct json_object *jmx_log_center_delivery_claim(struct json_object *cfg);
 struct json_object *jmx_log_center_delivery_stats(void);
+struct json_object *jmx_system_memory_profile_get(void);
+struct json_object *jmx_system_memory_profile_change(struct json_object *req, int apply);
 struct json_object *jmx_system_settings_get(void);
 int jmx_system_settings_set(struct json_object *cfg);
 int jmx_system_settings_apply(struct json_object *cfg);
@@ -415,6 +481,8 @@ struct json_object *jmx_signature_db_device_vendors(struct json_object *cfg);
 struct json_object *jmx_signature_db_device_types(struct json_object *cfg);
 struct json_object *jmx_signature_db_fingerprint_rules(struct json_object *cfg);
 int jmx_signature_db_fill_app_meta(struct json_object *obj, int app_id);
+int jmx_signature_db_fill_app_meta_with_db(sqlite3 *db, struct json_object *obj,
+                                            int app_id);
 int jmx_signature_db_open(sqlite3 **db);
 void jmx_signature_db_close(sqlite3 *db);
 int jmx_signature_db_resolve_host_app_id_with_db(sqlite3 *db, const char *host,
@@ -423,10 +491,10 @@ int jmx_signature_db_resolve_host_app_id_with_db(sqlite3 *db, const char *host,
 int jmx_signature_db_resolve_host_app_id(const char *host, const char *proto,
                                          int dst_port, int *app_id);
 struct json_object *jmx_signature_db_resolve_app(struct json_object *cfg);
-struct json_object *jmx_ai_conversations_list(void);
-struct json_object *jmx_ai_conversation_get(const char *id);
-int jmx_ai_conversation_save(struct json_object *cfg);
-int jmx_ai_conversation_delete(const char *id);
+struct json_object *jmx_ai_conversations_list(const char *actor);
+struct json_object *jmx_ai_conversation_get(const char *actor, const char *id);
+int jmx_ai_conversation_save(const char *actor, struct json_object *cfg);
+int jmx_ai_conversation_delete(const char *actor, const char *id);
 
 /* AI Config */
 struct json_object *jmx_ai_config_get(void);
@@ -453,8 +521,8 @@ struct json_object *jmx_ai_tool_authorization_resolve(int auth_id, int approve,
                                                       const char *role);
 struct json_object *jmx_ai_chat(struct json_object *req);
 struct json_object *jmx_ai_tool_call(struct json_object *req);
-struct json_object *jmx_ai_tool_authorizations_list(void);
-struct json_object *jmx_ai_tool_authorizations_get(const char *conversation_id);
+struct json_object *jmx_ai_tool_authorizations_list(const char *actor);
+struct json_object *jmx_ai_tool_authorizations_get(const char *actor, const char *conversation_id);
 struct json_object *jmx_bulk_ip_get_v2(void);
 int jmx_crontab_apply_text(const char *text, struct json_object *out);
 int jmx_system_time_sync_browser(int64_t client_ts, struct json_object *out);
@@ -468,13 +536,19 @@ int jmx_admin_rename(struct json_object *req, struct json_object *out);
 int jmx_admin_avatar_set(struct json_object *req, struct json_object *out);
 struct json_object *jmx_system_kernel_restore_defaults(struct json_object *cfg);
 struct json_object *jmx_system_cpu_interrupt_get(void);
+struct json_object *jmx_system_net_tuning_get(void);
+struct json_object *jmx_system_cpufreq_get(void);
 int jmx_system_cpu_interrupt_set(struct json_object *cfg, struct json_object *out);
+int jmx_system_net_tuning_set(struct json_object *cfg, struct json_object *out);
+int jmx_system_cpufreq_set(struct json_object *cfg, struct json_object *out);
 int jmx_system_ssh_idle_timeout_set(struct json_object *cfg, struct json_object *out);
 
 /* ═══ Container Service ═══ */
 struct json_object *jmx_container_service_get(void);
 struct json_object *jmx_container_docker_get(void);
 struct json_object *jmx_container_lxc_get(void);
+void jmx_lxc_autostart_start(void);
+void jmx_lxc_autostart_stop(void);
 
 /* Docker operations */
 int jmx_docker_container_start(const char *id, struct json_object *out);
@@ -487,12 +561,20 @@ int jmx_docker_container_rename(const char *id, struct json_object *cfg, struct 
 int jmx_docker_container_restart_policy(const char *id, struct json_object *cfg, struct json_object *out);
 struct json_object *jmx_docker_container_logs(const char *id, struct json_object *cfg);
 struct json_object *jmx_docker_container_stats(const char *id);
+struct json_object *jmx_docker_stats_get(const char *id);
+struct json_object *jmx_docker_workbench_read(struct json_object *cfg);
+int jmx_docker_workbench_write(struct json_object *cfg, struct json_object *out);
+struct json_object *jmx_docker_inspect(const char *kind, const char *id);
 int jmx_docker_container_create(struct json_object *cfg, struct json_object *out);
 
 /* Docker image operations */
 int jmx_docker_image_pull(struct json_object *cfg, struct json_object *out);
 int jmx_docker_image_remove(const char *id, struct json_object *cfg, struct json_object *out);
 struct json_object *jmx_docker_image_prune(struct json_object *cfg);
+int jmx_lxc_container_action(const char *name,const char *action,struct json_object *cfg,struct json_object *out);
+struct json_object *jmx_lxc_jobs_list(struct json_object *cfg);
+struct json_object *jmx_lxc_job_get(const char *id);
+int jmx_lxc_job_cancel(const char *id,struct json_object *cfg,struct json_object *out);
 struct json_object *jmx_docker_jobs_list(struct json_object *cfg);
 struct json_object *jmx_docker_job_get(const char *id);
 int jmx_docker_job_cancel(const char *id, struct json_object *cfg,
@@ -528,6 +610,8 @@ int jmx_lxc_container_clone(const char *name, struct json_object *cfg, struct js
 int jmx_lxc_container_snapshot(const char *name, struct json_object *cfg, struct json_object *out);
 int jmx_lxc_container_snapshot_restore(const char *name, const char *snap, struct json_object *cfg, struct json_object *out);
 struct json_object *jmx_lxc_container_config_get(const char *name);
+struct json_object *jmx_lxc_config_document_get(const char *name);
+int jmx_lxc_config_document_save(const char *name,struct json_object *cfg,struct json_object *out);
 int jmx_lxc_container_config_set(const char *name, struct json_object *cfg, struct json_object *out);
 struct json_object *jmx_lxc_config_get(void);
 int jmx_lxc_config_set(struct json_object *cfg, struct json_object *out);
@@ -546,6 +630,8 @@ int nc_exec(const char *sql);
 int nc_prepare(sqlite3_stmt **st, const char *sql);
 int nc_step_done(sqlite3_stmt *st);
 int nc_txn_begin(void);
+/* Main-loop only: Netboot applies DHCP within this authority transaction. */
+sqlite3 *jmx_netconfig_db_write_connection(void);
 int nc_txn_end(int rc);
 int nc_sqlite_changes(void);
 sqlite3_int64 nc_sqlite_last_insert_rowid(void);
@@ -570,7 +656,11 @@ int nc_backup_config(const char *pkg, char *bak, size_t bak_len);
 void nc_restore_config(const char *pkg, const char *bak);
 void nc_cleanup_backup(const char *bak);
 int nc_sig_open(sqlite3 **db);
-int nc_vpn_count_table(const char *table, const char *where);
+/* literal_where must be a compile-time string. It is concatenated into the
+ * statement, so a value built from a request would be an injection; the
+ * implementation refuses anything that does not look like a plain literal
+ * WHERE clause. */
+int nc_vpn_count_table(const char *table, const char *literal_where);
 char *nc_cmd_output(const char *cmd, int max_len);
 char *nc_cmd_output_status(const char *cmd, int max_len, int *status);
 struct json_object *nc_json_array_from_text(const char *txt);
@@ -595,4 +685,5 @@ int nc_uci_ensure_section(struct uci_context *ctx, struct uci_package *pkg,
 void nc_uci_delete_managed_sections(struct uci_context *ctx, struct uci_package *pkg,
                                     const char *pkg_name, const char *type,
                                     const char *prefix);
+struct json_object *jmx_netconfig_transaction(const char *method, struct json_object *req);
 #endif

@@ -5,7 +5,15 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEBD = (ROOT / "src/webd/jmx_app_api.c").read_text(encoding="utf-8")
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text, webd_function_text
+WEBD = webd_dispatch_text()
+
+
+def between(text: str, start: str, end: str) -> str:
+    offset = text.index(start)
+    return text[offset:text.index(end, offset)]
 
 
 def test_bootstrap_uses_flowd_status_as_the_capability_source() -> None:
@@ -42,7 +50,28 @@ def test_missing_status_fails_closed_and_legacy_flags_mean_read_only() -> None:
     assert "webd_apply_flowd_runtime_capabilities(capabilities, disabled_caps);" in WEBD
 
 
+def test_runtime_get_keeps_registered_worker_contract_without_runtime_db() -> None:
+    # webd_flowd_runtime_empty moved into api_flowd.c in Phase 6E. Read the
+    # definition itself (not the module's forward declaration) so the worker/
+    # available/db ordering is checked against the real body.
+    helper = webd_function_text("api_flowd.c", "webd_flowd_runtime_empty")
+
+    worker_check = helper.index(
+        'json_object_object_get_ex(resp, "worker_available", &v)'
+    )
+    available_check = helper.index(
+        'json_object_object_get_ex(resp, "available", &v)'
+    )
+    db_check = helper.index(
+        'json_object_object_get_ex(resp, "runtime_db_present", &v)'
+    )
+    assert 'return !json_object_get_boolean(v);' in helper
+    assert worker_check < available_check
+    assert worker_check < db_check
+
+
 if __name__ == "__main__":
     test_bootstrap_uses_flowd_status_as_the_capability_source()
     test_missing_status_fails_closed_and_legacy_flags_mean_read_only()
+    test_runtime_get_keeps_registered_worker_contract_without_runtime_db()
     print("ok: bootstrap aggregates flowd capabilities and fails closed when status is unavailable")

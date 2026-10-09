@@ -99,6 +99,9 @@ int main(int argc, char **argv)
         return 1;
     }
 
+    /* Workers wait for their own reload commands; no uloop_process is used.
+     * uloop's waitpid(-1) would otherwise steal system()'s exit status. */
+    uloop_handle_sigchld = false;
     if (uloop_init() != 0) {
         fprintf(stderr, "[%s] startup failed stage=uloop_init\n",
                 CLOUD_SERVICE_NAME);
@@ -117,9 +120,13 @@ int main(int argc, char **argv)
 
     fprintf(stderr, "[%s] started state=%s\n", CLOUD_SERVICE_NAME,
             cloud_tunnel_state());
+    cloud_browser_start();
+    cloud_cert_timer_start();
     uloop_run();
     rc = 0;
 
+    cloud_cert_timer_stop();
+    cloud_browser_stop();
     cloud_tunnel_stop();
 fail_ubus:
     cloud_ubus_stop();

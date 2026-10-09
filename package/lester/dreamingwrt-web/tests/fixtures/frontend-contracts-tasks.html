@@ -1,0 +1,9 @@
+<!doctype html><html lang="zh-CN"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>TaskCenter synthetic contract fixture</title><link rel="stylesheet" href="/static/ui-kit/dwrt-ui-kit.css"><link rel="stylesheet" href="/static/css/dwrt-theme.css"><link rel="stylesheet" href="/static/css/task-center.css"></head><body>
+<button id="dwrtTaskCenterButton" data-dwrt-component="button" aria-label="任务中心">任务</button>
+<button id="registryControl" data-dwrt-component="button">保存 Wi-Fi 配置</button>
+<script>
+window.fixtureCalls=[];window.fixtureMode='ready';
+window.DWRT_SESSION={tokens:()=>({access:'synthetic-only'}),fetch:async url=>{fixtureCalls.push(url);const now=Math.floor(Date.now()/1000);const wifi=url.includes('/wifi/');return {ok:fixtureMode!=='fail',status:fixtureMode==='fail'?503:200,json:async()=>fixtureMode==='fail'?{ok:false,error:{code:'source_unavailable'}}:{ok:true,contract:'product-plane.v1',data:wifi?{tasks:[{task_id:'fixture-wifi-done',state:'success',progress:100,started_at:now-60,updated_at:now-10,message:'Synthetic fixture: 配置已回读'},{task_id:'fixture-wifi-active',state:'in_progress',progress:50,started_at:now-120,message:'Synthetic fixture: 目标 1/2 已完成'}]}:{task_id:'fixture-ota',state:'in_progress',progress:35,started_at:now-90,message:'Synthetic fixture: 正在下载'},meta:{stale:false}}}}};
+</script><script src="/static/ui-kit/dwrt-ui-kit.js"></script><script src="/static/js/dwrt-data-registry.js"></script><script>
+const r=window.DWRT_DATA_REGISTRY=new window.DWRTDataRegistry();r.accept('wifi.config',{contract:'product-plane.v1',data:{},capabilities:{save_config:false,reasons:{save_config:'executor_disabled'}},permissions:{'wifi:write':true},entitlement:null});r.bindControl('wifi.config',document.getElementById('registryControl'),{capability:'save_config',permission:'wifi:write'});
+</script><script src="/static/js/task-center.js"></script></body></html>

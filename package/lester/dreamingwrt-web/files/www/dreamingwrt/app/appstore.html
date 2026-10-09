@@ -1,0 +1,133 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="robots" content="noindex,nofollow">
+    <title>应用中心 · Dreaming OS</title>
+    <link rel="icon" href="/static/images/logo-64.png">
+    <!-- 接入全局材质接口：与桌面壳/路由控制台同一套 data-theme-family × data-theme-resolved
+         令牌系统（毛玻璃/液态玻璃/传统）。此页在窗口 iframe 内渲染，透明 body 让窗口材质
+         贯通头尾，不再出现"上毛玻璃下纯色"的缝合怪。见 md/desktop-mode-layout-spec.md。 -->
+    <script>
+      (function () {
+        var VALID = ['liquid-glass', 'frosted-glass', 'traditional'];
+        var DEFAULT_FAMILY = 'frosted-glass';
+        var root = document.documentElement;
+        function stamp() {
+          var fam = '';
+          try { fam = localStorage.getItem('dreamingwrt.web.themeFamily') || ''; } catch (e) {}
+          root.dataset.themeFamily = VALID.indexOf(fam) >= 0 ? fam : DEFAULT_FAMILY;
+          var pref = 'system';
+          try { pref = localStorage.getItem('dreamingwrt.web.themePref') || 'system'; } catch (e) {}
+          var dark = pref === 'dark' || (pref === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          root.dataset.themePref = pref;
+          root.dataset.themeResolved = dark ? 'dark' : 'light';
+        }
+        stamp();
+        // Live-follow a console/desktop appearance change without a reopen (same-origin storage event).
+        try {
+          window.addEventListener('storage', function (e) {
+            if (e.key === 'dreamingwrt.web.themeFamily' || e.key === 'dreamingwrt.web.themePref') stamp();
+          });
+          if (window.matchMedia) {
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+              if ((root.dataset.themePref || 'system') === 'system') stamp();
+            });
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
+    <link rel="stylesheet" href="/static/css/theme-families.css?v=20261008-desktop-material-01">
+    <link rel="stylesheet" href="/static/desktop/dwrt-rail.css?v=20261008-desktop-material-01">
+    <link rel="stylesheet" href="/static/ui-kit/dwrt-ui-kit.css">
+    <link rel="stylesheet" href="/static/ui-kit/dwrt-control-material.css">
+    <link rel="stylesheet" href="/static/desktop/appstore/appstore.css?v=20261004-configure-01">
+  </head>
+  <body>
+    <!-- 侧栏 = 桌面 App 统一左侧栏（dwrt-rail，规范见 md/desktop-mode-layout-spec.md §9，
+         以系统设置侧栏为准）：品牌字标 logo-wide.png → 毛玻璃搜索药丸 → 图标片条目，
+         选中态为中性玻璃块；前景由共享采样器 glass-foreground.js 按实际背景逐字保证可读。 -->
+    <aside class="as-sidebar dwrt-rail">
+      <div class="dwrt-rail-brand" aria-hidden="true">
+        <img src="/static/images/logo-wide.png?v=20260919-brand-01" alt="DreamingOS">
+      </div>
+      <div class="dwrt-rail-search">
+        <span class="dwrt-rail-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg></span>
+        <input type="search" id="asSearch" class="dwrt-rail-search-input" placeholder="搜索应用" aria-label="搜索应用" autocomplete="off" spellcheck="false">
+      </div>
+      <nav class="dwrt-rail-list" id="asNav" aria-label="应用中心导航"></nav>
+    </aside>
+
+    <main class="as-main" id="asMain">
+      <!-- 目录来源/新鲜度条：显示 index.source(remote/cache/bundled)·channel·revision，
+           过期或上次刷新失败时高亮，并提供「刷新」触发 POST /catalog/refresh。诚实呈现，
+           不伪造在线状态。全视图常驻。 -->
+      <div class="as-index-bar" id="asIndexBar"></div>
+      <!-- 发现 -->
+      <section class="as-view" id="asViewDiscover" aria-label="发现">
+        <p class="as-eyebrow">发现</p>
+        <h1 class="as-title">今日推荐</h1>
+        <div class="as-section">
+          <div class="as-hero" id="asHero"></div>
+        </div>
+        <div class="as-section" id="asFeaturedSection">
+          <div class="as-section-head"><h2 class="as-section-title">编辑精选</h2></div>
+          <div class="as-strip" id="asFeatured"></div>
+        </div>
+        <div class="as-section" id="asRankSection">
+          <div class="as-section-head"><h2 class="as-section-title">全部应用</h2></div>
+          <div class="as-grid" id="asRank"></div>
+        </div>
+      </section>
+
+      <!-- 分类 -->
+      <section class="as-view" id="asViewCategory" aria-label="分类">
+        <p class="as-eyebrow" id="asCategoryEyebrow">分类</p>
+        <h1 class="as-title" id="asCategoryTitle">分类</h1>
+        <div class="as-grid" id="asCategoryGrid"></div>
+        <div class="as-empty" id="asCategoryEmpty" hidden>
+          <p class="as-empty-title">该分类暂无应用</p>
+          <p>换个分类看看，或在上方搜索。</p>
+        </div>
+      </section>
+
+      <!-- 搜索结果 -->
+      <section class="as-view" id="asViewSearch" aria-label="搜索结果">
+        <p class="as-eyebrow">搜索</p>
+        <h1 class="as-title" id="asSearchTitle">搜索</h1>
+        <div class="as-grid" id="asSearchGrid"></div>
+        <div class="as-empty" id="asSearchEmpty" hidden>
+          <p class="as-empty-title">未找到匹配的应用</p>
+          <p>试试其他关键词。</p>
+        </div>
+      </section>
+
+      <!-- 已安装 -->
+      <section class="as-view" id="asViewInstalled" aria-label="已安装">
+        <p class="as-eyebrow">管理</p>
+        <h1 class="as-title">已安装</h1>
+        <p class="as-detail-dev" id="asInstalledCount">正在读取已安装应用…</p>
+        <div class="as-grid" id="asInstalledGrid"></div>
+        <div class="as-empty" id="asInstalledEmpty" hidden>
+          <p class="as-empty-title">暂无已安装的应用</p>
+          <p>在「发现」中浏览并安装应用。</p>
+        </div>
+      </section>
+
+      <!-- 详情 -->
+      <section class="as-view" id="asViewDetail" aria-label="应用详情">
+        <button type="button" class="as-back" id="asBack">‹ 返回</button>
+        <div id="asDetailBody"></div>
+      </section>
+    </main>
+
+    <div class="as-toast" id="asToast" role="status" aria-live="polite"></div>
+
+    <script src="/static/js/dwrt-session-gate.js?v=20260808-region-ink-uses-painted-density-01" defer></script>
+    <script src="/static/ui-kit/dwrt-ui-kit.js" defer></script>
+    <script src="/static/desktop/appstore/appstore.js?v=20261005-capabilities-01" defer></script>
+    <script src="/static/desktop/glass-foreground.js?v=20261008-desktop-material-01" defer></script>
+  </body>
+</html>

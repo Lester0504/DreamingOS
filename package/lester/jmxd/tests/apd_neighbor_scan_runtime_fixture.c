@@ -15,13 +15,43 @@ static unsigned int fixture_if_nametoindex(const char *name);
 static unsigned int fixture_if_nametoindex(const char *name)
 {
     if (!strcmp(name, "wifi0")) return 11;
+    if (!strcmp(name, "wifi1")) return 13;
+    if (!strcmp(name, "wifi2")) return 14;
     if (!strcmp(name, "ath0")) return 12;
+    if (!strcmp(name, "ath1")) return 24;
+    if (!strcmp(name, "ath2")) return 25;
     if (!strcmp(name, "MLD1")) return 20;
+    if (!strcmp(name, "phy0.0-ap0")) return 21;
+    if (!strcmp(name, "phy0.1-ap0")) return 22;
+    if (!strcmp(name, "phy0.2-ap0")) return 23;
     return 0;
 }
 
 static int fixture_iw_inventory(const char *mode)
 {
+    if (!strcmp(mode, "multi-radio")) {
+        fputs("phy#0\n"
+              "\tInterface phy0.2-ap0\n"
+              "\t\tifindex 23\n"
+              "\t\tssid Six\n"
+              "\t\ttype AP\n"
+              "\t\tchannel 1 (5955 MHz), width: 320 MHz\n"
+              "\t\tRadios: 2\n"
+              "\tInterface phy0.1-ap0\n"
+              "\t\tifindex 22\n"
+              "\t\tssid Five\n"
+              "\t\ttype AP\n"
+              "\t\tchannel 44 (5220 MHz), width: 160 MHz\n"
+              "\t\tRadios: 1\n"
+              "\tInterface phy0.0-ap0\n"
+              "\t\tifindex 21\n"
+              "\t\tssid Two\n"
+              "\t\ttype AP\n"
+              "\t\tchannel 1 (2412 MHz), width: 20 MHz\n"
+              "\t\tRadios: 0\n",
+              stdout);
+        return ferror(stdout) ? 1 : 0;
+    }
     fputs("phy#0\n"
           "\tInterface MLD1\n"
           "\t\tifindex 20\n"
@@ -35,12 +65,14 @@ static int fixture_iw_inventory(const char *mode)
           "\t\tssid Main\n"
           "\t\ttype AP\n"
           "\t\tchannel 36 (5180 MHz), width: 80 MHz\n"
+          "\t\tRadios: 1\n"
           "\tInterface wifi0\n",
           stdout);
     fprintf(stdout, "\t\tifindex %s\n", !strcmp(mode, "mapping-mismatch") ?
             "99" : "11");
     fputs("\t\ttype AP\n"
-          "\t\tchannel 36 (5180 MHz), width: 80 MHz\n",
+          "\t\tchannel 36 (5180 MHz), width: 80 MHz\n"
+          "\t\tRadios: 1\n",
           stdout);
     return ferror(stdout) ? 1 : 0;
 }
@@ -373,6 +405,93 @@ static int fixture_expect_survey(const char *path)
     return 0;
 }
 
+static int fixture_expect_multi_radio_target(void)
+{
+    static const char inventory[] =
+        "phy#0\n"
+        "\tInterface phy0.2-ap0\n"
+        "\t\tifindex 23\n"
+        "\t\tssid Six\n"
+        "\t\ttype AP\n"
+        "\t\tchannel 1 (5955 MHz), width: 320 MHz\n"
+        "\t\tRadios: 2\n"
+        "\tInterface phy0.1-ap0\n"
+        "\t\tifindex 22\n"
+        "\t\tssid Five\n"
+        "\t\ttype AP\n"
+        "\t\tchannel 44 (5220 MHz), width: 160 MHz\n"
+        "\t\tRadios: 1\n"
+        "\tInterface phy0.0-ap0\n"
+        "\t\tifindex 21\n"
+        "\t\tssid Two\n"
+        "\t\ttype AP\n"
+        "\t\tchannel 1 (2412 MHz), width: 20 MHz\n"
+        "\t\tRadios: 0\n";
+    struct apd_neighbor_target target;
+    char reason[APD_NEIGHBOR_REASON_LEN + 1] = { 0 };
+
+    if (apd_neighbor_target_from_iw(inventory, "phy0r2", &target, reason) != 0 ||
+        strcmp(target.interface, "phy0.2-ap0") || target.wiphy_index != 0 ||
+        !target.has_radio_index || target.radio_index != 2 ||
+        target.frequency_mhz != 5955)
+        return 42;
+    if (apd_neighbor_target_from_iw(inventory, "phy0", &target, reason) != 0 ||
+        strcmp(target.interface, "phy0.0-ap0"))
+        return 43;
+    if (apd_neighbor_target_from_iw(inventory, "phy0r02", &target, reason) == 0 ||
+        strcmp(reason, "radio_id_invalid"))
+        return 44;
+    return 0;
+}
+
+static int fixture_expect_qsdk_logical_target(void)
+{
+    static const char inventory[] =
+        "phy#0\n"
+        "\tInterface ath2\n"
+        "\t\tifindex 25\n"
+        "\t\tssid Main\n"
+        "\t\ttype AP\n"
+        "\t\tchannel 33 (6115 MHz), width: 320 MHz\n"
+        "\tInterface ath1\n"
+        "\t\tifindex 24\n"
+        "\t\tssid Main\n"
+        "\t\ttype AP\n"
+        "\t\tchannel 36 (5180 MHz), width: 160 MHz\n"
+        "\tInterface MLD1\n"
+        "\t\tifindex 20\n"
+        "\t\tssid Main-MLO\n"
+        "\t\ttype AP\n"
+        "\t\tlink 0:\n"
+        "\t\t  channel 10 (2457 MHz), width: 20 MHz\n"
+        "\t\tlink 1:\n"
+        "\t\t  channel 36 (5180 MHz), width: 160 MHz\n"
+        "\t\tlink 2:\n"
+        "\t\t  channel 33 (6115 MHz), width: 320 MHz\n"
+        "\tInterface wifi2\n"
+        "\t\tifindex 14\n"
+        "\t\ttype AP\n"
+        "\t\tchannel 33 (6115 MHz), width: 320 MHz\n"
+        "\tInterface wifi1\n"
+        "\t\tifindex 13\n"
+        "\t\ttype AP\n"
+        "\t\tchannel 36 (5180 MHz), width: 160 MHz\n"
+        "\tInterface wifi0\n"
+        "\t\tifindex 11\n"
+        "\t\ttype AP\n"
+        "\t\tchannel 10 (2457 MHz), width: 20 MHz\n";
+    struct apd_neighbor_target target;
+    char reason[APD_NEIGHBOR_REASON_LEN + 1] = { 0 };
+
+    if (apd_neighbor_target_from_iw(inventory, "phy0r1", &target, reason) != 0 ||
+        strcmp(target.interface, "ath1") || target.frequency_mhz != 5180)
+        return 45;
+    if (apd_neighbor_target_from_iw(inventory, "phy0r2", &target, reason) != 0 ||
+        strcmp(target.interface, "ath2") || target.frequency_mhz != 6115)
+        return 46;
+    return 0;
+}
+
 static int fixture_expect_channel_catalog(void)
 {
     static const char text[] =
@@ -494,12 +613,10 @@ static int fixture_expect_failure_evidence(const char *path)
     if (!evidence || !json_object_is_type(evidence, json_type_object))
         return 51;
     value = fixture_field(evidence, "exit_status");
-    if (!value || json_object_get_int(value) != 1)
+    if (!value || json_object_get_int(value) != 91)
         return 52;
     value = fixture_field(evidence, "stderr_excerpt");
-    if (!value ||
-        !strstr(json_object_get_string(value), "Device or resource busy") ||
-        !strstr(json_object_get_string(value), "(-16)"))
+    if (!value || json_object_get_string(value)[0] != '\0')
         return 53;
     value = fixture_field(evidence, "stderr_truncated");
     if (!value || json_object_get_boolean(value))
@@ -547,6 +664,8 @@ int main(int argc, char **argv)
     if (!rc) rc = fixture_expect_partial(argv[0]);
     if (!rc) rc = fixture_expect_limits(argv[0]);
     if (!rc) rc = fixture_expect_survey(argv[0]);
+    if (!rc) rc = fixture_expect_multi_radio_target();
+    if (!rc) rc = fixture_expect_qsdk_logical_target();
     if (rc)
         return rc;
     puts("ok: APD neighbor scan fixed argv, strict mapping/parser, and honest limits");

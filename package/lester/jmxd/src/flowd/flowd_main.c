@@ -2,6 +2,7 @@
 /* DreamingWrt flowd: flow policy workers and GeoIP country routing control plane. */
 #include "flowd_internal.h"
 #include "flowd_export_runtime.h"
+#include "wan_sla_runtime.h"
 #include "../terminal_policy/terminal_policy.h"
 
 #define FLOWD_GEOIP_AUTO_IMPORT_INITIAL_MS 15000
@@ -189,6 +190,10 @@ static int flowd_geoip_scheduled_update_command(void)
 
 int main(int argc, char **argv)
 {
+    int sampler_rc = flowd_runtime_sampler_command(argc, argv);
+
+    if (sampler_rc >= 0)
+        return sampler_rc;
     if (argc > 1 && !strcmp(argv[1], "--geoip-auto-import-once"))
         return flowd_geoip_auto_import_command();
     if (argc > 1 && !strcmp(argv[1], "--geoip-scheduled-update-once"))
@@ -204,6 +209,8 @@ int main(int argc, char **argv)
         fprintf(stderr, "[dreamingwrt-flowd] terminal policy storage init failed\n");
     if (flowd_qoe_runtime_init() != 0)
         fprintf(stderr, "[dreamingwrt-flowd] QoE foundation init failed\n");
+    if (flowd_runtime_sampler_init(g_flowd_argv0) != 0)
+        fprintf(stderr, "[dreamingwrt-flowd] runtime sampler init failed\n");
     uloop_init();
     if (flowd_ubus_start() != 0) {
         flowd_qoe_runtime_close();
@@ -213,6 +220,10 @@ int main(int argc, char **argv)
     }
     if (flowd_qoe_runtime_start() != 0)
         fprintf(stderr, "[dreamingwrt-flowd] QoE scheduler start failed\n");
+    if (flowd_runtime_sampler_start() != 0)
+        fprintf(stderr, "[dreamingwrt-flowd] runtime sampler start failed\n");
+    if (flowd_wan_sla_runtime_start() != 0)
+        fprintf(stderr, "[dreamingwrt-flowd] WAN SLA shadow sampler start failed\n");
     /* Export stays off unless flowd_export_settings says otherwise; a failure to
      * start it must not take the daemon down with it. */
     if (flowd_export_runtime_start() != 0)
@@ -238,6 +249,8 @@ int main(int argc, char **argv)
     flowd_ubus_stop();
     flowd_export_runtime_stop();
     flowd_terminal_quota_runtime_stop();
+    flowd_runtime_sampler_stop();
+    flowd_wan_sla_runtime_stop();
     flowd_qoe_runtime_close();
     uloop_done();
     tp_db_close();

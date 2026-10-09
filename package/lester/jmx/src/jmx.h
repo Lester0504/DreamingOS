@@ -243,6 +243,7 @@ typedef struct active_host_node {
 
 char *ipv6_to_str(const struct in6_addr *addr, char *str);
 int af_send_msg_to_user(char *pbuf, uint16_t len);
+int af_send_msg_to_port(const char *pbuf, uint16_t len, u32 portid);
 void jmx_v2_update_active_app(uint32_t appid, uint32_t src_ip,
 			      uint32_t dst_ip, uint16_t src_port,
 			      uint16_t dst_port, uint8_t proto);

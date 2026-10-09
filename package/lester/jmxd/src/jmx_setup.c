@@ -2,10 +2,14 @@
 /*
  * jmx_setup.c - DreamingWrt first-run setup wizard backend
  */
+#ifndef _GNU_SOURCE
+#define _GNU_SOURCE   /* unshare(2)/CLONE_NEWNS, getrandom(3), strtok_r */
+#endif
 #include "jmx_netconfig_db.h"
 #include "jmx.h"
 #include "jmx_exec.h"
 #include "jmx_isp.h"
+#include "jmx_dataset_path.h"
 
 #include <sqlite3.h>
 #include <stdio.h>
@@ -24,6 +28,19 @@
 #include <uci.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
+/* PPPoE import-config harvest (AF_PACKET sniff + fork+exec fake-AC worker) */
+#include <ctype.h>
+#include <stdint.h>
+#include <signal.h>
+#include <sched.h>
+#include <sys/mount.h>
+#include <sys/random.h>
+#include <sys/socket.h>
+#include <arpa/inet.h>
+#include <net/if.h>
+#include <linux/if_packet.h>
+#include <linux/if_ether.h>
+#include <json-c/json_util.h>
 
 #define NC_SETUP_TOTP_STEP_S       30
 #define NC_SETUP_TOTP_DIGITS       6
@@ -44,6 +61,8 @@
 #define NC_SETUP_COMMAND_TIMEOUT_MS 5000
 #define NC_SETUP_UCI_PATH           "/sbin/uci"
 #define NC_SETUP_PPPOE_DISCOVERY_PATH "/usr/sbin/pppoe-discovery"
+#define NC_SETUP_DEVICE_ROLE_DIR       "/etc/dreamingwrt"
+#define NC_SETUP_DEVICE_ROLE_PATH      NC_SETUP_DEVICE_ROLE_DIR "/device_role"
 
 /* ══════════════════════════════════════════════════════════════════════
  * First-run setup wizard state
@@ -226,6 +245,72 @@ static struct json_object *nc_setup_load_draft(const char *kind)
         sqlite3_finalize(st);
     }
     return o ? o : json_object_new_object();
+}
+
+static const char *nc_setup_device_role_from_draft(struct json_object *device)
+{
+    struct json_object *general = NULL;
+
+    if (device && json_object_is_type(device, json_type_object) &&
+        json_object_object_get_ex(device, "general", &general) && general &&
+        json_object_is_type(general, json_type_object) &&
+        !strcmp(nc_json_str_def(general, "device_role", "gateway"), "ap"))
+        return "ap";
+    return "gateway";
+}
+
+static int nc_setup_device_role_write(const char *role)
+{
+    char tmp_path[PATH_MAX];
+    const char *canon = role && !strcmp(role, "ap") ? "ap" : "gateway";
+    char value[16];
+    size_t length;
+    size_t written = 0;
+    int fd = -1;
+    int dir_fd = -1;
+    int rc = -1;
+
+    if (mkdir(NC_SETUP_DEVICE_ROLE_DIR, 0755) != 0 && errno != EEXIST)
+        return -1;
+    snprintf(tmp_path, sizeof(tmp_path), "%s.tmp.%ld",
+             NC_SETUP_DEVICE_ROLE_PATH, (long)getpid());
+    (void)unlink(tmp_path);
+    fd = open(tmp_path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    if (fd < 0)
+        return -1;
+    length = (size_t)snprintf(value, sizeof(value), "%s\n", canon);
+    while (written < length) {
+        ssize_t n = write(fd, value + written, length - written);
+
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0)
+            goto out;
+        written += (size_t)n;
+    }
+    if (fsync(fd) != 0)
+        goto out;
+    if (close(fd) != 0) {
+        fd = -1;
+        goto out_closed;
+    }
+    fd = -1;
+    if (rename(tmp_path, NC_SETUP_DEVICE_ROLE_PATH) != 0)
+        goto out_closed;
+    dir_fd = open(NC_SETUP_DEVICE_ROLE_DIR, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (dir_fd < 0 || fsync(dir_fd) != 0)
+        goto out_closed;
+    rc = 0;
+
+out_closed:
+    if (dir_fd >= 0)
+        close(dir_fd);
+out:
+    if (fd >= 0)
+        close(fd);
+    if (rc != 0)
+        (void)unlink(tmp_path);
+    return rc;
 }
 
 static int nc_setup_update_step(const char *step)
@@ -1491,9 +1576,9 @@ static struct json_object *nc_setup_app_pairing_json(void)
     int status_available = 0;
     const char *status_error = "apid_db_missing";
 
-    if (access("/etc/dreamingwrt/apid.db", R_OK) == 0) {
+    if (access(jmx_dataset_path("apid"), R_OK) == 0) {
         status_error = "apid_db_open_failed";
-        if (sqlite3_open_v2("/etc/dreamingwrt/apid.db", &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
+        if (sqlite3_open_v2(jmx_dataset_path("apid"), &db, SQLITE_OPEN_READONLY, NULL) == SQLITE_OK) {
             int rc;
 
             status_error = "app_devices_schema_query_failed";
@@ -2193,6 +2278,459 @@ struct json_object *jmx_setup_detect_wan_status(struct json_object *cfg)
     return nc_setup_response(API_CODE_SUCCESS, d);
 }
 
+/* ══════════════════════════════════════════════════════════════════════
+ * PPPoE "import from old router" harvest (setup wizard, PM 2026-09-22)
+ *
+ * Stand up a throwaway PPPoE Access Concentrator on an isolated import port,
+ * force PAP in LCP, and sniff the peer's PAP Authenticate-Request off the wire
+ * (AF_PACKET) to recover the broadband username/password in cleartext. The
+ * fake-AC + sniffer run in a fork+exec worker process (freeze-safe: core's
+ * single control-plane uloop thread is never blocked), inside a private mount
+ * namespace so a wildcard /etc/ppp/pap-secrets never touches the host FS.
+ *
+ * Mechanism proven end-to-end on 30.1 (see PM-to-Backend handoff PoC log):
+ *   - pppoe-server runs in kernel mode (-k); the userspace /usr/sbin/pppoe
+ *     helper is NOT shipped, so -k is mandatory.
+ *   - pppd refuses to start under require-pap without a pap-secrets entry that
+ *     authorises the peer+address, so a wildcard `* * "harvest" *` is written
+ *     into the private /etc/ppp; capture happens before pppd validates, so the
+ *     dummy-secret mismatch (AuthNak) is irrelevant.
+ *   - pppd hides the peer PAP password from scripts; AF_PACKET sniffing is the
+ *     only authoritative capture path.
+ * Credentials live only in the per-session state file until the user confirms;
+ * 落库 reuses the existing save-wan path (no new write route here).
+ * ══════════════════════════════════════════════════════════════════════ */
+
+#define NC_IMP_SERVER   "/usr/sbin/pppoe-server"
+#define NC_IMP_PPPD     "/usr/sbin/pppd"
+#define NC_IMP_IP       "/sbin/ip"
+#define NC_IMP_DIR      "/var/run/dwrt-import"
+#define NC_IMP_AC       "DreamingWrt-Import"
+#define NC_IMP_DEF_TMO  100
+#define NC_IMP_MAX_TMO  120
+#define NC_IMP_MAX_EVID 8
+
+/* single-flight, in-memory (core is one long-lived process) */
+static char          g_imp_sid[40];
+static char          g_imp_port[64];
+static pid_t         g_imp_pid;
+static sqlite3_int64 g_imp_started;
+static int           g_imp_expires;
+
+struct nc_imp_cap { int has; char user[256]; char pass[256]; char mac[32]; int sess; };
+
+static int nc_imp_capability_ok(void) { return access(NC_IMP_SERVER, X_OK) == 0; }
+
+static int nc_imp_sid_ok(const char *s)
+{
+    size_t i, n;
+    if (!s) return 0;
+    n = strlen(s);
+    if (n < 8 || n >= sizeof(g_imp_sid)) return 0;
+    for (i = 0; i < n; i++)
+        if (!isxdigit((unsigned char)s[i])) return 0;
+    return 1;
+}
+
+static void nc_imp_gen_sid(char *out, size_t len)
+{
+    unsigned char r[16];
+    size_t i;
+
+    if (getrandom(r, sizeof(r), 0) != (ssize_t)sizeof(r)) {
+        sqlite3_int64 t = nc_now_s();
+        for (i = 0; i < sizeof(r); i++)
+            r[i] = (unsigned char)((rand() >> (i & 7)) ^ (t >> (i & 15)) ^ (int)getpid());
+    }
+    out[0] = '\0';
+    for (i = 0; i < sizeof(r) && (2 * i + 2) < len; i++)
+        snprintf(out + 2 * i, 3, "%02x", r[i]);
+}
+
+static void nc_imp_state_path(const char *sid, char *b, size_t l)
+{
+    snprintf(b, l, "%s/%s.json", NC_IMP_DIR, sid);
+}
+
+static int nc_imp_run(char *const argv[])
+{
+    pid_t p = fork();
+    int st = 0;
+
+    if (p < 0) return -1;
+    if (p == 0) {
+        int fd = open("/dev/null", O_WRONLY);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    while (waitpid(p, &st, 0) < 0)
+        if (errno != EINTR) return -1;
+    return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+}
+
+static void nc_imp_read_master(const char *port, char *out, size_t len)
+{
+    char p[160], lk[160];
+    ssize_t n;
+    char *b;
+
+    out[0] = '\0';
+    snprintf(p, sizeof(p), "/sys/class/net/%s/master", port);
+    n = readlink(p, lk, sizeof(lk) - 1);
+    if (n <= 0) return;
+    lk[n] = '\0';
+    b = strrchr(lk, '/');
+    b = b ? b + 1 : lk;
+    size_t name_len = strlen(b);
+    if (name_len >= len) return;
+    memcpy(out, b, name_len + 1);
+}
+
+static int nc_imp_read_up(const char *port)
+{
+    char p[160], buf[64];
+    FILE *f;
+    long flags = 0;
+
+    snprintf(p, sizeof(p), "/sys/class/net/%s/flags", port);
+    f = fopen(p, "r");
+    if (!f) return 0;
+    if (fgets(buf, sizeof(buf), f))
+        flags = strtol(buf, NULL, 16);
+    fclose(f);
+    return (flags & 0x1) ? 1 : 0;   /* IFF_UP */
+}
+
+static int nc_imp_add_evid(char evid[][80], int *n, const char *s)
+{
+    int i;
+    if (*n >= NC_IMP_MAX_EVID) return 0;
+    for (i = 0; i < *n; i++)
+        if (!strcmp(evid[i], s)) return 0;
+    snprintf(evid[*n], 80, "%s", s);
+    (*n)++;
+    return 1;
+}
+
+static int nc_imp_write_state(const char *sid, const char *status, const char *port,
+                              sqlite3_int64 started, int expires,
+                              char evid[][80], int nevid,
+                              const struct nc_imp_cap *cap, const char *error)
+{
+    char path[160], tmp[176];
+    struct json_object *o, *ev, *c;
+    FILE *f;
+    int i;
+
+    nc_imp_state_path(sid, path, sizeof(path));
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "w");
+    if (!f) return -1;
+    (void)fchmod(fileno(f), 0600);   /* best effort: creds live only in state file */
+
+    o = json_object_new_object();
+    json_object_object_add(o, "session_id", json_object_new_string(sid));
+    json_object_object_add(o, "status", json_object_new_string(status));
+    json_object_object_add(o, "port", json_object_new_string(port ? port : ""));
+    json_object_object_add(o, "started_at", json_object_new_int64(started));
+    json_object_object_add(o, "expires_in", json_object_new_int(expires));
+    json_object_object_add(o, "ts", json_object_new_int64(nc_now_s()));
+    ev = json_object_new_array();
+    for (i = 0; i < nevid; i++)
+        json_object_array_add(ev, json_object_new_string(evid[i]));
+    json_object_object_add(o, "evidence", ev);
+    if (cap && cap->has) {
+        c = json_object_new_object();
+        json_object_object_add(c, "username", json_object_new_string(cap->user));
+        json_object_object_add(c, "password", json_object_new_string(cap->pass));
+        json_object_object_add(c, "peer_mac", json_object_new_string(cap->mac));
+        json_object_object_add(c, "session_id", json_object_new_int(cap->sess));
+        json_object_object_add(o, "captured", c);
+    } else {
+        json_object_object_add(o, "captured", NULL);
+    }
+    json_object_object_add(o, "error", json_object_new_string(error ? error : ""));
+    fputs(json_object_to_json_string_ext(o, JSON_C_TO_STRING_PLAIN), f);
+    fclose(f);
+    json_object_put(o);
+    return rename(tmp, path);
+}
+
+static volatile sig_atomic_t g_imp_stop;
+static void nc_imp_sig(int s) { (void)s; g_imp_stop = 1; }
+
+/*
+ * Worker main: fork+exec'd as `dwrt-import-harvest --import-harvest-worker
+ * <sid> <port> <timeout>`. argv[0] is the synthetic name so dreamingwrt-init's
+ * cmdline orphan-reaper (which matches "dreamingwrt-core") does not SIGKILL us.
+ */
+int jmx_setup_import_harvest_worker_main(const char *sid, const char *port, const char *tmo_s)
+{
+    struct sigaction sa;
+    char evid[NC_IMP_MAX_EVID][80];
+    struct nc_imp_cap cap;
+    char master[64];
+    int was_up;
+    char ppdir[160], papf[200], optf[200], srvopt[200];
+    sqlite3_int64 started;
+    int timeout, deadline, nevid = 0, seen_session = 0, seen_pap = 0;
+    pid_t srv;
+    int s;
+
+    if (!nc_imp_sid_ok(sid) || !port || !nc_iface_name_ok(port))
+        return 2;
+    timeout = tmo_s ? atoi(tmo_s) : NC_IMP_DEF_TMO;
+    if (timeout <= 0 || timeout > NC_IMP_MAX_TMO) timeout = NC_IMP_DEF_TMO;
+
+    setsid();
+    memset(&sa, 0, sizeof(sa));
+    sa.sa_handler = nc_imp_sig;
+    sigaction(SIGTERM, &sa, NULL);
+    sigaction(SIGINT, &sa, NULL);
+    sigaction(SIGALRM, &sa, NULL);
+    alarm((unsigned)timeout + 5);
+
+    started = nc_now_s();
+    memset(&cap, 0, sizeof(cap));
+    mkdir(NC_IMP_DIR, 0700);
+    nc_imp_write_state(sid, "listening", port, started, timeout, evid, nevid, &cap, "");
+
+    /* isolate the import port: detach from any bridge, bring up standalone */
+    nc_imp_read_master(port, master, sizeof(master));
+    was_up = nc_imp_read_up(port);
+    if (master[0]) {
+        char *a[] = { NC_IMP_IP, "link", "set", (char *)port, "nomaster", NULL };
+        nc_imp_run(a);
+    }
+    { char *a[] = { NC_IMP_IP, "link", "set", (char *)port, "up", NULL }; nc_imp_run(a); }
+
+    /* private mount ns: bind a wildcard /etc/ppp over the host's */
+    snprintf(ppdir, sizeof(ppdir), "%s/%s-ppp", NC_IMP_DIR, sid);
+    mkdir(ppdir, 0700);
+    snprintf(papf, sizeof(papf), "%s/pap-secrets", ppdir);
+    { FILE *f = fopen(papf, "w"); if (f) { fputs("* * \"harvest\" *\n", f); fclose(f); chmod(papf, 0600); } }
+    snprintf(optf, sizeof(optf), "%s/options", ppdir);
+    { FILE *f = fopen(optf, "w"); if (f) { fputs("\n", f); fclose(f); } }
+    snprintf(srvopt, sizeof(srvopt), "%s/%s-srvopts", NC_IMP_DIR, sid);
+    { FILE *f = fopen(srvopt, "w"); if (f) {
+        fputs("require-pap\nrefuse-chap\nrefuse-mschap\nrefuse-mschap-v2\nrefuse-eap\n"
+              "lcp-echo-interval 0\nnoipdefault\nnodefaultroute\nnoproxyarp\n", f);
+        fclose(f); } }
+
+    if (unshare(CLONE_NEWNS) == 0) {
+        mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL);
+        mount(ppdir, "/etc/ppp", NULL, MS_BIND, NULL);
+    }
+
+    /* fake AC: kernel-mode pppoe-server, force PAP via srvopt */
+    srv = fork();
+    if (srv == 0) {
+        int fd;
+        char *a[] = { NC_IMP_SERVER, "-k", "-I", (char *)port, "-C", NC_IMP_AC,
+                      "-S", "", "-L", "10.253.0.1", "-R", "10.253.0.2", "-N", "1",
+                      "-O", srvopt, "-q", NC_IMP_PPPD, NULL };
+        setpgid(0, 0);
+        fd = open("/dev/null", O_WRONLY);
+        if (fd >= 0) { dup2(fd, 1); dup2(fd, 2); if (fd > 2) close(fd); }
+        execv(a[0], a);
+        _exit(127);
+    }
+
+    /* AF_PACKET sniff loop: decode PADI + PPP/PAP Authenticate-Request */
+    s = socket(AF_PACKET, SOCK_RAW, htons(ETH_P_ALL));
+    if (s >= 0) {
+        struct sockaddr_ll sll;
+        struct timeval tv = { 1, 0 };
+        memset(&sll, 0, sizeof(sll));
+        sll.sll_family = AF_PACKET;
+        sll.sll_protocol = htons(ETH_P_ALL);
+        sll.sll_ifindex = (int)if_nametoindex(port);
+        bind(s, (struct sockaddr *)&sll, sizeof(sll));
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    }
+
+    deadline = (int)nc_now_s() + timeout;
+    while (!g_imp_stop && !cap.has && (int)nc_now_s() < deadline && s >= 0) {
+        unsigned char buf[2048];
+        ssize_t n = recv(s, buf, sizeof(buf), 0);
+        unsigned etype;
+        char smac[32];
+        int p, sess, plen, wl, q;
+        unsigned proto;
+
+        if (n < 14) continue;
+        etype = ((unsigned)buf[12] << 8) | buf[13];
+        snprintf(smac, sizeof(smac), "%02x:%02x:%02x:%02x:%02x:%02x",
+                 buf[6], buf[7], buf[8], buf[9], buf[10], buf[11]);
+
+        if (etype == 0x8863) {          /* PPPoE Discovery */
+            unsigned code = (n > 15) ? buf[15] : 0;
+            const char *nm = code == 0x09 ? "padi" : code == 0x07 ? "pado" :
+                             code == 0x19 ? "padr" : code == 0x65 ? "pads" :
+                             code == 0xa7 ? "padt" : "disc";
+            char line[80];
+            snprintf(line, sizeof(line), "%s from %s", nm, smac);
+            if (nc_imp_add_evid(evid, &nevid, line) && (code == 0x09 || code == 0x07))
+                nc_imp_write_state(sid, code == 0x07 ? "pado_sent" : "padi_seen",
+                                   port, started, timeout, evid, nevid, &cap, "");
+            continue;
+        }
+        if (etype != 0x8864 || n < 20) continue;   /* PPPoE Session */
+        sess = ((int)buf[16] << 8) | buf[17];
+        if (!seen_session) {
+            seen_session = 1;
+            nc_imp_write_state(sid, "session_up", port, started, timeout, evid, nevid, &cap, "");
+        }
+        p = 20;
+        if (buf[p] & 1) { proto = buf[p]; p += 1; }
+        else { proto = ((unsigned)buf[p] << 8) | buf[p + 1]; p += 2; }
+        if (proto != 0xc023) continue;             /* PAP */
+        if (!seen_pap) {
+            seen_pap = 1;
+            nc_imp_write_state(sid, "authenticating", port, started, timeout, evid, nevid, &cap, "");
+        }
+        if (p + 4 > n || buf[p] != 1) continue;    /* code 1 = Authenticate-Request */
+        q = p + 4;
+        if (q >= n) continue;
+        plen = buf[q]; q += 1;
+        if (q + plen > n) continue;
+        if (plen > 255) plen = 255;
+        memcpy(cap.user, buf + q, plen); cap.user[plen] = '\0';
+        q += buf[p + 4];
+        if (q >= n) continue;
+        wl = buf[q]; q += 1;
+        if (q + wl > n) continue;
+        if (wl > 255) wl = 255;
+        memcpy(cap.pass, buf + q, wl); cap.pass[wl] = '\0';
+        snprintf(cap.mac, sizeof(cap.mac), "%s", smac);
+        cap.sess = sess;
+        cap.has = 1;
+        nc_imp_write_state(sid, "captured", port, started, timeout, evid, nevid, &cap, "");
+    }
+    if (s >= 0) close(s);
+
+    if (!cap.has) {
+        if (!g_imp_stop && (int)nc_now_s() >= deadline)
+            nc_imp_write_state(sid, "timeout", port, started, timeout, evid, nevid, &cap,
+                               "timeout_no_pppoe_client");
+        else
+            nc_imp_write_state(sid, "error", port, started, timeout, evid, nevid, &cap, "stopped");
+    }
+
+    /* teardown: kill the fake AC's process group, restore the port */
+    if (srv > 0) { kill(-srv, SIGTERM); kill(srv, SIGTERM); }
+    if (master[0]) {
+        char *a[] = { NC_IMP_IP, "link", "set", (char *)port, "master", master, NULL };
+        char *b[] = { NC_IMP_IP, "link", "set", (char *)port, "up", NULL };
+        nc_imp_run(a);
+        nc_imp_run(b);
+    } else if (!was_up) {
+        char *a[] = { NC_IMP_IP, "link", "set", (char *)port, "down", NULL };
+        nc_imp_run(a);
+    }
+    unlink(srvopt);
+    if (srv > 0) { int st2; waitpid(srv, &st2, 0); }
+    return cap.has ? 0 : 1;
+}
+
+struct json_object *jmx_setup_import_config_start(struct json_object *cfg)
+{
+    struct json_object *d;
+    const char *port;
+    char tbuf[16];
+    pid_t pid;
+
+    if (!nc_imp_capability_ok()) {
+        d = json_object_new_object();
+        json_object_object_add(d, "error", json_object_new_string("capability_disabled"));
+        json_object_object_add(d, "reason", json_object_new_string("pppoe_server_missing"));
+        return nc_setup_response(API_CODE_ERROR, d);
+    }
+    port = nc_json_str_def(cfg, "port", "");
+    if (!port[0] || !nc_iface_name_ok(port)) {
+        d = json_object_new_object();
+        json_object_object_add(d, "error", json_object_new_string(port[0] ? "invalid_port" : "port_required"));
+        return nc_setup_response(API_CODE_ERROR, d);
+    }
+    if (g_imp_pid > 0 && kill(g_imp_pid, 0) == 0) {
+        d = json_object_new_object();
+        json_object_object_add(d, "error", json_object_new_string("already_running"));
+        json_object_object_add(d, "session_id", json_object_new_string(g_imp_sid));
+        return nc_setup_response(API_CODE_ERROR, d);
+    }
+    if (g_imp_pid > 0) { int st; waitpid(g_imp_pid, &st, WNOHANG); g_imp_pid = 0; }
+
+    nc_imp_gen_sid(g_imp_sid, sizeof(g_imp_sid));
+    snprintf(g_imp_port, sizeof(g_imp_port), "%s", port);
+    g_imp_started = nc_now_s();
+    g_imp_expires = NC_IMP_DEF_TMO;
+    mkdir(NC_IMP_DIR, 0700);
+    {
+        char evid[1][80];
+        struct nc_imp_cap c;
+        memset(&c, 0, sizeof(c));
+        nc_imp_write_state(g_imp_sid, "listening", g_imp_port, g_imp_started, g_imp_expires, evid, 0, &c, "");
+    }
+    snprintf(tbuf, sizeof(tbuf), "%d", g_imp_expires);
+    pid = fork();
+    if (pid < 0) {
+        d = json_object_new_object();
+        json_object_object_add(d, "error", json_object_new_string("spawn_failed"));
+        return nc_setup_response(API_CODE_ERROR, d);
+    }
+    if (pid == 0) {
+        execl("/proc/self/exe", "dwrt-import-harvest", "--import-harvest-worker",
+              g_imp_sid, g_imp_port, tbuf, (char *)NULL);
+        _exit(127);
+    }
+    g_imp_pid = pid;
+    d = json_object_new_object();
+    json_object_object_add(d, "session_id", json_object_new_string(g_imp_sid));
+    json_object_object_add(d, "status", json_object_new_string("listening"));
+    json_object_object_add(d, "expires_in", json_object_new_int(g_imp_expires));
+    json_object_object_add(d, "port", json_object_new_string(g_imp_port));
+    return nc_setup_response(API_CODE_SUCCESS, d);
+}
+
+struct json_object *jmx_setup_import_config_status(struct json_object *cfg)
+{
+    const char *sid = nc_json_str_def(cfg, "session_id", "");
+    char path[160];
+    struct json_object *st, *d;
+
+    if (!sid[0]) sid = g_imp_sid;
+    if (!nc_imp_sid_ok(sid)) {
+        d = json_object_new_object();
+        json_object_object_add(d, "error", json_object_new_string("session_not_found"));
+        return nc_setup_response(API_CODE_ERROR, d);
+    }
+    if (g_imp_pid > 0) { int s; if (waitpid(g_imp_pid, &s, WNOHANG) == g_imp_pid) g_imp_pid = 0; }
+    nc_imp_state_path(sid, path, sizeof(path));
+    st = json_object_from_file(path);
+    if (!st) {
+        d = json_object_new_object();
+        json_object_object_add(d, "error", json_object_new_string("session_not_found"));
+        return nc_setup_response(API_CODE_ERROR, d);
+    }
+    return nc_setup_response(API_CODE_SUCCESS, st);
+}
+
+struct json_object *jmx_setup_import_config_stop(struct json_object *cfg)
+{
+    const char *sid = nc_json_str_def(cfg, "session_id", "");
+    struct json_object *d = json_object_new_object();
+
+    if (!sid[0]) sid = g_imp_sid;
+    if (g_imp_pid > 0 && (!sid[0] || !strcmp(sid, g_imp_sid))) {
+        int s;
+        kill(g_imp_pid, SIGTERM);
+        if (waitpid(g_imp_pid, &s, WNOHANG) == g_imp_pid) g_imp_pid = 0;
+    }
+    json_object_object_add(d, "ok", json_object_new_boolean(1));
+    return nc_setup_response(API_CODE_SUCCESS, d);
+}
+
 static struct json_object *nc_setup_normalize_wan(struct json_object *cfg)
 {
     struct json_object *wan = json_object_new_object();
@@ -2371,6 +2909,178 @@ struct json_object *jmx_setup_status(struct json_object *cfg)
     json_object_object_add(d, "app_pairing", nc_setup_app_pairing_json());
     json_object_object_add(d, "llm", nc_setup_llm_json());
     json_object_object_add(d, "wan_detection", nc_setup_load_wan_detect());
+    /*
+     * AP mode capabilities: the setup wizard can offer "become an AP" when
+     * the device has wireless hardware and the backend supports the role
+     * switch.  gateway_discovery lets the wizard scan for nearby controllers
+     * and suggest AP mode automatically.
+     */
+    {
+        int has_wifi = nc_setup_wifi_capability("wifi");
+        struct json_object *cap = json_object_new_object();
+        struct json_object *ap_binding = json_object_new_object();
+
+        json_object_object_add(cap, "ap_mode", json_object_new_boolean(has_wifi));
+        json_object_object_add(cap, "device_role_write", json_object_new_boolean(1));
+        json_object_object_add(cap, "pppoe_server",
+                               json_object_new_boolean(nc_imp_capability_ok()));
+        json_object_object_add(cap, "gateway_discovery", json_object_new_boolean(has_wifi));
+        json_object_object_add(cap, "gateway_discovery_api",
+                               json_object_new_string("/api/setup/discover-gateways"));
+        json_object_object_add(d, "capabilities", cap);
+        json_object_object_add(ap_binding, "status_api",
+                               json_object_new_string("/api/setup/ap-binding/status"));
+        json_object_object_add(ap_binding, "poll_interval_ms", json_object_new_int(10000));
+        json_object_object_add(d, "ap_binding", ap_binding);
+    }
+    return nc_setup_response(API_CODE_SUCCESS, d);
+}
+
+
+
+/*
+ * /api/setup/discover-gateways
+ *
+ * Scans the local subnet for DreamingWrt gateways that can adopt this
+ * device as an AP.  Returns a list of reachable gateways with their
+ * hostname, model, IP, and management capabilities.
+ *
+ * Discovery method: subnet scan on port 12517 with 3-second budget.
+ * Falls back to empty list on timeout.
+ */
+struct json_object *jmx_setup_discover_gateways(struct json_object *cfg)
+{
+    struct json_object *d = json_object_new_object();
+    struct json_object *items = json_object_new_array();
+    char line[512];
+    char my_ip[64] = "";
+    char subnet[64] = "";
+    FILE *fp;
+    int64_t start_ms;
+    int64_t now_ms;
+    int found = 0;
+    (void)cfg;
+
+    if (jmx_netconfig_db_init() != 0)
+        return nc_setup_response(API_CODE_ERROR, d);
+
+    /* Get our own IP to determine the subnet. */
+    fp = popen("ip -o -4 addr show br-lan 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1", "r");
+    if (fp) {
+        if (fgets(my_ip, sizeof(my_ip), fp)) {
+            char *nl = strchr(my_ip, '\n');
+            if (nl) *nl = '\0';
+        }
+        pclose(fp);
+    }
+    if (!my_ip[0]) {
+        fp = popen("ip -o -4 addr show eth0 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1", "r");
+        if (fp) {
+            if (fgets(my_ip, sizeof(my_ip), fp)) {
+                char *nl = strchr(my_ip, '\n');
+                if (nl) *nl = '\0';
+            }
+            pclose(fp);
+        }
+    }
+    if (!my_ip[0]) {
+        json_object_object_add(d, "ok", json_object_new_boolean(1));
+        json_object_object_add(d, "items", items);
+        json_object_object_add(d, "count", json_object_new_int(0));
+        json_object_object_add(d, "error",
+                               json_object_new_string("no_local_ip"));
+        return nc_setup_response(API_CODE_SUCCESS, d);
+    }
+
+    /* Extract /24 subnet. */
+    {
+        char *last_dot = strrchr(my_ip, '.');
+        if (last_dot) {
+            int prefix_len = last_dot - my_ip;
+            if (prefix_len < (int)sizeof(subnet) - 1) {
+                memcpy(subnet, my_ip, prefix_len);
+                subnet[prefix_len] = '\0';
+            }
+        }
+    }
+    if (!subnet[0]) {
+        json_object_object_add(d, "ok", json_object_new_boolean(1));
+        json_object_object_add(d, "items", items);
+        json_object_object_add(d, "count", json_object_new_int(0));
+        return nc_setup_response(API_CODE_SUCCESS, d);
+    }
+
+    /* Scan subnet with 3-second budget. */
+    start_ms = nc_now_s() * 1000;
+    for (int i = 1; i < 255; i++) {
+        char ip[80];
+        static const char probe_format[] =
+            "timeout 1 sh -c 'echo > /dev/tcp/%s/12517' 2>/dev/null && "
+            "timeout 2 wget -q -O- --timeout=1 'http://%s:12517/api/setup/status' 2>/dev/null";
+        char cmd[2 * sizeof(ip) + sizeof(probe_format)];
+        char result[1024] = "";
+
+        now_ms = nc_now_s() * 1000;
+        if (now_ms - start_ms > 3000)
+            break; /* budget exhausted */
+
+        snprintf(ip, sizeof(ip), "%s.%d", subnet, i);
+        if (!strcmp(ip, my_ip))
+            continue; /* skip ourselves */
+
+        /* Quick TCP connect check on port 12517. */
+        snprintf(cmd, sizeof(cmd), probe_format, ip, ip);
+        fp = popen(cmd, "r");
+        if (fp) {
+            size_t n = fread(result, 1, sizeof(result) - 1, fp);
+            pclose(fp);
+            if (n > 0) {
+                result[n] = '\0';
+                /* Check if it looks like a DreamingWrt response. */
+                if (strstr(result, "ok") || strstr(result, "config_ready") ||
+                    strstr(result, "wizard_completed") || strstr(result, "device")) {
+                    struct json_object *gw = json_tokener_parse(result);
+                    struct json_object *device = NULL;
+                    struct json_object *item = json_object_new_object();
+
+                    json_object_object_add(item, "ip",
+                                           json_object_new_string(ip));
+                    json_object_object_add(item, "management_ip",
+                                           json_object_new_string(ip));
+                    json_object_object_add(item, "management_port",
+                                           json_object_new_int(12517));
+                    if (gw && json_object_object_get_ex(gw, "device", &device) && device) {
+                        json_object_object_add(item, "hostname",
+                                               json_object_get(
+                                                   json_object_object_get(device, "hostname")));
+                        json_object_object_add(item, "model",
+                                               json_object_get(
+                                                   json_object_object_get(device, "model")));
+                    }
+                    json_object_object_add(item, "capabilities",
+                                           json_object_new_object());
+                    {
+                        struct json_object *cap = json_object_object_get(item, "capabilities");
+                        json_object_object_add(cap, "ap_management",
+                                               json_object_new_boolean(1));
+                        json_object_object_add(cap, "ap_enrollment",
+                                               json_object_new_boolean(1));
+                    }
+                    json_object_array_add(items, item);
+                    found++;
+                    if (gw) json_object_put(gw);
+                }
+            }
+        }
+    }
+
+    json_object_object_add(d, "ok", json_object_new_boolean(1));
+    json_object_object_add(d, "items", items);
+    json_object_object_add(d, "count", json_object_new_int(found));
+    json_object_object_add(d, "scanned_range",
+                           json_object_new_string(subnet));
+    json_object_object_add(d, "scan_duration_ms",
+                           json_object_new_int64(nc_now_s() * 1000 - start_ms));
     return nc_setup_response(API_CODE_SUCCESS, d);
 }
 
@@ -2445,6 +3155,16 @@ struct json_object *jmx_setup_save_device(struct json_object *cfg)
     json_object_object_add(general, "hostname", json_object_new_string(nc_json_str_def(cfg, "hostname", "")));
     json_object_object_add(general, "description", json_object_new_string(nc_json_str_def(cfg, "description", nc_json_str_def(cfg, "remark", ""))));
     json_object_object_add(general, "note", json_object_new_string(nc_json_str_def(cfg, "note", "")));
+    /*
+     * device_role: "gateway" (default) or "ap".  The wizard stores the
+     * choice so the apply step can switch the device into AP mode.  Only
+     * two values are accepted; anything else falls back to gateway.
+     */
+    {
+        const char *role = nc_json_str_def(cfg, "device_role", "gateway");
+        const char *canon = (!strcmp(role, "ap")) ? "ap" : "gateway";
+        json_object_object_add(general, "device_role", json_object_new_string(canon));
+    }
     json_object_object_add(payload, "general", general);
     if (has_admin_password) {
         struct json_object *admin = json_object_new_object();
@@ -2852,6 +3572,18 @@ struct json_object *jmx_setup_apply(struct json_object *cfg)
         if (test && json_object_object_get_ex(test, "data", &test_data) && test_data)
             ok = nc_json_bool_def(test_data, "ok", 0);
         json_object_object_add(d, "wan_test", test ? test : json_object_new_object());
+    }
+    if (ok && has_device) {
+        const char *role = nc_setup_device_role_from_draft(device);
+        int rc = nc_setup_device_role_write(role);
+        struct json_object *s = json_object_new_object();
+
+        json_object_object_add(s, "step", json_object_new_string("device_role"));
+        json_object_object_add(s, "role", json_object_new_string(role));
+        json_object_object_add(s, "ok", json_object_new_boolean(rc == 0));
+        json_object_array_add(steps, s);
+        if (rc != 0)
+            ok = 0;
     }
     json_object_object_add(d, "progress_id", json_object_new_string(apply_id));
     json_object_object_add(d, "steps", steps);

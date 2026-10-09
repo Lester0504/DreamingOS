@@ -207,6 +207,8 @@ typedef struct {
 	uint32_t legacy_kernel_rules;
 	uint32_t legacy_regex_inactive;
 	uint32_t chain_db_rules;
+	uint32_t chain_verified_rules;
+	uint32_t chain_enabled_rules;
 	uint32_t chain_ready_rules;
 	uint32_t chain_inactive_by_capability;
 	uint32_t chain_unresolved_rules;

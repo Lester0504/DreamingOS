@@ -91,7 +91,9 @@ int jmx_hosttype_load_oui(const char *path)
 	fseek(f, 0, SEEK_END); fsize = ftell(f); fseek(f, 0, SEEK_SET);
 	buf = malloc(fsize + 1);
 	if (!buf) { fclose(f); return -1; }
-	fread(buf, 1, fsize, f); buf[fsize] = '\0';
+	/* Terminate at what was actually read: a short read would otherwise leave
+	 * uninitialized bytes between it and fsize for the parser to walk into. */
+	buf[fread(buf, 1, fsize, f)] = '\0';
 	fclose(f);
 
 	root = json_tokener_parse(buf);

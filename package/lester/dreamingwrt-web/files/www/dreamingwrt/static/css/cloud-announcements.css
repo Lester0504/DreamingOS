@@ -1,0 +1,54 @@
+.cloud-announcements.dwrt-kit-modal {
+  box-sizing: border-box;
+  width: min(620px, calc(100vw - 24px));
+  max-height: calc(100dvh - 32px);
+  margin: auto;
+  padding: var(--app-page-gutter, 18px);
+  border: 1px solid var(--color-border-control, #8886);
+  border-radius: var(--app-radius-panel, 18px);
+  --dwrt-kit-text: var(--color-surface-alert-ink, #202124);
+  background: var(--color-surface-alert-paper, #f5f8fc);
+  color: var(--color-surface-alert-ink, #202124);
+  overflow: auto;
+  letter-spacing: 0;
+  display: block;
+  position: fixed;
+  transform: none;
+}
+.cloud-announcements:not([open]) { display: none; }
+.cloud-announcements::backdrop { background: #0006; }
+.cloud-announcements header, .cloud-announcements-tools, .cloud-announcements-status {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px; flex-wrap: wrap;
+}
+.cloud-announcements h2 { font-size: 20px; margin: 0; }
+.cloud-announcements h3 { font-size: 18px; overflow-wrap: anywhere; }
+.cloud-announcements button { font: inherit; color: inherit; cursor: pointer; }
+.cloud-announcements header button, .cloud-announcements-tools button, .cloud-announcements > button,
+.cloud-announcements-status button, .cloud-announcements-entry, .cloud-announcements-view {
+  min-height: 40px; padding: 8px 12px; border: 1px solid var(--color-border, #8886);
+  border-radius: var(--app-radius-compact, 8px); background: transparent; color: inherit;
+}
+.cloud-announcements-tools { margin: 16px 0; }
+.cloud-announcements-tools label { display: flex; align-items: center; gap: 8px; }
+.cloud-announcements-list { display: grid; }
+.cloud-announcements-row {
+  display: grid; text-align: left; gap: 8px; width: 100%; padding: 16px 0;
+  border: 0; border-bottom: 1px solid var(--color-border, #8886); background: none;
+  overflow-wrap: anywhere;
+}
+.cloud-announcements-row strong { min-width: 0; }
+.cloud-announcements-content { white-space: pre-wrap; overflow-wrap: anywhere; line-height: 1.7; }
+.cloud-level { font-size: 13px; }
+.cloud-level--info { color: var(--color-primary, #2775cb); }
+.cloud-level--warning { color: var(--color-warning, #996900); }
+.cloud-level--danger { color: var(--color-danger, #d33644); }
+.cloud-announcements-bell { position: relative; width: 36px; height: 36px; flex: 0 0 36px; }
+.cloud-announcements-bell[hidden], .cloud-announcements-launcher[hidden] { display: none !important; }
+.cloud-announcements-launcher { position: relative; }
+.cloud-announcements-bell svg { width: 20px; height: 20px; }
+.cloud-announcements-bell[data-unread="true"]::after, .cloud-announcements-launcher[data-unread="true"]::after {
+  content: ""; position: absolute; width: 7px; height: 7px; border-radius: 50%;
+  background: var(--color-danger, #d33644); top: 4px; right: 4px;
+}
+.cloud-announcements-entry { display: block; margin: 12px; cursor: pointer; }
+.cloud-announcements-view { margin-top: 8px; cursor: pointer; }

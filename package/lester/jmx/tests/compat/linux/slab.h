@@ -5,7 +5,14 @@
 #include <string.h>
 
 #define GFP_KERNEL 0U
+#define GFP_ATOMIC 0U
 #define __GFP_ZERO 1U
+
+static inline void *kmalloc(size_t size, unsigned int flags)
+{
+	(void)flags;
+	return malloc(size);
+}
 
 static inline void *kzalloc(size_t size, unsigned int flags)
 {

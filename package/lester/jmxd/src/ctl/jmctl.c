@@ -24,9 +24,11 @@
 #include <sys/socket.h>
 #include <sys/time.h>
 #include <sys/un.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include "ai_local_rpc_protocol.h"
+#include "jmx_strbuf.h"
 
 #define JMCTL_VERSION "0.1.0"
 #define JMCTL_DEFAULT_TIMEOUT_MS 8000
@@ -117,6 +119,10 @@ static void usage(FILE *out)
         "  jmctl ac status                      Controller/local-wifi/managed-AP/PKI state\n"
         "  jmctl ac caps                        Capability flags with reasons for disabled ones\n"
         "  jmctl ac aps                         List managed APs\n"
+        "  jmctl ac discovery list              List unadopted AP candidates\n"
+        "  jmctl ac discovery confirm <ap_id> [--yes]\n"
+        "  jmctl ac binding status <binding_id>\n"
+        "  jmctl ac binding cancel <binding_id> [--yes]\n"
         "  jmctl ac ap set <ap_id> name <name>\n"
         "  jmctl ac ap set <ap_id> model <model-override>\n"
         "  jmctl ac token list\n"
@@ -128,6 +134,9 @@ static void usage(FILE *out)
         "  jmctl ac job status <job_id>\n"
         "  jmctl ac job result <job_id>\n"
         "  jmctl ac job latest                  Latest scan results across APs\n"
+        "  jmctl ap pair [--code <DWRTCT1>|--bundle <json>]\n"
+        "  jmctl ap status|doctor\n"
+        "  jmctl ap unpair [--yes]               Local AP lifecycle via apdctl\n"
         "\n"
         "Raw ubus:\n"
         "  jmctl ubus <object> <method> [json]\n"
@@ -559,7 +568,11 @@ static int parse_cidr(const char *cidr, char *ip, size_t ip_len, int *prefix)
         return -1;
     if (inet_pton(AF_INET, buf, &tmp) != 1)
         return -1;
-    snprintf(ip, ip_len, "%s", buf);
+    /* inet_pton has accepted buf, so it is a dotted quad of at most 15 bytes.
+     * Reject rather than truncate anyway, so an undersized caller buffer can
+     * never hand back a different address than the one that was validated. */
+    if (jmx_strbuf_copy(ip, ip_len, buf) != 0)
+        return -1;
     return 0;
 }
 
@@ -1578,11 +1591,265 @@ static int ac_cmd_job(struct jmctl_opts *opts, int argc, char **argv)
     return print_error(opts, "usage", "jmctl ac job list|status|result|latest");
 }
 
+static int ac_discovery_list(struct jmctl_opts *opts)
+{
+    struct json_object *resp;
+    struct json_object *data;
+    struct json_object *items = NULL;
+    size_t i, n;
+
+    resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, "discovery_list", NULL,
+                            NULL);
+    if (opts->json) {
+        int rc = emit_result(opts, "ac discovery list", "discovery_list",
+                             NULL, resp);
+        if (resp)
+            json_object_put(resp);
+        return rc;
+    }
+    if (!response_success(resp)) {
+        print_json_obj(resp);
+        if (resp)
+            json_object_put(resp);
+        return 1;
+    }
+    data = jmx_get_data_object(resp);
+    if (!data || !json_object_object_get_ex(data, "items", &items) ||
+        !items || !json_object_is_type(items, json_type_array)) {
+        print_json_obj(resp);
+        json_object_put(resp);
+        return 1;
+    }
+    n = json_object_array_length(items);
+    if (!n) {
+        printf("no discovery candidates\n");
+        json_object_put(resp);
+        return 0;
+    }
+    printf("%-36.36s  %-15.15s  %-16.16s  %-7.7s  %s\n",
+           "AP_ID", "MGMT_IP", "MODEL", "CONFIRM", "KEY_FINGERPRINT");
+    for (i = 0; i < n; i++) {
+        struct json_object *item = json_object_array_get_idx(items, i);
+        struct json_object *request = NULL;
+        int confirm = json_object_object_get_ex(item, "confirm_request",
+                                                &request) && request;
+
+        printf("%-36.36s  %-15.15s  %-16.16s  %-7.7s  %s\n",
+               json_get_string_def(item, "ap_id", "?"),
+               json_get_string_def(item, "mgmt_ip", "-"),
+               json_get_string_def(item, "model", "-"),
+               confirm ? "ready" : "blocked",
+               json_get_string_def(item, "key_id", "-"));
+    }
+    printf("\n%zu candidate(s)\n", n);
+    json_object_put(resp);
+    return 0;
+}
+
+static struct json_object *ac_discovery_confirm_body(
+    struct jmctl_opts *opts, const char *ap_id,
+    struct json_object **candidate_out)
+{
+    struct json_object *resp;
+    struct json_object *data;
+    struct json_object *items = NULL;
+    size_t i, n;
+
+    if (candidate_out)
+        *candidate_out = NULL;
+    resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, "discovery_list", NULL,
+                            NULL);
+    if (!response_success(resp)) {
+        print_json_obj(resp);
+        if (resp)
+            json_object_put(resp);
+        return NULL;
+    }
+    data = jmx_get_data_object(resp);
+    if (!data || !json_object_object_get_ex(data, "items", &items) ||
+        !items || !json_object_is_type(items, json_type_array)) {
+        json_object_put(resp);
+        return NULL;
+    }
+    n = json_object_array_length(items);
+    for (i = 0; i < n; i++) {
+        struct json_object *item = json_object_array_get_idx(items, i);
+        struct json_object *request = NULL;
+        struct json_object *body = NULL;
+
+        if (strcmp(json_get_string_def(item, "ap_id", ""), ap_id) != 0)
+            continue;
+        if (!json_object_object_get_ex(item, "confirm_request", &request) ||
+            !request ||
+            strcmp(json_get_string_def(request, "method", ""), "POST") ||
+            strcmp(json_get_string_def(request, "ubus_method", ""),
+                   "discovery_confirm") ||
+            !json_object_object_get_ex(request, "body", &body) || !body ||
+            !json_object_is_type(body, json_type_object)) {
+            json_object_put(resp);
+            return NULL;
+        }
+        body = json_object_get(body);
+        if (candidate_out)
+            *candidate_out = json_object_get(item);
+        json_object_put(resp);
+        return body;
+    }
+    json_object_put(resp);
+    return NULL;
+}
+
+static int ac_discovery_confirm(struct jmctl_opts *opts, int argc,
+                                char **argv)
+{
+    const char *ap_id = NULL;
+    int assume_yes = 0;
+    int i;
+    struct json_object *candidate = NULL;
+    struct json_object *request;
+    struct json_object *resp;
+    int rc;
+
+    for (i = 0; i < argc; i++) {
+        if (!strcmp(argv[i], "--yes"))
+            assume_yes = 1;
+        else if (!ap_id)
+            ap_id = argv[i];
+        else
+            return print_error(opts, "usage",
+                               "jmctl ac discovery confirm <ap_id> [--yes]");
+    }
+    if (!ap_id)
+        return print_error(opts, "usage",
+                           "jmctl ac discovery confirm <ap_id> [--yes]");
+    if (!is_name_safe(ap_id))
+        return print_error(opts, "invalid_ap_id",
+                           "ap_id contains unsupported characters");
+    request = ac_discovery_confirm_body(opts, ap_id, &candidate);
+    if (!request) {
+        if (candidate)
+            json_object_put(candidate);
+        return print_error(opts, "candidate_not_confirmable",
+                           "candidate is absent or has no server-issued confirm_request");
+    }
+    if (!assume_yes && !opts->dry_run) {
+        char prompt[512];
+
+        snprintf(prompt, sizeof(prompt),
+                 "Confirm AP %s at %s, model %s, fingerprint %s?",
+                 ap_id, json_get_string_def(candidate, "mgmt_ip", "?"),
+                 json_get_string_def(candidate, "model", "?"),
+                 json_get_string_def(candidate, "key_id", "?"));
+        if (!ac_confirm(opts, prompt)) {
+            json_object_put(request);
+            json_object_put(candidate);
+            return 1;
+        }
+    }
+    json_object_put(candidate);
+    if (opts->dry_run) {
+        struct json_object *dry = json_object_new_object();
+
+        json_object_object_add(dry, "ok", json_object_new_boolean(1));
+        json_object_object_add(dry, "dry_run", json_object_new_boolean(1));
+        json_add_string(dry, "object", JMCTL_AC_OBJECT);
+        json_add_string(dry, "would_call", "discovery_confirm");
+        json_object_object_add(dry, "request", json_object_get(request));
+        print_json_obj(dry);
+        json_object_put(dry);
+        json_object_put(request);
+        return 0;
+    }
+    resp = ubus_invoke_json(opts, JMCTL_AC_OBJECT, "discovery_confirm",
+                            request, NULL);
+    rc = response_success(resp) ? 0 : 1;
+    if (opts->json) {
+        rc = emit_result(opts, "ac discovery confirm", "discovery_confirm",
+                         request, resp);
+    } else {
+        /* The response contains the only copy of the bootstrap secret. */
+        print_json_obj(resp);
+    }
+    if (resp)
+        json_object_put(resp);
+    json_object_put(request);
+    return rc;
+}
+
+static int ac_cmd_discovery(struct jmctl_opts *opts, int argc, char **argv)
+{
+    if (argc < 1)
+        return print_error(opts, "usage",
+                           "jmctl ac discovery list|confirm");
+    if (!strcmp(argv[0], "list")) {
+        if (argc != 1)
+            return print_error(opts, "usage",
+                               "jmctl ac discovery list takes no argument");
+        return ac_discovery_list(opts);
+    }
+    if (!strcmp(argv[0], "confirm"))
+        return ac_discovery_confirm(opts, argc - 1, argv + 1);
+    return print_error(opts, "usage", "jmctl ac discovery list|confirm");
+}
+
+static int ac_cmd_binding(struct jmctl_opts *opts, int argc, char **argv)
+{
+    struct json_object *req;
+
+    if (argc < 1)
+        return print_error(opts, "usage",
+                           "jmctl ac binding status|cancel");
+    if (!strcmp(argv[0], "status")) {
+        if (argc != 2)
+            return print_error(opts, "usage",
+                               "jmctl ac binding status <binding_id>");
+        if (!is_name_safe(argv[1]))
+            return print_error(opts, "invalid_binding_id",
+                               "binding_id contains unsupported characters");
+        req = json_object_new_object();
+        json_add_string(req, "binding_id", argv[1]);
+        return ac_read_call(opts, "ac binding status", "ap_binding_status",
+                            req);
+    }
+    if (!strcmp(argv[0], "cancel")) {
+        const char *binding_id = NULL;
+        int assume_yes = 0;
+        int i;
+
+        for (i = 1; i < argc; i++) {
+            if (!strcmp(argv[i], "--yes"))
+                assume_yes = 1;
+            else if (!binding_id)
+                binding_id = argv[i];
+            else
+                return print_error(opts, "usage",
+                                   "jmctl ac binding cancel <binding_id> [--yes]");
+        }
+        if (!binding_id || !is_name_safe(binding_id))
+            return print_error(opts, "invalid_binding_id",
+                               "binding_id is missing or invalid");
+        if (!assume_yes && !opts->dry_run) {
+            char prompt[160];
+
+            snprintf(prompt, sizeof(prompt),
+                     "Cancel binding %s and revoke its enrollment token?",
+                     binding_id);
+            if (!ac_confirm(opts, prompt))
+                return 1;
+        }
+        req = json_object_new_object();
+        json_add_string(req, "binding_id", binding_id);
+        return ac_write_call(opts, "ac binding cancel", "ap_binding_cancel",
+                             req);
+    }
+    return print_error(opts, "usage", "jmctl ac binding status|cancel");
+}
+
 static int cmd_ac(struct jmctl_opts *opts, int argc, char **argv)
 {
     if (argc < 1)
         return print_error(opts, "usage",
-                           "jmctl ac status|caps|aps|ap|token|job");
+                           "jmctl ac status|caps|aps|discovery|binding|ap|token|job");
     if (!strcmp(argv[0], "status")) {
         if (argc != 1)
             return print_error(opts, "usage", "jmctl ac status takes no argument");
@@ -1598,13 +1865,65 @@ static int cmd_ac(struct jmctl_opts *opts, int argc, char **argv)
             return print_error(opts, "usage", "jmctl ac aps takes no argument");
         return ac_print_aps(opts);
     }
+    if (!strcmp(argv[0], "discovery"))
+        return ac_cmd_discovery(opts, argc - 1, argv + 1);
+    if (!strcmp(argv[0], "binding"))
+        return ac_cmd_binding(opts, argc - 1, argv + 1);
     if (!strcmp(argv[0], "ap"))
         return ac_cmd_ap(opts, argc - 1, argv + 1);
     if (!strcmp(argv[0], "token"))
         return ac_cmd_token(opts, argc - 1, argv + 1);
     if (!strcmp(argv[0], "job"))
         return ac_cmd_job(opts, argc - 1, argv + 1);
-    return print_error(opts, "usage", "jmctl ac status|caps|aps|ap|token|job");
+    return print_error(opts, "usage",
+                       "jmctl ac status|caps|aps|discovery|binding|ap|token|job");
+}
+
+static int cmd_local_ap(struct jmctl_opts *opts, int argc, char **argv)
+{
+    char **child_argv;
+    pid_t pid;
+    int status;
+    int i, out = 0;
+
+    if (argc < 1 || (strcmp(argv[0], "pair") && strcmp(argv[0], "status") &&
+                     strcmp(argv[0], "doctor") && strcmp(argv[0], "unpair")))
+        return print_error(opts, "usage",
+                           "jmctl ap pair|status|doctor|unpair");
+    if (opts->dry_run)
+        return print_error(opts, "unsupported_dry_run",
+                           "local AP lifecycle commands do not support --dry-run");
+    child_argv = calloc((size_t)argc + 4, sizeof(*child_argv));
+    if (!child_argv)
+        return print_error(opts, "oom", "cannot allocate apdctl arguments");
+    child_argv[out++] = (char *)"apdctl";
+    if (opts->json)
+        child_argv[out++] = (char *)"--json";
+    for (i = 0; i < argc; i++)
+        child_argv[out++] = argv[i];
+    child_argv[out] = NULL;
+
+    pid = fork();
+    if (pid < 0) {
+        free(child_argv);
+        return print_error(opts, "fork_failed", strerror(errno));
+    }
+    if (pid == 0) {
+        execvp(child_argv[0], child_argv);
+        fprintf(stderr, "jmctl: cannot execute apdctl: %s\n", strerror(errno));
+        _exit(127);
+    }
+    free(child_argv);
+    while (waitpid(pid, &status, 0) < 0) {
+        if (errno == EINTR)
+            continue;
+        return print_error(opts, "wait_failed", strerror(errno));
+    }
+    if (WIFEXITED(status))
+        return WEXITSTATUS(status);
+    if (WIFSIGNALED(status))
+        return 128 + WTERMSIG(status);
+    return 1;
 }
 
 static int cmd_raw_ubus(struct jmctl_opts *opts, int argc, char **argv)
@@ -1955,6 +2274,8 @@ static int dispatch_argv(struct jmctl_opts *opts, int argc, char **argv)
         return cmd_user(opts, argc - 1, argv + 1);
     if (!strcmp(argv[0], "ac"))
         return cmd_ac(opts, argc - 1, argv + 1);
+    if (!strcmp(argv[0], "ap"))
+        return cmd_local_ap(opts, argc - 1, argv + 1);
     if (!strcmp(argv[0], "ubus"))
         return cmd_raw_ubus(opts, argc - 1, argv + 1);
     if (!strcmp(argv[0], "@llm"))
@@ -2767,7 +3088,7 @@ static char *read_console_line(struct jmctl_opts *opts, struct console_ctx *ctx)
         }
         if (c == 27) {
             unsigned char discard[2];
-            (void)read(STDIN_FILENO, discard, sizeof(discard));
+            (void)!read(STDIN_FILENO, discard, sizeof(discard));
             continue;
         }
         if (isprint(c) && len < JMCTL_LINE_MAX - 1) {

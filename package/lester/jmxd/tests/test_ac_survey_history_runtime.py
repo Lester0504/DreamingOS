@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
+import re
 import sqlite3
 import subprocess
 import sys
@@ -14,12 +15,33 @@ import tempfile
 ROOT = Path(__file__).resolve().parents[1]
 SOURCE = ROOT / "src/ac/ac_db.c"
 FIXTURE = ROOT / "tests/ac_survey_history_runtime_fixture.c"
+
+
+def schema_version() -> int:
+    match = re.search(r"#define AC_SCHEMA_VERSION (\d+)",
+                      SOURCE.read_text(encoding="utf-8"))
+    assert match, "AC_SCHEMA_VERSION not found in ac_db.c"
+    return int(match.group(1))
 # AC_SURVEY_TEST_PREFIX (or the shared AC_PAIRING_TEST_PREFIX layout with
 # include/json-c + lib/libjson-c.{a,so}) overrides the macOS Homebrew
 # defaults so the same driver runs against a Linux sysroot.
+_DEFAULT_JSON_PREFIXES = (
+    "/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19",
+    "/opt/homebrew/Cellar/json-c/0.19",
+    "/opt/homebrew/opt/json-c",
+    "/usr/local/opt/json-c",
+)
+
+
+def _default_json_prefix() -> Path:
+    for candidate in _DEFAULT_JSON_PREFIXES:
+        if (Path(candidate) / "include/json-c/json.h").is_file():
+            return Path(candidate)
+    return Path(_DEFAULT_JSON_PREFIXES[0])
+
+
 _ENV_PREFIX = os.environ.get("AC_SURVEY_TEST_PREFIX", "")
-JSON_PREFIX = Path(_ENV_PREFIX) if _ENV_PREFIX else Path(
-    "/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19")
+JSON_PREFIX = Path(_ENV_PREFIX) if _ENV_PREFIX else _default_json_prefix()
 _ENV_OPENSSL = os.environ.get("AC_SURVEY_TEST_OPENSSL_PREFIX", "")
 OPENSSL_PREFIX = Path(_ENV_OPENSSL) if _ENV_OPENSSL else (
     JSON_PREFIX if _ENV_PREFIX else Path("/opt/homebrew/opt/openssl@3"))
@@ -55,6 +77,7 @@ def run(binary: Path, database: Path, *args: str) -> subprocess.CompletedProcess
 
 
 def main() -> None:
+    expected_schema = schema_version()
     with tempfile.TemporaryDirectory(prefix="ac-survey-history-") as raw:
         directory = Path(raw)
         binary = directory / "fixture"
@@ -74,21 +97,27 @@ def main() -> None:
         with sqlite3.connect(migration) as connection:
             assert connection.execute(
                 "SELECT version FROM ac_schema_meta WHERE singleton=1"
-            ).fetchone() == (11,)
+            ).fetchone() == (expected_schema,)
             assert connection.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' "
                 "AND name='ac_radio_survey_bucket'"
             ).fetchone() is not None
+            assert connection.execute(
+                "SELECT COUNT(*) FROM pragma_table_info('ac_radio_survey_cursor') "
+                "WHERE name='source'"
+            ).fetchone() == (1,)
 
         database = directory / "runtime.db"
         result = run(binary, database)
-        assert "schema=11" in result.stdout
+        assert f"schema={expected_schema}" in result.stdout
         assert "fine_points=5" in result.stdout
         assert "dense_suppressed=1" in result.stdout
         assert "reset_safe=1" in result.stdout
         assert "weighted=1" in result.stdout
         assert "pagination=1" in result.stdout
         assert "old_rows=0" in result.stdout
+        assert "source_persisted=1" in result.stdout
+        assert "source_change_rebaselined=1" in result.stdout
         with sqlite3.connect(database) as connection:
             count = connection.execute(
                 "SELECT COUNT(*) FROM ac_radio_survey_bucket "
@@ -96,7 +125,8 @@ def main() -> None:
             ).fetchone()[0]
             assert count <= 576
             assert connection.execute("PRAGMA quick_check").fetchone() == ("ok",)
-    print("ok: AC v7-to-v8 Survey history migration, deltas, reset, weighted buckets, retention and pagination")
+    print("ok: AC Survey history migration, deltas, reset, source persistence, "
+          "weighted buckets, retention and pagination")
 
 
 if __name__ == "__main__":

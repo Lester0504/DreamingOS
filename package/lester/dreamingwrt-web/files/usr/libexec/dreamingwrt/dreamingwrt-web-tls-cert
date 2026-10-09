@@ -1,0 +1,206 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Generates the self-signed TLS certificate used by the DreamingWrt web console
+# on 443.
+#
+# Why this exists rather than reusing /etc/nginx/conf.d/_lan.crt: that cert is
+# produced by nginx-util with no subjectAltName extension. Chrome 58+ and Safari
+# ignore CN entirely and reject such a cert with ERR_CERT_COMMON_NAME_INVALID,
+# which on some builds offers no "proceed anyway" escape hatch. A self-signed
+# cert is expected to raise an untrusted-issuer warning; it must not raise a
+# name-mismatch error, because that is the variant users cannot click through.
+#
+# The private key never leaves the device: it is generated here on first boot,
+# and is not shipped in any package or repository.
+
+set -u
+
+CERT_DIR="/etc/dreamingwrt/tls"
+CERT="$CERT_DIR/console.crt"
+KEY="$CERT_DIR/console.key"
+# Apple's TLS server-trust policy (SecPolicyCreateSSL) rejects any leaf whose
+# validity window exceeds ~398 days with errSecCertificateValidityPeriodTooLong,
+# and Safari/Chrome enforce the same web-PKI hygiene rule. A cert over that cap
+# cannot complete a TLS handshake from iOS/macOS at all (this broke QR pairing),
+# so the window MUST stay under 398 days. A short-lived cert plus renewal is also
+# safer than a 10-year self-signed key that can never be rotated once leaked.
+DAYS=180
+# Re-sign once a third of the validity window remains, so the daily renewal cron
+# (or a reboot / system-settings change) has a wide margin to swap the new cert
+# in before the old one lapses and takes the HTTPS console + WebAuthn down.
+RENEW_WITHIN_DAYS=$((DAYS / 3))
+
+log() {
+	logger -t dreamingwrt-web-tls -p daemon.info "$*"
+	return 0
+}
+
+# Collect every name/address this box may legitimately be reached by. A cert
+# that lists only the current LAN IP breaks the moment the user changes the LAN
+# subnet, so include the hostname forms as well.
+collect_sans() {
+	local hostname custom_domain sans ip seen
+
+	hostname="$(uci -q get system.@system[0].hostname)"
+	[ -n "$hostname" ] || hostname="DreamingWrt"
+	custom_domain="$(uci -q get system.@system[0].console_domain)"
+
+	sans="DNS:$hostname,DNS:$hostname.local,DNS:$hostname.lan,DNS:localhost"
+	[ -n "$custom_domain" ] && sans="$sans,DNS:$custom_domain"
+	seen=""
+
+	for ip in $(ip -4 -o addr show scope global 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'); do
+		case " $seen " in *" $ip "*) continue ;; esac
+		seen="$seen $ip"
+		sans="$sans,IP:$ip"
+	done
+
+	case " $seen " in
+		*" 127.0.0.1 "*) ;;
+		*) sans="$sans,IP:127.0.0.1" ;;
+	esac
+
+	echo "$sans"
+}
+
+cert_covers_current_addresses() {
+	local text entry
+
+	text="$(openssl x509 -in "$CERT" -noout -text 2>/dev/null)" || return 1
+
+	for entry in $(collect_sans | tr ',' ' '); do
+		case "$entry" in
+			DNS:*)
+				echo "$text" | grep -qE "DNS:${entry#DNS:}([,[:space:]]|\$)" || {
+					log "certificate does not cover ${entry}, re-signing"
+					return 1
+				}
+				;;
+			IP:*)
+				echo "$text" | grep -qE "IP Address:${entry#IP:}([,[:space:]]|\$)" || {
+					log "certificate does not cover ${entry}, re-signing"
+					return 1
+				}
+				;;
+		esac
+	done
+	return 0
+}
+
+cert_still_good() {
+	[ -s "$CERT" ] && [ -s "$KEY" ] || return 1
+
+	openssl x509 -in "$CERT" -noout \
+		-checkend $((RENEW_WITHIN_DAYS * 86400)) >/dev/null 2>&1 || {
+		log "certificate expires within ${RENEW_WITHIN_DAYS}d, re-signing"
+		return 1
+	}
+
+	# A cert whose SAN list no longer covers the current addresses is as broken
+	# as an expired one from the browser's point of view.
+	cert_covers_current_addresses
+}
+
+generate() {
+	local sans tmp_key tmp_crt
+
+	sans="$(collect_sans)"
+	mkdir -p "$CERT_DIR" || return 1
+	chmod 0700 "$CERT_DIR"
+
+	tmp_key="$KEY.new.$$"
+	tmp_crt="$CERT.new.$$"
+
+	# P-256 rather than the 384-bit key nginx-util left behind: universally
+	# supported, and cheap enough for a router CPU to terminate on.
+	if ! openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+		-keyout "$tmp_key" -out "$tmp_crt" -days "$DAYS" -nodes -sha256 \
+		-subj "/C=ZZ/O=DreamingWrt/CN=DreamingWrt Web Console" \
+		-addext "subjectAltName=$sans" \
+		-addext "basicConstraints=critical,CA:FALSE" \
+		-addext "keyUsage=critical,digitalSignature,keyEncipherment" \
+		-addext "extendedKeyUsage=serverAuth" \
+		>/dev/null 2>&1; then
+		log "openssl failed to generate the certificate"
+		rm -f "$tmp_key" "$tmp_crt"
+		return 1
+	fi
+
+	# 600 while still under the temporary name, so the key is never briefly
+	# world-readable under its final name.
+	chmod 0600 "$tmp_key" || { rm -f "$tmp_key" "$tmp_crt"; return 1; }
+	chmod 0644 "$tmp_crt" || { rm -f "$tmp_key" "$tmp_crt"; return 1; }
+
+	# Same-directory rename so a reader never sees a half-written pair.
+	if ! mv "$tmp_key" "$KEY" || ! mv "$tmp_crt" "$CERT"; then
+		rm -f "$tmp_key" "$tmp_crt"
+		return 1
+	fi
+
+	log "generated self-signed console certificate with SAN $sans"
+	return 0
+}
+
+nginx_running() {
+	local p
+
+	for p in /proc/[0-9]*; do
+		tr '\000' ' ' < "$p/cmdline" 2>/dev/null | grep -q "nginx" && return 0
+	done
+	return 1
+}
+
+refresh() {
+	local backup
+
+	backup="$(umask 077; mktemp -d /tmp/dreamingwrt-tls-refresh.XXXXXX)" || return 1
+	[ -s "$CERT" ] && cp -p "$CERT" "$backup/console.crt"
+	[ -s "$KEY" ] && cp -p "$KEY" "$backup/console.key"
+	if ! generate; then
+		rm -rf "$backup"
+		return 1
+	fi
+	if nginx_running; then
+		if ! nginx -t >/dev/null 2>&1 ||
+		   ! /etc/init.d/nginx reload >/dev/null 2>&1; then
+			[ -s "$backup/console.crt" ] && cp -p "$backup/console.crt" "$CERT"
+			[ -s "$backup/console.key" ] && cp -p "$backup/console.key" "$KEY"
+			nginx -t >/dev/null 2>&1 &&
+				/etc/init.d/nginx reload >/dev/null 2>&1 || true
+			rm -rf "$backup"
+			return 1
+		fi
+	fi
+	rm -rf "$backup"
+	return 0
+}
+
+case "${1:-ensure}" in
+	ensure)
+		cert_still_good && exit 0
+		generate
+		;;
+	force)
+		generate
+		;;
+	refresh)
+		refresh
+		;;
+	renew)
+		# Idempotent periodic entry point (driven by the daily cron). Only
+		# re-sign and hot-reload nginx when the cert has actually entered its
+		# renewal window or its SANs no longer match, so running it every day
+		# never churns the key or the client-visible fingerprint needlessly.
+		cert_still_good && exit 0
+		refresh
+		;;
+	print)
+		[ -s "$CERT" ] || { echo "no certificate at $CERT" >&2; exit 1; }
+		openssl x509 -in "$CERT" -noout -subject -dates -ext subjectAltName
+		;;
+	*)
+		echo "usage: ${0##*/} [ensure|force|refresh|renew|print]" >&2
+		exit 1
+		;;
+esac

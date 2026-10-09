@@ -19,18 +19,106 @@ import apd_test_deps  # noqa: E402
 
 
 ROOT = Path(__file__).resolve().parents[1]
-SOURCE = ROOT / "src/jmx_netconfig_db.c"
+SOURCE = ROOT / "src/netconfig/033_nc_container.c"
 FIXTURE = ROOT / "tests/container_service_runtime_fixture.c"
 
 FUNCTIONS = (
     "nc_cmd_exists",
+    "nc_lxc_create_available",
+    "nc_lxc_read_text",
+    "nc_lxc_name_valid",
+    "nc_lxc_string",
+    "nc_lxc_bool",
+    "nc_lxc_error",
+    "nc_lxc_trim",
+    "nc_lxc_config_value",
+    "nc_lxc_path",
+    "nc_lxc_runtime_path",
+    "nc_lxc_root_add",
+    "nc_lxc_roots",
+    "nc_lxc_object",
+    "nc_lxc_exec_read",
+    "nc_lxc_job_kind",
+    "nc_lxc_jobs_conflict",
+    "nc_lxc_identity",
+    "nc_lxc_state",
+    "nc_lxc_job_stage",
+    "jmx_lxc_container_config_get",
+    "nc_lxc_document_db",
+    "nc_lxc_root_admit",
+    "nc_lxc_root_remember",
+    "nc_lxc_options",
+    "nc_lxc_mounts_validate",
+    "jmx_lxc_settings_save",
+    "jmx_lxc_config_get",
+    "nc_lxc_document_hash",
+    "nc_lxc_document_row",
+    "nc_lxc_document_fields",
+    "jmx_lxc_config_document_get",
+    "nc_lxc_document_render",
+    "nc_lxc_document_runtime_changed",
+    "nc_lxc_document_validate_fields",
+    "jmx_lxc_config_document_save",
+    "nc_lxc_document_plan",
+    "nc_lxc_document_submit",
+    "nc_lxc_document_replace",
+    "nc_lxc_document_finish",
+    "nc_lxc_document_execute",
+    "nc_lxc_catalog_collect",
+    "nc_lxc_catalog_fetch",
+    "nc_lxc_image_arch",
+    "nc_lxc_catalog_parse",
+    "jmx_lxc_templates_get",
+    "nc_lxc_subid",
+    "nc_lxc_bridge",
+    "nc_lxc_create_plan",
+    "nc_lxc_create_submit",
+    "nc_lxc_download_write",
+    "nc_lxc_download_file",
+    "nc_lxc_mount_token",
+    "nc_lxc_create_config",
+    "nc_lxc_created_record",
+    "nc_lxc_create_execute",
+    "nc_lxc_origin",
+    "nc_lxc_snapshot_name",
+    "nc_lxc_snapshot_entries",
+    "nc_lxc_maintenance_source",
+    "nc_lxc_maintenance_list",
+    "nc_lxc_copy_space",
+    "nc_lxc_maintenance_plan",
+    "nc_lxc_maintenance_submit",
+    "nc_lxc_copy_finish",
+    "nc_lxc_maintenance_execute",
+    "nc_lxc_validate_action",
+    "jmx_lxc_container_action",
+    "nc_lxc_job_execute",
+    "nc_container_job_row",
+    "jmx_docker_job_get",
+    "jmx_docker_jobs_list",
+    "nc_container_job_get_engine",
+    "nc_container_jobs_list_engine",
+    "nc_container_job_cancel_engine",
+    "jmx_lxc_job_get",
+    "jmx_lxc_jobs_list",
+    "jmx_lxc_job_cancel",
+
     "nc_container_job_register_worker",
     "nc_container_monotonic_ms",
     "nc_exec_result_free",
     "nc_exec_trim_output",
     "nc_exec_argv_capture_ex",
+    "nc_exec_argv_capture",
+    "nc_docker_member",
+    "nc_docker_copy",
+    "nc_docker_read_json",
+    "nc_docker_keys",
+    "nc_docker_string",
+    "nc_docker_integer",
+    "nc_docker_env_key",
+    "nc_docker_path",
     "nc_docker_name_valid",
     "nc_docker_image_id_valid",
+    "nc_docker_resource_id_valid",
     "nc_docker_hostname_valid",
     "nc_docker_label_key_valid",
     "nc_docker_label_value_valid",
@@ -39,6 +127,8 @@ FUNCTIONS = (
     "nc_docker_create_error",
     "nc_docker_create_field_supported",
     "nc_container_label_compare",
+    "nc_docker_create_extended",
+    "nc_docker_create_preflight",
     "nc_docker_create_normalize",
     "nc_docker_confirmation_required",
     "nc_docker_invalid",
@@ -47,8 +137,79 @@ FUNCTIONS = (
     "nc_container_job_worker_matches",
     "nc_container_jobs_reconcile",
     "nc_container_job_spawn",
+    "nc_docker_workflow_kind",
     "nc_container_job_submit",
     "jmx_docker_container_create",
+    "nc_docker_http_write",
+    "nc_docker_engine_request",
+    "nc_docker_ipv4_cidr",
+    "nc_docker_network_driver_available",
+    "nc_docker_network_parent_allowed",
+    "nc_docker_network_options",
+    "nc_docker_network_conflict",
+    "nc_docker_network_plan_for",
+    "nc_docker_network_plan",
+    "jmx_docker_network_create",
+    "nc_docker_raw_container",
+    "nc_docker_container_revision",
+    "nc_docker_container_template",
+    "nc_docker_replace_submit",
+    "nc_docker_replacement_networks",
+    "nc_docker_disconnect_networks",
+    "nc_docker_restore_networks",
+    "nc_docker_set_restart",
+    "nc_docker_replacement_body",
+    "nc_docker_recreate_record",
+    "nc_docker_replace_execute",
+    "nc_docker_recover_execute",
+    "nc_docker_recover_submit",
+    "nc_docker_network_raw",
+    "nc_docker_network_snapshot",
+    "nc_docker_network_revision",
+    "nc_docker_network_edit_read",
+    "nc_docker_network_rebuild_submit",
+    "nc_docker_network_definition",
+    "nc_docker_network_endpoints_apply",
+    "nc_docker_network_endpoints_verify",
+    "nc_docker_network_restore",
+    "nc_docker_network_rebuild_execute",
+
+    "nc_docker_cleanup_revision",
+    "nc_docker_cleanup_get",
+    "nc_docker_cleanup_item",
+    "nc_docker_cleanup_preview",
+    "nc_docker_cleanup_find",
+    "nc_docker_cleanup_validate",
+    "nc_docker_cleanup_execute",
+    "nc_docker_compose_available",
+    "nc_docker_compose_build_available",
+    "nc_docker_import_open",
+    "nc_docker_image_archive",
+    "nc_docker_workflow_schema",
+    "nc_docker_compose_id",
+    "nc_docker_compose_random_id",
+    "nc_docker_compose_file_close",
+    "nc_docker_compose_file_open",
+    "nc_docker_compose_directory",
+    "nc_docker_compose_path",
+    "nc_docker_compose_model",
+    "nc_docker_compose_validate",
+    "nc_docker_compose_meta",
+    "nc_docker_compose_yaml",
+    "nc_docker_compose_busy",
+    "nc_docker_compose_save",
+    "nc_docker_registry_search",
+    "nc_docker_compose_list",
+    "nc_docker_compose_exec",
+    "nc_docker_compose_action",
+    "jmx_docker_workbench_read",
+    "jmx_docker_workbench_write",
+    "nc_docker_workflow_execute",
+    "nc_docker_pull_flush",
+    "nc_docker_pull_line",
+    "nc_docker_pull_stream",
+    "nc_docker_pull_execute",
+    "jmx_docker_image_pull",
     "jmx_docker_job_worker",
     "jmx_docker_job_cancel",
 )
@@ -91,6 +252,8 @@ def _definition(source: str, name: str) -> str:
     for match in re.finditer(rf"\b{re.escape(name)}\s*\(", source):
         line_start = source.rfind("\n", 0, match.start()) + 1
         prefix = source[line_start:match.start()]
+        if not re.match(r"^(?:static\s+)?(?:const\s+)?(?:int|int64_t|void|char|struct json_object|size_t)\b", prefix):
+            continue
         if "typedef" in prefix or prefix.lstrip().startswith("#"):
             continue
         opening = source.find("{", match.end())
@@ -148,16 +311,37 @@ def _macro(source: str, name: str) -> str:
     return source[match.start():end]
 
 
-def write_production_includes(defs_path: Path, impl_path: Path) -> None:
+def write_production_includes(defs_path: Path, impl_path: Path, lxc_fixture: bool = False) -> None:
     source = SOURCE.read_text(encoding="utf-8")
+    source = re.sub(r'#include "(033_nc_(?:docker|lxc)_[^"\n]+)"',
+                    lambda m: (SOURCE.parent / m[1]).read_text(), source)
+    source = re.sub(r'#include "(033_nc_(?:docker|lxc)_[^"\n]+)"',
+                    lambda m: (SOURCE.parent / m[1]).read_text(), source)
+    source += "\n" + (ROOT / "src/netconfig/024_nc_system_settings.c").read_text()
+    if lxc_fixture:
+        source=source.replace(_definition(source,"nc_lxc_catalog_fetch"),'''static char *nc_lxc_catalog_fetch(struct json_object *out) {
+            (void)nc_lxc_catalog_collect;const char *value=getenv("LXC_TEST_INDEX");
+            if(!value){nc_lxc_error(out,"template_source_unavailable");return NULL;}return strdup(value);
+        }''')
+        source=source.replace(_definition(source,"nc_lxc_download_file"),'''static int nc_lxc_download_file(const char *url,const char *path,size_t limit,sqlite3 *jobs,const char *id,struct json_object *result) {
+            (void)url;(void)limit;(void)jobs;(void)id;(void)nc_lxc_download_write;
+            if(getenv("LXC_TEST_DOWNLOAD_FAIL"))return nc_lxc_error(result,"template_download_failed");
+            FILE *f=fopen(path,"wx");if(!f)return nc_lxc_error(result,"lxc_download_storage_failed");
+            fputs("transport fixture only",f);fclose(f);return 0;
+        }''')
     assert "#ifndef NC_CONTAINER_JOB_DB_PATH" in source
     assert "#ifndef NC_CONTAINER_JOB_EXEC_PATH" in source
     assert "execl(NC_CONTAINER_JOB_EXEC_PATH" in source
     defs_path.write_text(
-        "\n".join(_macro(source, name) for name in MACROS) + "\n",
+        "\n".join(_macro(source, name) for name in MACROS) + "\n" + re.search(r"struct nc_docker_pull \{.*?\n\};", source, re.S)[0] + "\n" +
+        re.search(r"struct nc_lxc_catalog_buffer \{[^\n]+\};",source)[0]+"\n"+
+        re.search(r"struct nc_lxc_download \{[^\n]+\};",source)[0]+"\n"+
+        "\n".join("#ifndef "+name+"\n"+_macro(source,name)+"\n#endif" for name in ("NC_LXC_TEMPLATE_DIR","NC_LXC_IMAGE_ORIGIN","NC_LXC_DEFAULT_CONFIG","NC_LXC_SUBUID","NC_LXC_SUBGID","NC_LXC_BRIDGE_ROOT"))+"\n",
         encoding="utf-8",
     )
     impl_path.write_text(
+        "#ifndef NC_LXC_SYSTEM_CONFIG\n#define NC_LXC_SYSTEM_CONFIG \"/etc/lxc/lxc.conf\"\n#endif\n" +
+        "\n".join(_definition(source,name).split("{",1)[0].strip()+";" for name in FUNCTIONS) + "\n" +
         "\n\n".join(_definition(source, name) for name in FUNCTIONS) + "\n",
         encoding="utf-8",
     )
@@ -185,20 +369,48 @@ def json_c_flags() -> list[str]:
     return apd_test_deps.package_flags("json-c")
 
 
-def compile_fixture(temp: Path, db: Path) -> Path:
+def compile_fixture(temp: Path, db: Path, settings: bool = False, engine_socket: Path | None = None, migration: bool = False, lxc_fixture: bool = False, lxc_boot: bool = False) -> Path:
     compiler = shutil.which("cc") or shutil.which("clang") or shutil.which("gcc")
     assert compiler, "native C compiler unavailable"
     defs = temp / "container_service_runtime_defs.inc"
     implementation = temp / "container_service_runtime_impl.inc"
     executable = temp / "container-runtime"
-    write_production_includes(defs, implementation)
+    (temp / "cgroup.controllers").write_text("cpu memory pids\n")
+    with sqlite3.connect(temp / "config.db"):
+        pass
+    write_production_includes(defs, implementation, lxc_fixture)
     command = [
-        compiler, "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread",
+        compiler, "-std=c11", "-D_POSIX_C_SOURCE=200809L", "-Wall", "-Wextra", "-Werror", "-pthread",
         "-I", str(temp),
         f'-DNC_CONTAINER_JOB_DB_PATH="{db}"',
         f'-DNC_CONTAINER_JOB_EXEC_PATH="{executable}"',
-        str(FIXTURE), "-lsqlite3", *json_c_flags(), "-o", str(executable),
+        f'-DNC_LXC_CONFIG_DB="{temp / "config.db"}"',
+        f'-DNC_LXC_CGROUP_CONTROLLERS="{temp / "cgroup.controllers"}"',
+        "-I", str(ROOT / "src"), "-DAC_SECRETS_TESTING",
+        f'-DNC_CONTAINER_SECRET_KEY_PATH="{temp / "container-secrets.key"}"',
+        str(FIXTURE), str(ROOT / "src/ac/ac_secrets.c"), "-lsqlite3",
+        *apd_test_deps.package_flags("openssl"), *apd_test_deps.package_flags("libcurl"), *json_c_flags(), "-o", str(executable),
     ]
+    if engine_socket:
+        command += [f'-DNC_DOCKER_ENGINE_SOCKET="{engine_socket}"']
+    if lxc_boot:
+        command += ['-DLXC_BOOT_TESTING',f'-DNC_LXC_BOOT_MARKER="{temp / "boot-marker"}"']
+    if lxc_fixture:
+        for macro,path in [('NC_LXC_TEMPLATE_DIR','templates'),('NC_LXC_DEFAULT_CONFIG','default.conf'),('NC_LXC_SUBUID','subuid'),('NC_LXC_SUBGID','subgid'),('NC_LXC_BRIDGE_ROOT','net')]:
+            command += [f'-D{macro}="{temp / path}"']
+    if settings:
+        prefix, shared = apd_test_deps.resolve_prefix("uci", "uci.h")
+        assert shared, "settings integration requires a linkable native libuci"
+        command += ["-DDOCKER_SETTINGS_TESTING", "-I", str(prefix / "include"),
+                    "-L", str(prefix / "lib"), "-luci", f"-Wl,--disable-new-dtags,-rpath,{prefix / 'lib'}",
+                    f'-DNC_DOCKER_SETTINGS_DB="{temp / "config.db"}"',
+                    f'-DNC_DOCKER_UCI_DIR="{temp / "uci"}"',
+                    f'-DNC_DOCKER_INIT="{temp / "init-dockerd"}"',
+                    f'-DNC_DOCKER_SETTINGS_LOCK="{temp / "settings.lock"}"',
+                    f'-DNC_DOCKER_UCI_DELTA="{temp / "uci-delta"}"']
+    if migration:
+        command = [x.replace(f"-Wl,--disable-new-dtags,-rpath,{prefix / 'lib'}", f"-Wl,--disable-new-dtags,-rpath,{temp / 'libs'}") for x in command]
+        command += [f"-Wl,-rpath-link,{prefix / 'lib'}", "-DDOCKER_MIGRATION_TESTING", f'-DNC_DOCKER_MIGRATION_LOCK="{temp / "migration.lock"}"']
     proc = subprocess.run(command, text=True, capture_output=True)
     assert proc.returncode == 0, f"fixture compile failed:\n{proc.stdout}\n{proc.stderr}"
     return executable
@@ -216,13 +428,21 @@ import sys
 record = Path(os.environ["DREAMINGWRT_FAKE_DOCKER_RECORD"])
 with record.open("a", encoding="utf-8") as stream:
     stream.write(json.dumps(sys.argv[1:], separators=(",", ":")) + "\\n")
-if sys.argv[1:2] == ["create"]:
+if sys.argv[1:3] == ["image", "inspect"]:
+    if "missing:1" in sys.argv:
+        raise SystemExit(1)
+    print('[{"Id":"sha256:example"}]')
+elif sys.argv[1:3] == ["volume", "inspect"]:
+    print('[{"Name":"data"}]')
+elif sys.argv[1:2] == ["start"]:
+    print(os.environ["DREAMINGWRT_FAKE_CONTAINER_ID"])
+elif sys.argv[1:2] == ["create"]:
     if "registry.example/slow:1" in sys.argv[2:]:
         import time
         time.sleep(30)
     print(os.environ["DREAMINGWRT_FAKE_CONTAINER_ID"])
 elif sys.argv[1:2] == ["inspect"]:
-    print("/runtime-generated")
+    print("true" if "{{.State.Running}}" in sys.argv else "/runtime-generated")
 else:
     print("unexpected fake docker argv", file=sys.stderr)
     raise SystemExit(64)
@@ -362,12 +582,51 @@ def main() -> None:
         assert value["state"] == "success" and value["rc"] == 0
         assert value["result_id"] == CONTAINER_ID
         assert value["result_name"] == "runtime-test"
-        assert records(record)[0] == [
+        assert next(x for x in records(record) if x[0] == "create") == [
             "create", "--name", "runtime-test", "--hostname", "runtime.local",
             "--restart", "unless-stopped", "--network", "bridge",
             "--label", "a.first=first", "--label", "z.last=last",
             "registry.example/app:1", "serve", "--listen", "0.0.0.0:8080",
         ]
+
+        # Additive fields are executed, not silently dropped. Secrets never reach
+        # the persisted job request, task output or process argv.
+        extended = {"confirm": True, "image": "registry.example/app:1", "name": "extended",
+                    "ports": [{"host_ip": "127.0.0.1", "host_port": 49287, "container_port": 80, "protocol": "tcp"}],
+                    "mounts": [{"type": "volume", "source": "data", "target": "/data", "read_only": True}],
+                    "env": {"DEMO_SECRET": "container-test-secret-value", "PATH": "/test-container-only"},
+                    "resources": {"memory_bytes": 67108864, "cpu_shares": 128},
+                    "start_after_create": True}
+        submitted = json.loads(run(executable, env, "create", json.dumps(extended)).stdout)
+        value = wait_terminal(db, submitted["job_id"])
+        assert value["state"] == "success", dict(value)
+        assert json.loads(value["request_json"]) == {"secret_ref": submitted["job_id"]}
+        assert "container-test-secret-value" not in value["output"]
+        created = [x for x in records(record) if x[0] == "create"][-1]
+        assert "127.0.0.1:49287:80/tcp" in created
+        assert "type=volume,source=data,target=/data,readonly" in created
+        assert created[created.index("--memory") + 1] == "67108864"
+        assert created[created.index("--cpu-shares") + 1] == "128"
+        assert "--env-file" in created and "container-test-secret-value" not in str(created)
+        assert ["start", CONTAINER_ID] in records(record)
+        assert ["inspect", "--format", "{{.State.Running}}", CONTAINER_ID] in records(record)
+        with sqlite3.connect(db) as conn:
+            assert conn.execute("SELECT length(ciphertext) FROM ac_secrets WHERE secret_id=?", ("docker-" + submitted["job_id"],)).fetchone()[0] > 0
+        assert b"container-test-secret-value" not in db.read_bytes()
+        for changed, field in [({"ports": [extended["ports"][0], extended["ports"][0]]}, "ports[1].host_port"),
+                               ({"ports": [{"host_port": 70000, "container_port": 80, "protocol": "tcp"}]}, "ports[0].host_port"),
+                               ({"mounts": [{"type": "bind", "source": "/", "target": "/data"}]}, "mounts[0].source"),
+                               ({"resources": {"cpu_percent": 50}}, "resources"),
+                               ({"env": {"BAD-KEY": "x"}}, "env"),
+                               ({"env": {"A": "a\nb"}}, "env")]:
+            invalid = {"image": extended["image"], **changed}
+            result = json.loads(run(executable, env, "normalize", json.dumps(invalid), expected=1).stdout)
+            assert result["field"] == field, result
+        before = records(record)
+        invalid = {"confirm": True, "image": "missing:1"}
+        result = json.loads(run(executable, env, "create", json.dumps(invalid), expected=1).stdout)
+        assert result["error"] == "image_unavailable"
+        assert not any(x[0] == "create" for x in records(record)[len(before):])
 
         # Without a requested name the worker persists Docker's inspected name.
         second_request = {"confirm": True, "image": "registry.example/unnamed:2"}

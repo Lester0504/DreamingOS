@@ -1,0 +1,26 @@
+#!/bin/sh
+# Retained /etc Nginx files survive A/B upgrades. Add only the image bridge;
+# never replace user/other-task routes. No reload: firstboot starts Nginx later.
+snippet=/usr/share/dreamingwrt/nginx/device-images.inc
+[ -s "$snippet" ] || exit 1
+for directory in /etc/nginx/conf.d /etc/dreamingos/nginx/conf.d; do
+	for file in "$directory/dreamingwrt-webd.locations" \
+		"$directory/luci-12517.conf" "$directory/luci-12517.conf.disabled"; do
+		[ -f "$file" ] || continue
+		grep -Fq "$snippet" "$file" && continue
+		# An existing explicit bridge is left to its owner, avoiding duplicates.
+		grep -Eq '^[[:space:]]*location[[:space:]]+\^~[[:space:]]+/luci-static/dreamingwrt/fingerprint/images/' "$file" && continue
+		case "$file" in
+			*.locations) cat "$file" > "$file.images-tmp" || exit 1
+				printf '\ninclude %s;\n' "$snippet" >> "$file.images-tmp" || exit 1 ;;
+			*) # Only the known LuCI server template is edited.
+				grep -Eq '^[[:space:]]*include conf.d/luci.locations;' "$file" || continue
+				sed "/^[[:space:]]*include conf.d\/luci.locations;/a\\
+\tinclude $snippet;
+" "$file" > "$file.images-tmp" || exit 1 ;;
+		esac
+		[ -f "$file.before-device-images" ] || cp -p "$file" "$file.before-device-images" || exit 1
+		mv "$file.images-tmp" "$file" || exit 1
+	done
+done
+exit 0

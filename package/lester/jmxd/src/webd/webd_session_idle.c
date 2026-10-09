@@ -123,6 +123,10 @@ int webd_session_idle_migrate(sqlite3 *config_db, sqlite3 *app_db)
                         "session_id TEXT NOT NULL DEFAULT ''") != 0 ||
         idle_add_column(app_db, "web_sessions", "last_activity_at",
                         "last_activity_at INTEGER NOT NULL DEFAULT 0") != 0 ||
+        idle_add_column(app_db, "web_sessions", "refresh_consumed_at",
+                        "refresh_consumed_at INTEGER NOT NULL DEFAULT 0") != 0 ||
+        idle_add_column(app_db, "web_sessions", "replaced_by",
+                        "replaced_by TEXT NOT NULL DEFAULT ''") != 0 ||
         idle_exec(app_db,
                   "UPDATE web_sessions SET last_activity_at=created_at "
                   "WHERE last_activity_at<=0") != 0 ||
@@ -307,6 +311,48 @@ static int idle_session_read(sqlite3 *app_db, const char *token,
     if (row->last_activity_at <= 0)
         row->last_activity_at = row->created_at;
     return WEBD_SESSION_IDLE_OK;
+}
+
+static int idle_consumed_refresh_read(sqlite3 *app_db, const char *token,
+                                      struct webd_session_row *row)
+{
+    sqlite3_stmt *statement = NULL;
+    const char *username;
+    const char *session_id;
+    int rc;
+
+    if (!app_db || !token || !row || sqlite3_prepare_v2(
+            app_db,
+            "SELECT username,session_id,created_at,expires_at,last_activity_at "
+            "FROM web_sessions WHERE token=?1 AND type='refresh' "
+            "AND revoked<>0 AND refresh_consumed_at>0 LIMIT 1",
+            -1, &statement, NULL) != SQLITE_OK)
+        return WEBD_SESSION_IDLE_DB_ERROR;
+    sqlite3_bind_text(statement, 1, token, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(statement);
+    if (rc == SQLITE_DONE) {
+        sqlite3_finalize(statement);
+        return WEBD_SESSION_IDLE_TOKEN_INVALID;
+    }
+    if (rc != SQLITE_ROW) {
+        sqlite3_finalize(statement);
+        return WEBD_SESSION_IDLE_DB_ERROR;
+    }
+    username = (const char *)sqlite3_column_text(statement, 0);
+    session_id = (const char *)sqlite3_column_text(statement, 1);
+    memset(row, 0, sizeof(*row));
+    if (!idle_text_ok(username, sizeof(row->username) - 1) ||
+        !idle_text_ok(session_id, sizeof(row->session_id) - 1)) {
+        sqlite3_finalize(statement);
+        return WEBD_SESSION_IDLE_TOKEN_INVALID;
+    }
+    snprintf(row->username, sizeof(row->username), "%s", username);
+    snprintf(row->session_id, sizeof(row->session_id), "%s", session_id);
+    row->created_at = sqlite3_column_int64(statement, 2);
+    row->expires_at = sqlite3_column_int64(statement, 3);
+    row->last_activity_at = sqlite3_column_int64(statement, 4);
+    sqlite3_finalize(statement);
+    return WEBD_SESSION_IDLE_REUSED;
 }
 
 static int idle_family_update(sqlite3 *app_db,
@@ -498,8 +544,29 @@ int webd_session_idle_refresh_issue(sqlite3 *config_db, sqlite3 *app_db,
     if (idle_exec(app_db, "BEGIN IMMEDIATE") != 0)
         return WEBD_SESSION_IDLE_DB_ERROR;
     result = idle_session_read(app_db, refresh_token, "refresh", now, &row);
-    if (result != WEBD_SESSION_IDLE_OK)
+    if (result != WEBD_SESSION_IDLE_OK) {
+        /* Another request may have consumed this exact token after the first
+         * optimistic read.  Treat that race as reuse, not as a generic
+         * invalid token, and revoke the family while the transaction is held. */
+        if (result == WEBD_SESSION_IDLE_TOKEN_INVALID) {
+            struct webd_session_row consumed;
+            int consumed_result = idle_consumed_refresh_read(
+                app_db, refresh_token, &consumed);
+            if (consumed_result == WEBD_SESSION_IDLE_REUSED) {
+                if (idle_family_update(app_db, &consumed, now, 1) != 0) {
+                    result = WEBD_SESSION_IDLE_DB_ERROR;
+                    goto rollback;
+                }
+                if (idle_exec(app_db, "COMMIT") != 0) {
+                    idle_rollback(app_db);
+                    return WEBD_SESSION_IDLE_DB_ERROR;
+                }
+                result = WEBD_SESSION_IDLE_REUSED;
+                return result;
+            }
+        }
         goto rollback;
+    }
     idle_info_set(info, &row, timeout_min);
     if (idle_is_expired(now, row.last_activity_at, timeout_min)) {
         if (idle_family_update(app_db, &row, now, 1) != 0) {
@@ -531,6 +598,143 @@ rollback:
     return result;
 }
 
+int webd_session_idle_refresh_rotate(sqlite3 *config_db, sqlite3 *app_db,
+                                     const char *refresh_token,
+                                     const char *new_access_token,
+                                     const char *new_refresh_token,
+                                     int64_t access_expires_at, int64_t now,
+                                     struct webd_session_idle_info *info,
+                                     int64_t *refresh_expires_at)
+{
+    struct webd_session_row row;
+    int timeout_min;
+    int result;
+
+    if (refresh_expires_at)
+        *refresh_expires_at = 0;
+    if (!config_db || !app_db || !idle_text_ok(refresh_token, 256) ||
+        !idle_text_ok(new_access_token, 256) ||
+        !idle_text_ok(new_refresh_token, 256) ||
+        !strcmp(refresh_token, new_access_token) ||
+        !strcmp(refresh_token, new_refresh_token) ||
+        !strcmp(new_access_token, new_refresh_token) || now < 0 ||
+        access_expires_at <= now)
+        return WEBD_SESSION_IDLE_INVALID_ARGUMENT;
+    result = idle_session_read(app_db, refresh_token, "refresh", now, &row);
+    if (result != WEBD_SESSION_IDLE_OK) {
+        if (result != WEBD_SESSION_IDLE_TOKEN_INVALID)
+            return result;
+        result = idle_consumed_refresh_read(app_db, refresh_token, &row);
+        if (result != WEBD_SESSION_IDLE_REUSED)
+            return result;
+        if (idle_exec(app_db, "BEGIN IMMEDIATE") != 0)
+            return WEBD_SESSION_IDLE_DB_ERROR;
+        if (idle_family_update(app_db, &row, now, 1) != 0 ||
+            idle_exec(app_db, "COMMIT") != 0) {
+            idle_rollback(app_db);
+            return WEBD_SESSION_IDLE_DB_ERROR;
+        }
+        return WEBD_SESSION_IDLE_REUSED;
+    }
+    result = webd_session_idle_timeout_get(config_db, row.username,
+                                           &timeout_min);
+    if (result != WEBD_SESSION_IDLE_OK)
+        return result;
+    if (idle_exec(app_db, "BEGIN IMMEDIATE") != 0)
+        return WEBD_SESSION_IDLE_DB_ERROR;
+    result = idle_session_read(app_db, refresh_token, "refresh", now, &row);
+    if (result != WEBD_SESSION_IDLE_OK)
+        goto rollback;
+    idle_info_set(info, &row, timeout_min);
+    if (idle_is_expired(now, row.last_activity_at, timeout_min)) {
+        if (idle_family_update(app_db, &row, now, 1) != 0) {
+            result = WEBD_SESSION_IDLE_DB_ERROR;
+            goto rollback;
+        }
+        if (idle_exec(app_db, "COMMIT") != 0) {
+            idle_rollback(app_db);
+            return WEBD_SESSION_IDLE_DB_ERROR;
+        }
+        return WEBD_SESSION_IDLE_TIMEOUT;
+    }
+    /* A successful rotation is one-time: atomically consume this exact row.
+     * If another request won the race, revoke the whole family and report
+     * reuse instead of minting another access token. */
+    {
+        sqlite3_stmt *statement = NULL;
+        int rc;
+        if (sqlite3_prepare_v2(app_db,
+                "UPDATE web_sessions SET revoked=1,refresh_consumed_at=?2,"
+                "replaced_by=?3 WHERE token=?1 "
+                "AND type='refresh' AND revoked=0", -1, &statement, NULL) != SQLITE_OK) {
+            result = WEBD_SESSION_IDLE_DB_ERROR;
+            goto rollback;
+        }
+        sqlite3_bind_text(statement, 1, refresh_token, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(statement, 2, now);
+        sqlite3_bind_text(statement, 3, new_refresh_token, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(statement);
+        sqlite3_finalize(statement);
+        if (rc != SQLITE_DONE) {
+            result = WEBD_SESSION_IDLE_DB_ERROR;
+            goto rollback;
+        }
+        if (sqlite3_changes(app_db) != 1) {
+            result = WEBD_SESSION_IDLE_TOKEN_INVALID;
+            goto rollback;
+        }
+    }
+    if (idle_family_update(app_db, &row, now, 0) != 0 ||
+        idle_insert_row(app_db, new_access_token, row.username, "access",
+                        row.session_id, now, access_expires_at) != 0 ||
+        idle_insert_row(app_db, new_refresh_token, row.username, "refresh",
+                        row.session_id, now, row.expires_at) != 0) {
+        result = WEBD_SESSION_IDLE_DB_ERROR;
+        goto rollback;
+    }
+    if (idle_exec(app_db, "COMMIT") != 0) {
+        idle_rollback(app_db);
+        return WEBD_SESSION_IDLE_DB_ERROR;
+    }
+    row.last_activity_at = now;
+    idle_info_set(info, &row, timeout_min);
+    if (refresh_expires_at)
+        *refresh_expires_at = row.expires_at;
+    return WEBD_SESSION_IDLE_OK;
+
+rollback:
+    idle_rollback(app_db);
+    return result;
+}
+
+int webd_session_idle_gc(sqlite3 *app_db, int64_t now, int64_t retention_s,
+                         int limit, int *deleted_out)
+{
+    sqlite3_stmt *statement = NULL;
+    int rc;
+
+    if (deleted_out)
+        *deleted_out = 0;
+    if (!app_db || now < 0 || retention_s < 0 || limit <= 0)
+        return WEBD_SESSION_IDLE_INVALID_ARGUMENT;
+    if (sqlite3_prepare_v2(app_db,
+            "DELETE FROM web_sessions WHERE rowid IN (SELECT rowid FROM web_sessions "
+            "WHERE expires_at<=?1 AND expires_at<=?2 "
+            "OR (revoked<>0 AND created_at<=?2) "
+            "ORDER BY expires_at ASC LIMIT ?3)", -1, &statement, NULL) != SQLITE_OK)
+        return WEBD_SESSION_IDLE_DB_ERROR;
+    sqlite3_bind_int64(statement, 1, now);
+    sqlite3_bind_int64(statement, 2, now - retention_s);
+    sqlite3_bind_int(statement, 3, limit);
+    rc = sqlite3_step(statement);
+    sqlite3_finalize(statement);
+    if (rc != SQLITE_DONE)
+        return WEBD_SESSION_IDLE_DB_ERROR;
+    if (deleted_out)
+        *deleted_out = sqlite3_changes(app_db);
+    return WEBD_SESSION_IDLE_OK;
+}
+
 const char *webd_session_idle_error(int result)
 {
     switch (result) {
@@ -540,6 +744,8 @@ const char *webd_session_idle_error(int result)
         return "invalid_web_session";
     case WEBD_SESSION_IDLE_USER_NOT_FOUND:
         return "web_user_not_found";
+    case WEBD_SESSION_IDLE_REUSED:
+        return "refresh_token_reused";
     case WEBD_SESSION_IDLE_DB_ERROR:
         return "web_session_state_unavailable";
     case WEBD_SESSION_IDLE_INVALID_ARGUMENT:

@@ -1,0 +1,390 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+# Transactional apply/rollback executor for DreamingOS WEB access controls.
+# stdout carries one JSON line; stderr is diagnostics only.
+
+set -u
+
+CONF_DIR="/etc/nginx/conf.d"
+NGINX_CONF="/etc/nginx/nginx.conf"
+SSL_CONF="$CONF_DIR/dreamingwrt-console-ssl.conf"
+WEB_LOCATIONS="$CONF_DIR/dreamingwrt-webd.locations"
+RESTRICT_LOCAL="/etc/nginx/restrict_locally"
+RESTRICT_CONSOLE="/etc/nginx/restrict_console"
+FORCE_FILE="$CONF_DIR/force-https.locations"
+CERT="/etc/dreamingwrt/tls/console.crt"
+KEY="/etc/dreamingwrt/tls/console.key"
+BACKUP_ROOT="/etc/dreamingwrt/backups"
+CERT_TOOL="/usr/libexec/dreamingwrt/dreamingwrt-web-tls-cert"
+STATE="/etc/dreamingwrt/web-access.json"
+UCI_CONFIG="/etc/config/nginx"
+UCI_SECTION="nginx._lan"
+LOCK_DIR="/var/lock/dreamingwrt-web-access.apply.lock"
+BACKUP=""
+
+say() { echo "$*" >&2; }
+
+json_escape() {
+  printf '%s' "$1" | sed 's/[\\"]/\\&/g'
+}
+
+ok_out() {
+  local backup="$1"
+  if [ -n "$backup" ]; then
+    printf '{"ok":true,"executor":"web_access_apply_v1","backup":"%s"}\n' "$(json_escape "$backup")"
+  else
+    printf '{"ok":true,"executor":"web_access_apply_v1"}\n'
+  fi
+}
+
+fail_out() {
+  local code="$1" message="$2" field="$3"
+  [ -n "$message" ] || message="web access apply failed"
+  if [ -n "$field" ]; then
+    printf '{"ok":false,"error":{"code":"%s","message":"%s","details":{"field":"%s"}}}\n' "$code" "$(json_escape "$message")" "$(json_escape "$field")"
+  else
+    printf '{"ok":false,"error":{"code":"%s","message":"%s"}}\n' "$code" "$(json_escape "$message")"
+  fi
+  exit 1
+}
+
+nginx_running() {
+  local p
+  for p in /proc/[0-9]*; do
+    tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q "nginx" && return 0
+  done
+  return 1
+}
+
+acquire_lock() {
+  mkdir -p /var/lock 2>/dev/null ||
+    fail_out "lock_unavailable" "could not create the web access lock directory" ""
+  mkdir "$LOCK_DIR" 2>/dev/null ||
+    fail_out "web_access_apply_busy" "another web access change is already applying" ""
+  trap 'rmdir "$LOCK_DIR" 2>/dev/null || true' EXIT
+  trap 'exit 1' HUP INT TERM
+}
+
+backup_file() {
+  local source="$1" name="$2" required="$3"
+
+  if [ -e "$source" ]; then
+    cp -p "$source" "$BACKUP/$name" || return 1
+    : > "$BACKUP/$name.present" || return 1
+    return 0
+  fi
+  [ "$required" = "0" ]
+}
+
+backup() {
+  local ts dir
+  ts="$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$BACKUP_ROOT" || return 1
+  dir="$(umask 077; mktemp -d "$BACKUP_ROOT/web-access-$ts-XXXXXX")" || return 1
+  BACKUP="$dir"
+  backup_file "$NGINX_CONF" "nginx.conf" 1 || return 1
+  backup_file "$UCI_CONFIG" "nginx.uci" 1 || return 1
+  backup_file "$SSL_CONF" "dreamingwrt-console-ssl.conf" 1 || return 1
+  backup_file "$WEB_LOCATIONS" "dreamingwrt-webd.locations" 1 || return 1
+  backup_file "$RESTRICT_LOCAL" "restrict_locally" 1 || return 1
+  backup_file "$RESTRICT_CONSOLE" "restrict_console" 0 || return 1
+  backup_file "$FORCE_FILE" "force-https.locations" 0 || return 1
+  backup_file "$CERT" "console.crt" 0 || return 1
+  backup_file "$KEY" "console.key" 0 || return 1
+  echo "$dir"
+}
+
+restore_file() {
+  local target="$1" name="$2" tmp
+
+  if [ -e "$BACKUP/$name.present" ]; then
+    tmp="$target.restore-$$"
+    cp -p "$BACKUP/$name" "$tmp" || return 1
+    mv "$tmp" "$target" || return 1
+  else
+    rm -f "$target" || return 1
+  fi
+}
+
+restore_backup_files() {
+  [ -n "$BACKUP" ] || return 0
+  restore_file "$NGINX_CONF" "nginx.conf" &&
+  restore_file "$SSL_CONF" "dreamingwrt-console-ssl.conf" &&
+  restore_file "$WEB_LOCATIONS" "dreamingwrt-webd.locations" &&
+  restore_file "$RESTRICT_LOCAL" "restrict_locally" &&
+  restore_file "$RESTRICT_CONSOLE" "restrict_console" &&
+  restore_file "$FORCE_FILE" "force-https.locations" &&
+  restore_file "$CERT" "console.crt" &&
+  restore_file "$KEY" "console.key"
+}
+
+restore_uci() {
+  [ -n "$BACKUP" ] || return 0
+  restore_file "$UCI_CONFIG" "nginx.uci"
+}
+
+rollback_nginx() {
+  restore_backup_files && restore_uci &&
+  nginx -t >/dev/null 2>&1 && /etc/init.d/nginx reload >/dev/null 2>&1
+}
+
+write_state() {
+  printf '{"force_https":%s,"http_port":%s,"https_port":%s,"external_access":"%s"}\n' "$1" "$2" "$3" "$4" > "$STATE.new"
+  chmod 0644 "$STATE.new"
+  mv "$STATE.new" "$STATE"
+}
+
+write_restrict_console() {
+  local mode="$1"
+  {
+    echo "allow ::1;"
+    echo "allow fc00::/7;"
+    echo "allow fec0::/10;"
+    echo "allow fe80::/10;"
+    echo "allow 127.0.0.0/8;"
+    echo "allow 10.0.0.0/8;"
+    echo "allow 172.16.0.0/12;"
+    echo "allow 192.168.0.0/16;"
+    echo "allow 169.254.0.0/16;"
+    case "$mode" in
+      ipv4) echo "allow 0.0.0.0/0;" ;;
+      ipv6) echo "allow ::/0;" ;;
+      dual) echo "allow 0.0.0.0/0;"; echo "allow ::/0;" ;;
+    esac
+    echo "deny all;"
+  } > "$RESTRICT_CONSOLE.new"
+  chmod 0644 "$RESTRICT_CONSOLE.new"
+  mv "$RESTRICT_CONSOLE.new" "$RESTRICT_CONSOLE"
+}
+
+write_force_file() {
+  local enabled="$1" https_port="$2" port_suffix=""
+  if [ "$enabled" = "1" ]; then
+    [ "$https_port" != "443" ] && port_suffix=":$https_port"
+    cat > "$FORCE_FILE.new" <<EOF
+if (\$scheme = http) {
+    return 301 https://\$host$port_suffix\$request_uri;
+}
+EOF
+    chmod 0644 "$FORCE_FILE.new"
+    mv "$FORCE_FILE.new" "$FORCE_FILE"
+  else
+    rm -f "$FORCE_FILE"
+  fi
+}
+
+swap_restrict() {
+  local target="$1" from="$2" to="$3"
+  [ -f "$target" ] || return 0
+  sed -i "s#^[[:space:]]*include $from;[[:space:]]*#    include $to;#" "$target"
+}
+
+apply_uci() {
+  local http_port="$1"
+  uci -q delete "$UCI_SECTION.listen"
+  uci add_list "$UCI_SECTION.listen"="$http_port default_server"
+  uci add_list "$UCI_SECTION.listen"="[::]:$http_port default_server"
+  uci commit nginx
+}
+
+write_ssl_listen_port() {
+  local port="$1"
+  sed -i "s/^\([[:space:]]*\)listen [0-9][0-9]* ssl;/\1listen $port ssl;/" "$SSL_CONF"
+  sed -i "s/^\([[:space:]]*\)listen \[::\]:[0-9][0-9]* ssl;/\1listen [::]:$port ssl;/" "$SSL_CONF"
+}
+
+write_http_listen_port() {
+  local port="$1"
+  sed -i "s/^\([[:space:]]*\)listen [0-9][0-9]* default_server;/\1listen $port default_server;/" "$NGINX_CONF"
+  sed -i "s/^\([[:space:]]*\)listen \[::\]:[0-9][0-9]* default_server;/\1listen [::]:$port default_server;/" "$NGINX_CONF"
+  if [ -f /var/lib/nginx/lan.listen ]; then
+    sed -i "s/:\([0-9][0-9]*\);$/:$port;/" /var/lib/nginx/lan.listen
+  fi
+  if [ -f /var/lib/nginx/lan.listen.default ]; then
+    sed -i "s/:\([0-9][0-9]*\) default_server;/:$port default_server;/" /var/lib/nginx/lan.listen.default
+  fi
+}
+
+current_http_port() {
+  uci -q get "$UCI_SECTION.listen" 2>/dev/null | grep -oE '[0-9]+' | head -1
+}
+
+current_https_port() {
+  sed -n 's/^[[:space:]]*listen \([0-9][0-9]*\) ssl;.*/\1/p' "$SSL_CONF" 2>/dev/null | head -1
+}
+
+port_bad() {
+  [ "$1" -ge 1 ] 2>/dev/null && [ "$1" -le 65535 ] 2>/dev/null || return 0
+  case "$1" in
+    12517|12518|11504) return 0 ;;
+  esac
+  return 1
+}
+
+port_in_use() {
+  local port="$1" current="$2"
+  [ -n "$port" ] || return 1
+  [ "$port" = "$current" ] && return 1
+  netstat -tln 2>/dev/null | grep -qE "[:.]$port[[:space:]]"
+}
+
+port_listening() {
+  local port="$1"
+  netstat -tln 2>/dev/null | grep -qE "[:.]$port[[:space:]]"
+}
+
+port_layout_ready() {
+  local http_port="$1" https_port="$2" old_http="$3" old_https="$4"
+
+  port_listening "$http_port" &&
+  port_listening "$https_port" &&
+  { [ "$old_http" = "$http_port" ] || ! port_listening "$old_http"; } &&
+  { [ "$old_https" = "$https_port" ] || ! port_listening "$old_https"; }
+}
+
+wait_for_port_layout() {
+  local http_port="$1" https_port="$2" old_http="$3" old_https="$4" attempt=0
+
+  while [ "$attempt" -lt 8 ]; do
+    port_layout_ready "$http_port" "$https_port" "$old_http" "$old_https" && return 0
+    attempt=$((attempt + 1))
+    sleep 1
+  done
+  return 1
+}
+
+apply() {
+  local force_https="$1" http_port="$2" https_port="$3" external="$4" detail old_http old_https
+  case "$force_https" in 0|1) ;; *) fail_out "invalid_boolean" "force_https must be 0 or 1" "force_https" ;; esac
+  case "$external" in disabled|ipv4|ipv6|dual) ;; *) fail_out "invalid_external_access" "external_access must be disabled, ipv4, ipv6 or dual" "external_access" ;; esac
+  port_bad "$http_port" && fail_out "invalid_port" "HTTP port is out of range or reserved" "http_port"
+  port_bad "$https_port" && fail_out "invalid_port" "HTTPS port is out of range or reserved" "https_port"
+  [ "$http_port" = "$https_port" ] && fail_out "port_conflict" "HTTP and HTTPS ports must be different" "https_port"
+  [ -f "$SSL_CONF" ] || fail_out "https_listener_unavailable" "HTTPS console block is not active" "https_port"
+  port_in_use "$http_port" "$(current_http_port)" && fail_out "port_in_use" "HTTP port is already in use by another service" "http_port"
+  port_in_use "$https_port" "$(current_https_port)" && fail_out "port_in_use" "HTTPS port is already in use by another service" "https_port"
+  old_http="$(current_http_port)"
+  old_https="$(current_https_port)"
+  [ -n "$old_http" ] || fail_out "http_listener_unavailable" "current HTTP listener is unavailable" "http_port"
+  [ -n "$old_https" ] || fail_out "https_listener_unavailable" "current HTTPS listener is unavailable" "https_port"
+
+  BACKUP="$(backup)" || fail_out "backup_failed" "could not create a complete web access backup" ""
+  apply_uci "$http_port" || {
+    rollback_nginx || fail_out "rollback_failed" "could not restore nginx after UCI apply failed" ""
+    fail_out "nginx_uci_apply_failed" "could not update the persisted HTTP listener" "http_port"
+  }
+  write_http_listen_port "$http_port"
+  write_ssl_listen_port "$https_port"
+  if [ "$external" = "disabled" ]; then
+    swap_restrict "$SSL_CONF" restrict_console restrict_locally
+    swap_restrict "$WEB_LOCATIONS" restrict_console restrict_locally
+  else
+    swap_restrict "$SSL_CONF" restrict_locally restrict_console
+    swap_restrict "$WEB_LOCATIONS" restrict_locally restrict_console
+  fi
+  write_restrict_console "$external"
+  write_force_file "$force_https" "$https_port"
+
+  if ! nginx -t >/dev/null 2>&1; then
+    detail="$(nginx -t 2>&1 | head -3)"
+    rollback_nginx || fail_out "rollback_failed" "nginx rejected the staged config and automatic rollback failed" ""
+    fail_out "nginx_config_rejected" "nginx rejected the staged web access config: $detail" ""
+  fi
+  if ! /etc/init.d/nginx reload >/dev/null 2>&1; then
+    detail="$(/etc/init.d/nginx reload 2>&1 | head -3)"
+    rollback_nginx || fail_out "rollback_failed" "nginx could not apply the change and automatic rollback failed" ""
+    fail_out "nginx_reload_failed" "nginx could not apply the new web access config: $detail" ""
+  fi
+  if ! wait_for_port_layout "$http_port" "$https_port" "$old_http" "$old_https"; then
+    rollback_nginx || fail_out "rollback_failed" "nginx listener verification failed and automatic rollback failed" ""
+    wait_for_port_layout "$old_http" "$old_https" "$http_port" "$https_port" ||
+      fail_out "rollback_failed" "nginx listener verification failed and restored listeners did not return" ""
+    fail_out "listener_apply_incomplete" "nginx did not converge on the requested HTTP and HTTPS listeners" ""
+  fi
+
+  write_state "$force_https" "$http_port" "$https_port" "$external"
+  ok_out "$BACKUP"
+}
+
+certificate_install() {
+  local input="$1" crt key cert_pub key_pub
+  [ -s "$input" ] || fail_out "certificate_upload_invalid" "uploaded certificate payload is empty" "ssl_certificate_upload"
+  BACKUP="$(backup)" || fail_out "backup_failed" "could not create a complete certificate backup" "ssl_certificate_upload"
+  crt="$BACKUP/staged.crt"
+  key="$BACKUP/staged.key"
+  cert_pub="$BACKUP/staged.cert.pub"
+  key_pub="$BACKUP/staged.key.pub"
+  awk '/-----BEGIN CERTIFICATE-----/{p=1} p{print} /-----END CERTIFICATE-----/{p=0}' "$input" > "$crt"
+  awk '/-----BEGIN [A-Z0-9 ]*PRIVATE KEY-----/{p=1} p{print} /-----END [A-Z0-9 ]*PRIVATE KEY-----/{p=0}' "$input" > "$key"
+  [ -s "$crt" ] || fail_out "certificate_parse_failed" "no PEM certificate found in upload" "ssl_certificate_upload"
+  [ -s "$key" ] || fail_out "private_key_parse_failed" "no PEM private key found in upload" "ssl_certificate_upload"
+  openssl x509 -in "$crt" -noout -subject -dates >/dev/null 2>&1 || fail_out "certificate_parse_failed" "uploaded certificate is not a valid PEM X.509 certificate" "ssl_certificate_upload"
+  openssl x509 -in "$crt" -noout -checkend 0 >/dev/null 2>&1 || fail_out "certificate_expired" "uploaded certificate is already expired" "ssl_certificate_upload"
+  openssl pkey -in "$key" -noout -check >/dev/null 2>&1 || fail_out "private_key_parse_failed" "uploaded private key is not a valid PEM key" "ssl_certificate_upload"
+  openssl x509 -in "$crt" -noout -pubkey > "$cert_pub" 2>/dev/null
+  openssl pkey -in "$key" -pubout > "$key_pub" 2>/dev/null
+  cmp -s "$cert_pub" "$key_pub" || fail_out "private_key_mismatch" "private key does not match the uploaded certificate" "ssl_certificate_upload"
+
+  cp "$crt" "$CERT.new" && chmod 0644 "$CERT.new" && mv "$CERT.new" "$CERT"
+  cp "$key" "$KEY.new" && chmod 0600 "$KEY.new" && mv "$KEY.new" "$KEY"
+
+  if ! nginx -t >/dev/null 2>&1; then
+    rollback_nginx || fail_out "rollback_failed" "nginx rejected the certificate and automatic rollback failed" "ssl_certificate_upload"
+    fail_out "nginx_config_rejected" "nginx rejected the uploaded certificate" "ssl_certificate_upload"
+  fi
+  if ! /etc/init.d/nginx reload >/dev/null 2>&1; then
+    rollback_nginx || fail_out "rollback_failed" "nginx could not apply the certificate and automatic rollback failed" "ssl_certificate_upload"
+    fail_out "nginx_reload_failed" "nginx could not apply the uploaded certificate" "ssl_certificate_upload"
+  fi
+  ok_out "$BACKUP"
+}
+
+certificate_reset() {
+  BACKUP="$(backup)" || fail_out "backup_failed" "could not create a complete certificate backup" "ssl_certificate"
+  [ -x "$CERT_TOOL" ] || fail_out "certificate_reset_unavailable" "default certificate tool is missing" "ssl_certificate"
+  if ! "$CERT_TOOL" force; then
+    restore_backup_files || fail_out "rollback_failed" "could not restore the original certificate" "ssl_certificate"
+    fail_out "certificate_generate_failed" "could not regenerate the default console certificate" "ssl_certificate"
+  fi
+  if ! nginx -t >/dev/null 2>&1; then
+    rollback_nginx || fail_out "rollback_failed" "nginx rejected the regenerated certificate and automatic rollback failed" "ssl_certificate"
+    fail_out "nginx_config_rejected" "nginx rejected the regenerated default certificate" "ssl_certificate"
+  fi
+  if ! /etc/init.d/nginx reload >/dev/null 2>&1; then
+    rollback_nginx || fail_out "rollback_failed" "nginx could not apply the regenerated certificate and automatic rollback failed" "ssl_certificate"
+    fail_out "nginx_reload_failed" "nginx could not apply the default certificate" "ssl_certificate"
+  fi
+  ok_out "$BACKUP"
+}
+
+case "$1" in
+  apply)
+    acquire_lock
+    shift
+    force_https="0" http_port="" https_port="" external="disabled"
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --force-https) force_https="$2"; shift 2 ;;
+        --http-port) http_port="$2"; shift 2 ;;
+        --https-port) https_port="$2"; shift 2 ;;
+        --external-access) external="$2"; shift 2 ;;
+        *) fail_out "invalid_argument" "unknown apply argument: $1" "" ;;
+      esac
+    done
+    [ -n "$http_port" ] || fail_out "missing_field" "http_port is required" "http_port"
+    [ -n "$https_port" ] || fail_out "missing_field" "https_port is required" "https_port"
+    apply "$force_https" "$http_port" "$https_port" "$external"
+    ;;
+  certificate-install)
+    acquire_lock
+    [ "$#" -ge 2 ] || fail_out "missing_field" "certificate payload path is required" "ssl_certificate_upload"
+    certificate_install "$2"
+    ;;
+  certificate-reset)
+    acquire_lock
+    certificate_reset
+    ;;
+  *)
+    fail_out "invalid_command" "usage: dreamingwrt-web-access-apply [apply|certificate-install|certificate-reset]" ""
+    ;;
+esac

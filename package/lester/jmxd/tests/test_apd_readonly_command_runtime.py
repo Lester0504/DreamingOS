@@ -2,6 +2,7 @@
 """Execute APD's bounded argv-only collector, including inherited SIGCHLD ignore."""
 
 from pathlib import Path
+import os
 import subprocess
 import tempfile
 
@@ -32,7 +33,23 @@ def main() -> None:
                                     capture_output=True, text=True, timeout=2)
             for token in tokens:
                 assert token in result.stdout, (scenario, token, result.stdout)
-    print("ok: APD readonly command distinguishes timeout, output limit, failure, and ECHILD")
+        policy_env = {**os.environ, "DREAMINGWRT_APD_VENDOR_QUERIES": "0"}
+        for name in ("wlanconfig", "apstats", "wifitool", "iwpriv"):
+            alias = Path(raw) / name
+            alias.symlink_to(binary)
+            result = subprocess.run([str(alias), "success"], check=True,
+                                    capture_output=True, text=True, timeout=2,
+                                    env=policy_env)
+            assert "rc=-1 exit=126" in result.stdout, result.stdout
+            assert "vendor_queries_disabled_by_policy" in result.stdout
+            assert "fixture-ok" not in result.stdout
+        alias = Path(raw) / "iw"
+        alias.symlink_to(binary)
+        result = subprocess.run([str(alias), "success"], check=True,
+                                capture_output=True, text=True, timeout=2,
+                                env=policy_env)
+        assert "rc=0 exit=0" in result.stdout and "fixture-ok" in result.stdout
+    print("ok: APD bounded commands and vendor-query quarantine")
 
 
 if __name__ == "__main__":

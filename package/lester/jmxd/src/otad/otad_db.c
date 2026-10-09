@@ -1012,6 +1012,108 @@ int otad_operation_claim_hot_apply(const char *operation_id)
     return rc == SQLITE_DONE && sqlite3_changes(g_otad_inventory_db) == 1 ? 0 : -1;
 }
 
+/*
+ * Single-slot firmware preflight. Like otad_operation_commit_hot_preflight()
+ * but for firmware (kind='firmware') with no A/B topology constraint and
+ * target_slot='S'. Trust fields are still fully required.
+ */
+int otad_operation_commit_single_slot_preflight(const char *operation_id,
+                                                const char *from_version,
+                                                const char *to_version,
+                                                const char *build_id,
+                                                const struct otad_trust_binding *binding,
+                                                struct json_object *result)
+{
+    sqlite3_stmt *st;
+    const char *result_text;
+    int rc;
+
+    if (!otad_operation_id_ok(operation_id) || !binding ||
+        !otad_digest_hex_ok(binding->manifest_digest) ||
+        !otad_signing_key_id_ok(binding->signing_key_id) ||
+        binding->trust_policy_version < 1 ||
+        !otad_digest_hex_ok(binding->trust_policy_digest) ||
+        !otad_digest_hex_ok(binding->device_identity_digest) ||
+        !binding->authenticity_verified || !binding->target_compatible ||
+        !binding->policy_passed || !result ||
+        !json_object_is_type(result, json_type_object))
+        return -1;
+    result_text = json_object_to_json_string_ext(result, JSON_C_TO_STRING_PLAIN);
+    if (!result_text || strlen(result_text) > OTAD_MAX_JSON_BYTES)
+        return -1;
+    st = otad_operation_prepare(
+        "UPDATE ota_operations SET state='pending',progress=20,from_version=?1,to_version=?2,build_id=?3,"
+        "target_slot='S',manifest_digest=?4,signing_key_id=?5,"
+        "trust_policy_version=?6,trust_policy_digest=?7,device_identity_digest=?8,"
+        "topology_digest='',authenticity_verified=?9,target_compatible=?10,policy_passed=?11,"
+        "result_json=?12,error_code='',error_message='',updated_at=?13 "
+        "WHERE operation_id=?14 AND kind='firmware' AND action='preflight' AND state='validating' "
+        "AND source_size>=1048576 AND length(source_sha256)=64 "
+        "AND source_sha256 NOT GLOB '*[^0-9A-Fa-f]*' "
+        "AND manifest_digest='' AND signing_key_id='' AND trust_policy_version=0 "
+        "AND trust_policy_digest='' AND device_identity_digest='' AND topology_digest='' "
+        "AND authenticity_verified=0 AND target_compatible=0 AND policy_passed=0");
+    if (!st)
+        return -1;
+    sqlite3_bind_text(st, 1, from_version ? from_version : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, to_version ? to_version : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 3, build_id ? build_id : "", -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 4, binding->manifest_digest, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 5, binding->signing_key_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 6, binding->trust_policy_version);
+    sqlite3_bind_text(st, 7, binding->trust_policy_digest, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, binding->device_identity_digest, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int(st, 9, binding->authenticity_verified);
+    sqlite3_bind_int(st, 10, binding->target_compatible);
+    sqlite3_bind_int(st, 11, binding->policy_passed);
+    sqlite3_bind_text(st, 12, result_text, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_int64(st, 13, otad_now_s());
+    sqlite3_bind_text(st, 14, operation_id, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    return rc == SQLITE_DONE && sqlite3_changes(g_otad_inventory_db) == 1 ? 0 : -1;
+}
+
+/*
+ * Claim a verified single-slot firmware preflight for apply. Mirrors
+ * otad_operation_claim_apply() minus the A/B slot conditions and topology
+ * digest requirement, using target_slot='S' instead.
+ */
+int otad_operation_claim_single_slot_apply(const char *operation_id)
+{
+    sqlite3_stmt *st;
+    int rc;
+
+    if (!otad_operation_id_ok(operation_id))
+        return -1;
+    st = otad_operation_prepare(
+        "UPDATE ota_operations SET action='apply',state='writing',progress=25,"
+        "worker_pid=0,error_code='',error_message='',updated_at=?1 "
+        "WHERE operation_id=?2 AND kind='firmware' AND action='preflight' "
+        "AND state='pending' AND target_slot='S' AND authenticity_verified=1 "
+        "AND target_compatible=1 AND policy_passed=1 "
+        "AND manifest_digest<>'' AND signing_key_id<>'' "
+        "AND trust_policy_version>0 AND trust_policy_digest<>'' "
+        "AND device_identity_digest<>'' AND topology_digest='' "
+        "AND source_size>=1048576 AND length(source_sha256)=64 "
+        "AND source_sha256 NOT GLOB '*[^0-9A-Fa-f]*' "
+        "AND length(manifest_digest)=64 AND manifest_digest NOT GLOB '*[^0-9A-Fa-f]*' "
+        "AND length(signing_key_id)<=128 AND signing_key_id NOT GLOB '*[^0-9A-Za-z._-]*' "
+        "AND length(trust_policy_digest)=64 "
+        "AND trust_policy_digest NOT GLOB '*[^0-9A-Fa-f]*' "
+        "AND length(device_identity_digest)=64 "
+        "AND device_identity_digest NOT GLOB '*[^0-9A-Fa-f]*'");
+    if (!st)
+        return -1;
+    sqlite3_bind_int64(st, 1, otad_now_s());
+    sqlite3_bind_text(st, 2, operation_id, -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    if (rc == SQLITE_CONSTRAINT)
+        return -2;
+    return rc == SQLITE_DONE && sqlite3_changes(g_otad_inventory_db) == 1 ? 0 : -1;
+}
+
 int otad_operation_find_active_firmware_apply(
     char operation_id[OTAD_OPERATION_ID_LEN + 1])
 {
@@ -1148,10 +1250,12 @@ static struct json_object *otad_operation_row_json(sqlite3_stmt *st)
 {
     struct json_object *o = json_object_new_object();
     struct json_object *result = NULL;
+    struct json_object *options = NULL;
     const char *state = (const char *)sqlite3_column_text(st, 4);
     const char *result_text = (const char *)sqlite3_column_text(st, 14);
     const char *error_code = (const char *)sqlite3_column_text(st, 15);
     const char *error_message = (const char *)sqlite3_column_text(st, 16);
+    const char *options_text = (const char *)sqlite3_column_text(st, 27);
     int terminal = state && (!strcmp(state, "success") || !strcmp(state, "failed"));
 
     json_object_object_add(o, "ok", json_object_new_boolean(1));
@@ -1159,6 +1263,14 @@ static struct json_object *otad_operation_row_json(sqlite3_stmt *st)
     otad_json_add_string(o, "kind", (const char *)sqlite3_column_text(st, 1));
     otad_json_add_string(o, "action", (const char *)sqlite3_column_text(st, 2));
     otad_json_add_string(o, "upload_id", (const char *)sqlite3_column_text(st, 3));
+    if (options_text)
+        options = json_tokener_parse(options_text);
+    if (options) {
+        const char *owner = otad_json_str(options, "owner_id", "");
+        if (owner[0])
+            otad_json_add_string(o, "owner_id", owner);
+        json_object_put(options);
+    }
     otad_json_add_string(o, "state", state);
     otad_json_add_string(o, "phase", state && !strcmp(state, "success") ? "completed" : state);
     json_object_object_add(o, "progress", json_object_new_int(sqlite3_column_int(st, 5)));
@@ -1219,7 +1331,7 @@ struct json_object *otad_operation_status(struct json_object *body)
         "from_version,to_version,build_id,target_slot,created_at,updated_at,result_json,"
         "error_code,error_message,completed_at,manifest_digest,signing_key_id,trust_policy_version,"
         "trust_policy_digest,device_identity_digest,topology_digest,"
-        "authenticity_verified,target_compatible,policy_passed "
+        "authenticity_verified,target_compatible,policy_passed,options_json "
         "FROM ota_operations WHERE operation_id=?1");
     if (!st)
         return otad_error("operation_query_failed", "failed to prepare operation query");

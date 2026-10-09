@@ -3,6 +3,8 @@
 #define _GNU_SOURCE 1
 #endif
 #include "otad_internal.h"
+#include "otad_upload_lifecycle.h"
+#include "../webd/webd_upload_staging.h"
 #include <zlib.h>
 
 #ifndef OTAD_AB_SLOTS_SUPPORTED
@@ -31,10 +33,17 @@ struct otad_firmware_info {
     uint64_t firmware_size;
     struct otad_payload_info rootfs;
     struct otad_payload_info vmlinuz;
+    struct otad_payload_info sysupgrade;
+    int is_single_slot;
     struct json_object *json;
 };
 
 struct uloop_timeout g_otad_confirm_timer;
+static int g_otad_confirm_observer_mode;
+
+static int otad_slot_status_observer_probe(struct otad_ab_topology *topology,
+                                           char *error, size_t error_len);
+static int64_t otad_status_monotonic_ms(void);
 
 static int otad_hex_ok(const char *s, size_t n)
 {
@@ -227,33 +236,60 @@ static int otad_firmware_header_read_fd(int fd, uint64_t expected_size,
         return -1;
     }
     out->schema_version = otad_json_int(out->json, "schema_version", 0);
-    if ((out->schema_version != 1 && out->schema_version != 2 &&
-         out->schema_version != 3) ||
-        strcmp(otad_json_str(out->json, "product", ""), "DreamingWrt") ||
-        strcmp(otad_json_str(out->json, "artifact_type", ""), "ota_bin") ||
-        strcmp(otad_json_str(out->json, "firmware_type", ""), "firmware") ||
-        strcmp(otad_json_str(out->json, "rootfs_format", ""), "ext4")) {
-        snprintf(error, error_len, "firmware_info_contract_mismatch");
-        json_object_put(out->json);
-        out->json = NULL;
-        return -1;
+    {
+        const char *artifact_type = otad_json_str(out->json, "artifact_type", "");
+        const char *rootfs_format = otad_json_str(out->json, "rootfs_format", "");
+        int is_ab = !strcmp(artifact_type, "ota_bin") && !strcmp(rootfs_format, "ext4");
+        int is_single_slot = 0;
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+        is_single_slot = !strcmp(artifact_type, "sysupgrade_bin") &&
+                         !strcmp(rootfs_format, "fit");
+#endif
+        if ((out->schema_version != 1 && out->schema_version != 2 &&
+             out->schema_version != 3) ||
+            strcmp(otad_json_str(out->json, "product", ""), "DreamingWrt") ||
+            strcmp(otad_json_str(out->json, "firmware_type", ""), "firmware") ||
+            (!is_ab && !is_single_slot)) {
+            snprintf(error, error_len, "firmware_info_contract_mismatch");
+            json_object_put(out->json);
+            out->json = NULL;
+            return -1;
+        }
+        out->is_single_slot = is_single_slot;
     }
     out->firmware_size = otad_json_u64(out->json, "firmware_size_bytes", 0);
     if (out->firmware_size != (uint64_t)st.st_size ||
-        !json_object_object_get_ex(out->json, "payloads", &payloads) ||
-        otad_payload_parse(payloads, "rootfs", out->schema_version, 1,
-                           &out->rootfs) != 0 ||
-        otad_payload_parse(payloads, "vmlinuz", out->schema_version, 0,
-                           &out->vmlinuz) != 0 ||
-        !otad_payload_range_valid(&out->rootfs, out->firmware_size,
-                                  OTAD_FIRMWARE_HEADER_BYTES) ||
-        !otad_payload_range_valid(&out->vmlinuz, out->firmware_size,
-                                  OTAD_FIRMWARE_HEADER_BYTES) ||
-        out->vmlinuz.offset < out->rootfs.offset + out->rootfs.size) {
+        !json_object_object_get_ex(out->json, "payloads", &payloads)) {
         snprintf(error, error_len, "firmware_size_or_payload_contract_mismatch");
         json_object_put(out->json);
         out->json = NULL;
         return -1;
+    }
+    if (!out->is_single_slot) {
+        if (otad_payload_parse(payloads, "rootfs", out->schema_version, 1,
+                               &out->rootfs) != 0 ||
+            otad_payload_parse(payloads, "vmlinuz", out->schema_version, 0,
+                               &out->vmlinuz) != 0 ||
+            !otad_payload_range_valid(&out->rootfs, out->firmware_size,
+                                      OTAD_FIRMWARE_HEADER_BYTES) ||
+            !otad_payload_range_valid(&out->vmlinuz, out->firmware_size,
+                                      OTAD_FIRMWARE_HEADER_BYTES) ||
+            out->vmlinuz.offset < out->rootfs.offset + out->rootfs.size) {
+            snprintf(error, error_len, "firmware_size_or_payload_contract_mismatch");
+            json_object_put(out->json);
+            out->json = NULL;
+            return -1;
+        }
+    } else {
+        if (otad_payload_parse(payloads, "sysupgrade", out->schema_version, 0,
+                               &out->sysupgrade) != 0 ||
+            !otad_payload_range_valid(&out->sysupgrade, out->firmware_size,
+                                      OTAD_FIRMWARE_HEADER_BYTES)) {
+            snprintf(error, error_len, "firmware_size_or_payload_contract_mismatch");
+            json_object_put(out->json);
+            out->json = NULL;
+            return -1;
+        }
     }
     snprintf(out->version, sizeof(out->version), "%s",
              otad_json_str(out->json, "dreamingwrt_version", ""));
@@ -853,10 +889,12 @@ int otad_operation_reverify_trust_binding(
     if (otad_release_trust_verify(fd, info.firmware_size, info.json,
                                   &evidence, error, error_len) != 0)
         goto out;
-    if (otad_ab_topology_discover(&topology, error, error_len) != 0 ||
-        otad_ab_topology_validate_release(&topology, info.json,
-                                          error, error_len) != 0)
-        goto out;
+    if (!info.is_single_slot) {
+        if (otad_ab_topology_discover(&topology, error, error_len) != 0 ||
+            otad_ab_topology_validate_release(&topology, info.json,
+                                              error, error_len) != 0)
+            goto out;
+    }
     if (otad_release_trust_binding_get(evidence, &binding,
                                        error, error_len) != 0)
         goto out;
@@ -868,7 +906,8 @@ int otad_operation_reverify_trust_binding(
         binding.authenticity_verified != work->authenticity_verified ||
         binding.target_compatible != work->target_compatible ||
         binding.policy_passed != work->policy_passed ||
-        strcasecmp(topology.topology_digest, work->topology_digest)) {
+        (!info.is_single_slot &&
+         strcasecmp(topology.topology_digest, work->topology_digest))) {
         snprintf(error, error_len, "release_trust_binding_changed_after_preflight");
         goto out;
     }
@@ -1056,6 +1095,630 @@ struct json_object *otad_operation_status_by_id(const char *operation_id)
     return resp;
 }
 
+static int otad_firmware_worker_start(const char *operation_id);
+static int otad_copy_range(int src_fd, uint64_t offset, uint64_t size, int dst_fd);
+
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+/*
+ * Validate a single-slot firmware container. Like otad_firmware_validate_fd()
+ * but without A/B topology discovery or inactive-slot capacity checks. Only
+ * trust verification and payload integrity are required.
+ */
+static int otad_firmware_validate_single_slot_fd(
+    int fd, uint64_t expected_size,
+    struct otad_firmware_info *info,
+    struct json_object **result_out,
+    char *error, size_t error_len)
+{
+    struct json_object *resp = NULL;
+    struct json_object *trust_evidence = NULL;
+
+    if (result_out)
+        *result_out = NULL;
+    memset(info, 0, sizeof(*info));
+    if (otad_firmware_header_read_fd(fd, expected_size, info,
+                                     error, error_len) != 0)
+        return -1;
+    if (!info->is_single_slot) {
+        snprintf(error, error_len, "not_single_slot_firmware");
+        return -1;
+    }
+    if (webd_upload_staging_check_capacity(0, error, error_len) != 0)
+        return -1;
+    if (otad_verify_payload_fd(fd, &info->sysupgrade, error, error_len) != 0)
+        return -1;
+    resp = json_object_new_object();
+    json_object_object_add(resp, "ok", json_object_new_boolean(1));
+    json_object_object_add(resp, "verified", json_object_new_boolean(0));
+    otad_json_add_string(resp, "dreamingwrt_version", info->version);
+    otad_json_add_string(resp, "build_id", info->build_id);
+    otad_json_add_string(resp, "linux_version", info->linux_version);
+    json_object_object_add(resp, "firmware_size_bytes",
+                           json_object_new_int64((int64_t)info->firmware_size));
+    otad_json_add_string(resp, "target_slot", "S");
+    json_object_object_add(resp, "single_slot", json_object_new_boolean(1));
+    json_object_object_add(resp, "integrity_verified", json_object_new_boolean(1));
+    if (otad_release_trust_verify(fd, info->firmware_size, info->json,
+                                  &trust_evidence, error, error_len) != 0) {
+        if (trust_evidence)
+            json_object_object_add(resp, "release_trust", trust_evidence);
+        json_object_object_add(resp, "verified", json_object_new_boolean(0));
+        if (result_out)
+            *result_out = resp;
+        else
+            json_object_put(resp);
+        return -1;
+    }
+    json_object_object_add(resp, "release_trust", trust_evidence);
+    json_object_object_add(resp, "authenticity_verified",
+                           json_object_new_boolean(1));
+    json_object_object_add(resp, "signature_required", json_object_new_boolean(1));
+    json_object_object_add(resp, "signature_verified", json_object_new_boolean(1));
+    otad_json_add_string(resp, "signature_status", "verified");
+    json_object_object_add(resp, "target_compatible", json_object_new_boolean(1));
+    json_object_object_add(resp, "policy_passed", json_object_new_boolean(1));
+    json_object_object_del(resp, "verified");
+    json_object_object_add(resp, "verified", json_object_new_boolean(1));
+    json_object_object_del(resp, "safe_to_apply");
+    json_object_object_add(resp, "safe_to_apply", json_object_new_boolean(1));
+    otad_json_add_string(resp, "release_gate", "open");
+    otad_json_add_string(resp, "release_gate_reason", "");
+    if (result_out)
+        *result_out = resp;
+    else
+        json_object_put(resp);
+    return 0;
+}
+
+/*
+ * Single-slot firmware preflight. Validates trust, verifies payload integrity,
+ * and commits the operation to the DB with target_slot='S'.
+ */
+static struct json_object *
+otad_firmware_preflight_single_slot(struct json_object *body)
+{
+    const char *upload_id = otad_json_str(body, "upload_id", "");
+    struct json_object *options = json_object_new_object();
+    struct otad_staged_upload upload;
+    struct otad_firmware_info info;
+    struct json_object *result = NULL;
+    struct otad_trust_binding trust_binding;
+    char operation_id[OTAD_OPERATION_ID_LEN + 1] = "";
+    char from_version[128] = "";
+    char error[160] = "";
+    int auto_reboot = otad_json_bool(body, "auto_reboot", 1);
+
+    memset(&info, 0, sizeof(info));
+    if (body && json_object_object_get_ex(body, "path", NULL)) {
+        json_object_put(options);
+        return otad_error("arbitrary_path_forbidden",
+                          "firmware operations accept only a finalized server upload_id");
+    }
+    if (!otad_upload_id_ok(upload_id)) {
+        json_object_put(options);
+        return otad_error("upload_id_invalid",
+                          "a finalized server-generated upload_id is required");
+    }
+    json_object_object_add(options, "auto_reboot",
+                           json_object_new_boolean(auto_reboot));
+    otad_json_add_string(options, "owner_id", otad_json_str(body, "owner_id", ""));
+    if (otad_operation_create("firmware", "preflight", upload_id, options,
+                              operation_id, error, sizeof(error)) != 0) {
+        json_object_put(options);
+        return otad_error(error, "failed to create firmware preflight operation");
+    }
+    json_object_put(options);
+    if (otad_staged_upload_open(upload_id, &upload, error, sizeof(error)) != 0)
+        goto failed;
+    if (otad_operation_set_source(operation_id, upload.size, upload.sha256) != 0) {
+        snprintf(error, sizeof(error), "operation_source_persist_failed");
+        goto failed_open;
+    }
+    {
+        int validate_rc = otad_firmware_validate_single_slot_fd(
+            upload.fd, upload.size, &info, &result, error, sizeof(error));
+
+        if (result &&
+            otad_release_trust_binding_get(result, &trust_binding, NULL, 0) == 0) {
+            if (otad_current_release_version(from_version, error,
+                                             sizeof(error)) != 0)
+                goto failed_open;
+            if (validate_rc == 0 &&
+                otad_operation_commit_single_slot_preflight(
+                    operation_id, from_version, info.version, info.build_id,
+                    &trust_binding, result) != 0) {
+                snprintf(error, sizeof(error), "operation_trust_persist_failed");
+                goto failed_open;
+            }
+        }
+        if (validate_rc != 0)
+            goto failed_open;
+    }
+    otad_staged_upload_close(&upload);
+    otad_firmware_info_done(&info);
+    json_object_put(result);
+    return otad_operation_status_by_id(operation_id);
+
+failed_open:
+    otad_staged_upload_close(&upload);
+failed:
+    (void)otad_operation_update(operation_id, "failed", 100,
+                                error[0] ? error : "firmware_preflight_failed",
+                                "firmware preflight did not pass", result);
+    otad_firmware_info_done(&info);
+    if (result)
+        json_object_put(result);
+    return otad_operation_status_by_id(operation_id);
+}
+
+/*
+ * Single-slot firmware apply claim. Validates the preflight, claims the
+ * operation, and starts the worker process.
+ */
+static struct json_object *
+otad_firmware_apply_single_slot(struct json_object *body)
+{
+    const char *operation_id = otad_json_str(body, "operation_id", "");
+    struct otad_operation_work work;
+    char active_id[OTAD_OPERATION_ID_LEN + 1] = "";
+    int rc;
+
+    if (body && (json_object_object_get_ex(body, "path", NULL) ||
+                 json_object_object_get_ex(body, "upload_id", NULL)))
+        return otad_error("apply_requires_preflight_operation",
+                          "apply accepts only the operation_id returned by preflight");
+    if (!otad_operation_id_ok(operation_id))
+        return otad_error("operation_id_invalid",
+                          "a pending firmware preflight operation_id is required");
+    if (otad_operation_get_work(operation_id, &work) != 0)
+        return otad_error("operation_not_found", "operation_id does not exist");
+    if (strcmp(work.kind, "firmware") || strcmp(work.action, "preflight") ||
+        strcmp(work.state, "pending"))
+        return otad_error("operation_not_pending_preflight",
+                          "firmware apply requires a successful pending preflight");
+    if (!work.authenticity_verified || !work.target_compatible ||
+        !work.signing_key_id[0] || work.trust_policy_version < 1) {
+        struct json_object *resp = otad_firmware_release_gate_error();
+        (void)otad_operation_update(operation_id, "failed", 100,
+                                    "firmware_release_trust_gate_closed",
+                                    "firmware apply requires a preflight that verified publisher authenticity and target compatibility",
+                                    resp);
+        otad_json_add_string(resp, "operation_id", operation_id);
+        return resp;
+    }
+    rc = otad_operation_claim_single_slot_apply(operation_id);
+    if (rc == -2) {
+        (void)otad_operation_find_active_firmware_apply(active_id);
+        {
+            struct json_object *resp = otad_error("firmware_operation_in_progress",
+                                                  "another firmware write or reboot is active");
+            otad_json_add_string(resp, "active_operation_id", active_id);
+            return resp;
+        }
+    }
+    if (rc != 0)
+        return otad_error("operation_claim_failed",
+                          "preflight operation could not transition to writing");
+    otad_slot_status_cache_invalidate();
+    if (otad_firmware_worker_start(operation_id) != 0) {
+        (void)otad_operation_update(operation_id, "failed", 100,
+                                    "operation_worker_start_failed",
+                                    "failed to start the firmware slot-writing worker", NULL);
+        return otad_operation_status_by_id(operation_id);
+    }
+    return otad_operation_status_by_id(operation_id);
+}
+
+/* Move bytes towards offset zero without allocating a second image. */
+static int otad_single_slot_compact(int fd, uint64_t offset, uint64_t size)
+{
+    unsigned char buf[65536];
+    uint64_t done = 0;
+
+    while (done < size) {
+        size_t want = size - done < sizeof(buf) ?
+            (size_t)(size - done) : sizeof(buf);
+        ssize_t got;
+        size_t written = 0;
+
+        do {
+            got = pread(fd, buf, want, (off_t)(offset + done));
+        } while (got < 0 && errno == EINTR);
+        if (got <= 0)
+            return -1;
+        while (written < (size_t)got) {
+            ssize_t n = pwrite(fd, buf + written, (size_t)got - written,
+                               (off_t)(done + written));
+            if (n < 0 && errno == EINTR)
+                continue;
+            if (n <= 0)
+                return -1;
+            written += (size_t)n;
+        }
+        done += (uint64_t)got;
+    }
+    return ftruncate(fd, (off_t)size) == 0 && fsync(fd) == 0 ? 0 : -1;
+}
+
+static int otad_single_slot_prepare(struct otad_staged_upload *upload,
+                                    const struct otad_payload_info *payload,
+                                    const char *path, int *consumed,
+                                    char *error, size_t error_len)
+{
+    struct stat source, writable;
+    struct otad_payload_info prepared = *payload;
+    int fd, rc = -1;
+
+    *consumed = 0;
+    fd = openat(upload->dirfd, "data.bin", O_RDWR | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0 || fstat(fd, &writable) != 0 ||
+        fstat(upload->fd, &source) != 0 || !S_ISREG(writable.st_mode) ||
+        writable.st_dev != source.st_dev || writable.st_ino != source.st_ino ||
+        (uint64_t)source.st_size != upload->size ||
+        !otad_payload_range_valid(payload, upload->size,
+                                   OTAD_FIRMWARE_HEADER_BYTES)) {
+        snprintf(error, error_len, "sysupgrade_source_invalid");
+        goto done;
+    }
+    /* The caller holds the staging lock and owns a fresh private destination. */
+    if (renameat(upload->dirfd, "data.bin", AT_FDCWD, path) != 0) {
+        snprintf(error, error_len, "sysupgrade_source_move_failed");
+        goto done;
+    }
+    *consumed = 1;
+    if (otad_single_slot_compact(fd, payload->offset, payload->size) != 0) {
+        snprintf(error, error_len, "sysupgrade_prepare_failed");
+        goto done;
+    }
+    prepared.offset = 0;
+    rc = otad_verify_payload_fd(fd, &prepared, error, error_len);
+done:
+    if (fd >= 0)
+        close(fd);
+    return rc;
+}
+
+/* Drain both output streams even after the bounded diagnostic buffer is full. */
+static int otad_single_slot_run(char *const argv[], char *output, size_t output_len)
+{
+    int pipefd[2], status;
+    pid_t pid;
+    char buf[1024];
+    size_t used = 0;
+    ssize_t n;
+    int read_failed = 0;
+
+    if (output_len)
+        output[0] = '\0';
+    if (pipe(pipefd) != 0)
+        return -1;
+    pid = fork();
+    if (pid == 0) {
+        close(pipefd[0]);
+        if (dup2(pipefd[1], STDOUT_FILENO) < 0 ||
+            dup2(pipefd[1], STDERR_FILENO) < 0)
+            _exit(127);
+        close(pipefd[1]);
+        execv(argv[0], argv);
+        _exit(127);
+    }
+    close(pipefd[1]);
+    if (pid < 0) {
+        close(pipefd[0]);
+        return -1;
+    }
+    for (;;) {
+        n = read(pipefd[0], buf, sizeof(buf));
+        if (n < 0 && errno == EINTR)
+            continue;
+        if (n <= 0) {
+            read_failed = n < 0;
+            break;
+        }
+        if (output_len && used < output_len - 1) {
+            size_t keep = (size_t)n;
+            if (keep > output_len - 1 - used)
+                keep = output_len - 1 - used;
+            memcpy(output + used, buf, keep);
+            used += keep;
+            output[used] = '\0';
+        }
+    }
+    close(pipefd[0]);
+    while (waitpid(pid, &status, 0) < 0)
+        if (errno != EINTR)
+            return -1;
+    return !read_failed && WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+static int otad_single_slot_progress(const char *operation_id,
+                                     struct json_object *result,
+                                     const char *state, int progress,
+                                     const char *phase)
+{
+    otad_json_add_string(result, "phase", phase);
+    return otad_operation_update(operation_id, state, progress, "", "", result);
+}
+
+static int otad_single_slot_boot_id(char value[64])
+{
+    FILE *fp = fopen("/proc/sys/kernel/random/boot_id", "r");
+    int rc = -1;
+
+    value[0] = '\0';
+    if (!fp)
+        return -1;
+    if (fgets(value, 64, fp)) {
+        value[strcspn(value, "\r\n")] = '\0';
+        if (strlen(value) == 36)
+            rc = 0;
+    }
+    fclose(fp);
+    return rc;
+}
+
+/* Native sysupgrade owns all device writes; this worker only prepares the FIT. */
+/*
+ * Remove stale single-slot staging left in tmpfs by a previous apply that was
+ * killed before its own cleanup ran (a failed flash with no reboot), or by an
+ * older otad that used the flat "otad-sysupgrade.bin" name.  /tmp is tmpfs and
+ * is cleared on reboot, so anything matching the staging prefix here predates
+ * the current apply and only crowds the ~1.9G tmpfs the config backup shares.
+ * Best-effort: never fail an apply because a leftover could not be removed.
+ * Callers run this before mkdtemp(), so the current operation's directory does
+ * not exist yet, and single-slot applies are serialized by the operation state
+ * machine, so no live sibling staging can match the prefix.
+ */
+static int otad_single_slot_prune_stale(void)
+{
+    static const char base[] = "/tmp/dreamingwrt";
+    static const char prefix[] = "otad-sysupgrade";
+    DIR *dir;
+    struct dirent *ent;
+    int removed = 0;
+
+    dir = opendir(base);
+    if (!dir)
+        return 0;
+    while ((ent = readdir(dir)) != NULL) {
+        char path[OTAD_MAX_PATH];
+        struct stat st;
+
+        if (strncmp(ent->d_name, prefix, sizeof(prefix) - 1) != 0)
+            continue;
+        if (snprintf(path, sizeof(path), "%s/%s", base, ent->d_name) >=
+            (int)sizeof(path))
+            continue;
+        if (lstat(path, &st) != 0)
+            continue;
+        if (S_ISDIR(st.st_mode)) {
+            DIR *sub = opendir(path);
+            if (sub) {
+                struct dirent *sent;
+                while ((sent = readdir(sub)) != NULL) {
+                    char child[OTAD_MAX_PATH];
+
+                    if (!strcmp(sent->d_name, ".") ||
+                        !strcmp(sent->d_name, ".."))
+                        continue;
+                    if (snprintf(child, sizeof(child), "%s/%s", path,
+                                 sent->d_name) >= (int)sizeof(child))
+                        continue;
+                    (void)unlink(child);
+                }
+                closedir(sub);
+            }
+            if (rmdir(path) == 0)
+                removed++;
+        } else if (unlink(path) == 0) {
+            removed++;
+        }
+    }
+    closedir(dir);
+    return removed;
+}
+
+static int otad_single_slot_apply_worker(const char *operation_id,
+                                         const struct otad_operation_work *work)
+{
+    struct otad_firmware_info info;
+    struct otad_staged_upload upload;
+    struct json_object *result = json_object_new_object();
+    char error[160] = "";
+    char directory[] = "/tmp/dreamingwrt/otad-sysupgrade-XXXXXX";
+    char sysupgrade_path[OTAD_MAX_PATH] = "";
+    char native_output[4096] = "";
+    char boot_id[64] = "";
+    int consumed = 0, directory_created = 0;
+    int rc = -1;
+
+    memset(&info, 0, sizeof(info));
+    memset(&upload, 0, sizeof(upload));
+    upload.rootfd = upload.dirfd = upload.lockfd = upload.fd = -1;
+    json_object_object_add(result, "single_slot", json_object_new_boolean(1));
+    if (!operation_id || !work || strcmp(work->kind, "firmware") ||
+        strcmp(work->action, "apply") || strcmp(work->state, "writing")) {
+        snprintf(error, sizeof(error), "operation_worker_contract_invalid");
+        goto fail;
+    }
+    if (!work->authenticity_verified || !work->target_compatible ||
+        !work->signing_key_id[0] || work->trust_policy_version < 1) {
+        snprintf(error, sizeof(error), "firmware_release_trust_gate_closed");
+        goto fail;
+    }
+    if (otad_staged_upload_open(work->upload_id, &upload,
+                                error, sizeof(error)) != 0)
+        goto fail;
+    if (upload.size != work->source_size ||
+        strcasecmp(upload.sha256, work->source_sha256)) {
+        snprintf(error, sizeof(error), "staging_source_changed_after_preflight");
+        goto fail_open;
+    }
+    if (otad_operation_reverify_trust_binding(upload.fd, upload.size, work,
+                                              error, sizeof(error)) != 0)
+        goto fail_open;
+    if (otad_single_slot_boot_id(boot_id) != 0) {
+        snprintf(error, sizeof(error), "boot_identity_unavailable");
+        goto fail_open;
+    }
+    otad_json_add_string(result, "source_boot_id", boot_id);
+    /* Re-read header for sysupgrade payload offsets */
+    if (otad_firmware_header_read_fd(upload.fd, upload.size, &info,
+                                     error, sizeof(error)) != 0)
+        goto fail_open;
+    if (!info.is_single_slot) {
+        snprintf(error, sizeof(error), "not_single_slot_firmware");
+        goto fail_open;
+    }
+    otad_json_add_string(result, "expected_build_id", info.build_id);
+    if (otad_single_slot_progress(operation_id, result, "writing", 30,
+                                  "preparing_sysupgrade") != 0 ||
+        otad_db_persist_now() != 0) {
+        snprintf(error, sizeof(error), "operation_progress_persist_failed");
+        goto fail_open;
+    }
+    if (otad_mkdir_p("/tmp/dreamingwrt", 0755) != 0) {
+        snprintf(error, sizeof(error), "runtime_directory_failed");
+        goto fail_open;
+    }
+    {
+        int pruned_stale = otad_single_slot_prune_stale();
+        if (pruned_stale > 0)
+            json_object_object_add(result, "pruned_stale_staging",
+                                   json_object_new_int(pruned_stale));
+    }
+    if (webd_upload_staging_check_capacity(0,
+                                          error, sizeof(error)) != 0)
+        goto fail_open;
+    if (!mkdtemp(directory)) {
+        snprintf(error, sizeof(error), "sysupgrade_directory_failed");
+        goto fail_open;
+    }
+    directory_created = 1;
+    snprintf(sysupgrade_path, sizeof(sysupgrade_path), "%s/sysupgrade.bin", directory);
+    if (otad_single_slot_prepare(&upload, &info.sysupgrade, sysupgrade_path,
+                                 &consumed, error, sizeof(error)) != 0)
+        goto fail_open;
+    otad_staged_upload_close(&upload);
+    otad_firmware_info_done(&info);
+    json_object_object_add(result, "upload_consumed", json_object_new_boolean(1));
+    if (otad_single_slot_progress(operation_id, result, "writing", 60,
+                                  "checking_platform") != 0) {
+        snprintf(error, sizeof(error), "operation_progress_persist_failed");
+        goto fail;
+    }
+    {
+        char *argv[] = { "/sbin/sysupgrade", "-T", sysupgrade_path, NULL };
+        int status = otad_single_slot_run(argv, native_output, sizeof(native_output));
+        otad_json_add_string(result, "native_check_output", native_output);
+        if (status != 0) {
+            snprintf(error, sizeof(error), "sysupgrade_check_failed");
+            goto fail;
+        }
+    }
+    if (otad_single_slot_progress(operation_id, result, "writing", 80,
+                                  "starting_sysupgrade") != 0 ||
+        otad_state_set("state", "applying_sysupgrade") != 0 ||
+        otad_db_persist_now() != 0) {
+        snprintf(error, sizeof(error), "operation_progress_persist_failed");
+        goto fail;
+    }
+    {
+        char *argv[] = { "/sbin/sysupgrade", sysupgrade_path, NULL };
+        int status = otad_single_slot_run(argv, native_output, sizeof(native_output));
+        otad_json_add_string(result, "native_upgrade_output", native_output);
+        if (status != 0) {
+            snprintf(error, sizeof(error), "sysupgrade_start_failed");
+            goto fail;
+        }
+    }
+    /* A successful handoff is not proof of a completed flash. Keep the image. */
+    rc = otad_single_slot_progress(operation_id, result, "rebooting", 90, "rebooting");
+    (void)otad_db_persist_now();
+    json_object_put(result);
+    return rc;
+
+fail_open:
+    otad_staged_upload_close(&upload);
+fail:
+    otad_staged_upload_close(&upload);
+    otad_firmware_info_done(&info);
+    if (consumed)
+        unlink(sysupgrade_path);
+    if (directory_created)
+        rmdir(directory);
+    json_object_object_add(result, "upload_consumed", json_object_new_boolean(consumed));
+    otad_json_add_string(result, "phase", "failed");
+    otad_state_set("state", "failed");
+    otad_state_set("last_error", error[0] ? error : "single_slot_apply_failed");
+    (void)otad_operation_update(operation_id, "failed", 100,
+                                error[0] ? error : "single_slot_apply_failed",
+                                native_output[0] ? native_output :
+                                    "single-slot firmware apply failed",
+                                result);
+    (void)otad_db_persist_now();
+    json_object_put(result);
+    return rc;
+}
+
+static void otad_single_slot_reconcile_boot(void)
+{
+    char operation_id[OTAD_OPERATION_ID_LEN + 1] = "";
+    char boot_id[64], error[160] = "";
+    struct json_object *operation, *result = NULL, *release = NULL;
+    const char *source_boot, *expected_build, *phase;
+    int confirmed, active;
+
+    active = otad_operation_find_active_firmware_apply(operation_id);
+    if (active == 1) {
+        char state[64];
+        otad_state_get("state", state, sizeof(state), "");
+        if (!strcmp(state, "applying_sysupgrade")) {
+            otad_state_set("state", "failed");
+            (void)otad_db_persist_now();
+        }
+        return;
+    }
+    if (active != 0 || otad_single_slot_boot_id(boot_id) != 0)
+        return;
+    operation = otad_operation_status_by_id(operation_id);
+    if (strcmp(otad_json_str(operation, "target_slot", ""), "S") ||
+        !json_object_object_get_ex(operation, "result", &result) || !result)
+        goto done;
+    source_boot = otad_json_str(result, "source_boot_id", "");
+    expected_build = otad_json_str(result, "expected_build_id", "");
+    phase = otad_json_str(result, "phase", "");
+    if (!source_boot[0] || !strcmp(source_boot, boot_id))
+        goto done;
+    confirmed = (!strcmp(phase, "starting_sysupgrade") || !strcmp(phase, "rebooting")) &&
+        expected_build[0] &&
+        otad_release_metadata_read(&release, NULL, error, sizeof(error)) == 0 &&
+        !strcmp(expected_build, otad_json_str(release, "build_id", "")) &&
+        !strcmp(otad_json_str(operation, "to_version", ""),
+                 otad_json_str(release, "dreamingwrt_version", ""));
+    otad_json_add_string(result, "phase", confirmed ? "boot_confirmed" : "failed");
+    otad_json_add_string(result, "observed_boot_id", boot_id);
+    /* The launcher may be killed by procd before it records rebooting. */
+    if (confirmed && !strcmp(otad_json_str(operation, "state", ""), "writing") &&
+        otad_operation_update(operation_id, "rebooting", 90, "", "", result) != 0)
+        goto done;
+    if (confirmed &&
+        otad_operation_update(operation_id, "reconnecting", 95, "", "", result) != 0)
+        goto done;
+    if (otad_operation_update(operation_id, confirmed ? "success" : "failed", 100,
+            confirmed ? "" : "sysupgrade_boot_not_confirmed",
+            confirmed ? "" : "native upgrade did not boot the expected release", result) == 0) {
+        otad_state_set("state", confirmed ? "idle" : "failed");
+        otad_state_set("last_error", confirmed ? "" : "sysupgrade_boot_not_confirmed");
+        (void)otad_db_persist_now();
+    }
+done:
+    if (release)
+        json_object_put(release);
+    json_object_put(operation);
+}
+#endif /* OTAD_SINGLE_SLOT_SUPPORTED */
+
 struct json_object *otad_firmware_preflight(struct json_object *body)
 {
     struct json_object *path_value = NULL;
@@ -1077,9 +1740,14 @@ struct json_object *otad_firmware_preflight(struct json_object *body)
     int blockers = 0;
 
     if (!OTAD_AB_SLOTS_SUPPORTED) {
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+        json_object_put(options);
+        return otad_firmware_preflight_single_slot(body);
+#else
         json_object_put(options);
         return otad_error("ab_slots_not_supported_on_target",
                           "full firmware preflight requires an A/B slot target");
+#endif
     }
     memset(&info, 0, sizeof(info));
     if (body && json_object_object_get_ex(body, "path", &path_value)) {
@@ -1096,6 +1764,7 @@ struct json_object *otad_firmware_preflight(struct json_object *body)
                            json_object_new_boolean(allow_unpreserved));
     json_object_object_add(options, "auto_reboot",
                            json_object_new_boolean(auto_reboot));
+    otad_json_add_string(options, "owner_id", otad_json_str(body, "owner_id", ""));
     if (otad_operation_create("firmware", "preflight", upload_id, options,
                               operation_id, error, sizeof(error)) != 0) {
         json_object_put(options);
@@ -1879,7 +2548,7 @@ static int otad_firmware_apply_worker(const char *operation_id,
     mounted = 1;
     (void)otad_operation_update(operation_id, "writing", 75, "", "", NULL);
     snprintf(kernel_path, sizeof(kernel_path), "%s/boot/vmlinuz", OTAD_SLOT_MOUNT);
-    snprintf(release_path, sizeof(release_path), "%s/etc/dreamingwrt-release.json", OTAD_SLOT_MOUNT);
+    snprintf(release_path, sizeof(release_path), "%s/etc/dreamingos-ota-manifest.json", OTAD_SLOT_MOUNT);
     if (otad_mkdir_p("/tmp/dreamingwrt", 0755) != 0) {
         snprintf(error, sizeof(error), "runtime_directory_failed");
         goto fail;
@@ -2024,11 +2693,20 @@ static void otad_operation_process_done(struct uloop_process *process, int statu
     operation = otad_operation_status_by_id(g_otad_operation_process_id);
     state = otad_json_str(operation, "state", "");
     if ((!WIFEXITED(status) || WEXITSTATUS(status) != 0) &&
-        (!strcmp(state, "writing") || !strcmp(state, "validating")))
+        (!strcmp(state, "writing") || !strcmp(state, "validating"))) {
+        struct json_object *result = NULL;
+        if (!strcmp(otad_json_str(operation, "target_slot", ""), "S")) {
+            (void)json_object_object_get_ex(operation, "result", &result);
+            if (result)
+                otad_json_add_string(result, "phase", "failed");
+            otad_state_set("state", "failed");
+            otad_state_set("last_error", "operation_worker_failed");
+        }
         (void)otad_operation_update(g_otad_operation_process_id, "failed", 100,
                                     "operation_worker_failed",
                                     "firmware operation worker exited before reaching reboot state",
-                                    NULL);
+                                    result);
+    }
     json_object_put(operation);
     otad_slot_status_cache_invalidate();
     memset(&g_otad_operation_process, 0, sizeof(g_otad_operation_process));
@@ -2081,11 +2759,16 @@ int otad_operation_worker(const char *operation_id)
         strcmp(work.state, "writing"))
         return 1;
     if (!OTAD_AB_SLOTS_SUPPORTED) {
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+        rc = otad_single_slot_apply_worker(operation_id, &work);
+        return rc == 0 ? 0 : 1;
+#else
         (void)otad_operation_update(operation_id, "failed", 100,
                                     "ab_slots_not_supported_on_target",
                                     "full firmware apply requires an A/B slot target",
                                     NULL);
         return 1;
+#endif
     }
     options = json_tokener_parse(work.options_json);
     if (!options || !json_object_is_type(options, json_type_object)) {
@@ -2113,9 +2796,14 @@ struct json_object *otad_firmware_apply(struct json_object *body)
     char active_id[OTAD_OPERATION_ID_LEN + 1] = "";
     int rc;
 
-    if (!OTAD_AB_SLOTS_SUPPORTED)
+    if (!OTAD_AB_SLOTS_SUPPORTED) {
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+        return otad_firmware_apply_single_slot(body);
+#else
         return otad_error("ab_slots_not_supported_on_target",
                           "full firmware apply requires an A/B slot target");
+#endif
+    }
     if (body && (json_object_object_get_ex(body, "path", &path_value) ||
                  json_object_object_get_ex(body, "upload_id", &upload_value)))
         return otad_error("apply_requires_preflight_operation",
@@ -2190,9 +2878,13 @@ struct json_object *otad_confirm_boot(struct json_object *body)
     int network_available;
     int64_t observation_elapsed = 0;
     int64_t observation_remaining = 0;
+    int upload_cleanup_rc = 1;
+    int upload_deleted = 0;
+    char upload_cleanup_error[96] = "";
     char *check_argv[] = { "/usr/bin/dreamingwrt-init", "check", "--json", NULL };
     struct json_object *health = NULL;
     struct otad_boot_readiness readiness;
+    int observer = g_otad_confirm_observer_mode;
 
     char topology_error[128] = "";
 
@@ -2201,8 +2893,10 @@ struct json_object *otad_confirm_boot(struct json_object *body)
     if (!OTAD_AB_SLOTS_SUPPORTED)
         return otad_error("ab_slots_not_supported_on_target",
                           "pending-slot promotion requires an A/B slot target");
-    if (otad_ab_topology_discover(&topology, topology_error,
-                                  sizeof(topology_error)) != 0)
+    if ((observer && otad_slot_status_observer_probe(
+              &topology, topology_error, sizeof(topology_error)) != 0) ||
+        (!observer && otad_ab_topology_discover(
+              &topology, topology_error, sizeof(topology_error)) != 0))
         return otad_error(topology_error[0] ? topology_error : "ab_topology_invalid",
                           "current root, A/B partitions, and DATA mount must form a valid DreamingWrt topology");
     snprintf(current, sizeof(current), "%s", topology.current_slot);
@@ -2264,6 +2958,17 @@ struct json_object *otad_confirm_boot(struct json_object *body)
     if (operation_rc < 0)
         return otad_error("operation_confirm_failed",
                           "boot was promoted but its firmware operation could not be completed");
+    if (operation_rc == 0 && completed_operation_id[0]) {
+        upload_cleanup_rc = otad_consumed_upload_cleanup(
+            completed_operation_id, &upload_deleted,
+            upload_cleanup_error, sizeof(upload_cleanup_error));
+        if (upload_cleanup_rc < 0)
+            fprintf(stderr,
+                    "[dreamingwrt-otad] consumed upload cleanup failed "
+                    "operation=%s error=%s\n",
+                    completed_operation_id,
+                    upload_cleanup_error[0] ? upload_cleanup_error : "unknown");
+    }
     otad_state_set("active_slot", current);
     otad_state_set("pending_slot", "");
     otad_state_set("pending_operation_id", "");
@@ -2286,6 +2991,13 @@ struct json_object *otad_confirm_boot(struct json_object *body)
         json_object_object_add(resp, "operation_completed",
                                json_object_new_boolean(operation_rc == 0));
         otad_json_add_string(resp, "operation_id", completed_operation_id);
+        json_object_object_add(resp, "upload_cleanup_attempted",
+                               json_object_new_boolean(upload_cleanup_rc <= 0));
+        json_object_object_add(resp, "upload_cleanup_deleted",
+                               json_object_new_boolean(upload_deleted));
+        if (upload_cleanup_rc < 0)
+            otad_json_add_string(resp, "upload_cleanup_error",
+                                 upload_cleanup_error);
         return resp;
     }
 }
@@ -2309,6 +3021,12 @@ void otad_reconcile_boot_state(void)
     int grub_tries_rc;
     sqlite3_stmt *st;
 
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+    if (!OTAD_AB_SLOTS_SUPPORTED) {
+        otad_single_slot_reconcile_boot();
+        return;
+    }
+#endif
     if (otad_ab_topology_discover(&topology, NULL, 0) != 0)
         return;
     snprintf(current, sizeof(current), "%s", topology.current_slot);
@@ -2407,9 +3125,24 @@ void otad_reconcile_boot_state(void)
         if (good_build_id[0] &&
             otad_operation_complete_confirmed_boot(
                 current, "", good_build_id, completed_operation_id) == 0)
+        {
+            int upload_deleted = 0;
+            char upload_cleanup_error[96] = "";
+
+            if (completed_operation_id[0] &&
+                otad_consumed_upload_cleanup(completed_operation_id,
+                                              &upload_deleted,
+                                              upload_cleanup_error,
+                                              sizeof(upload_cleanup_error)) < 0)
+                fprintf(stderr,
+                        "[dreamingwrt-otad] reconciled consumed upload cleanup failed "
+                        "operation=%s error=%s\n",
+                        completed_operation_id,
+                        upload_cleanup_error[0] ? upload_cleanup_error : "unknown");
             fprintf(stderr,
                     "[dreamingwrt-otad] reconciled confirmed operation=%s slot=%s build=%s\n",
                     completed_operation_id, current, good_build_id);
+        }
     }
     if (!active[0])
         otad_state_set("active_slot", current);
@@ -2774,6 +3507,68 @@ static void otad_status_probe_store_failure(
              error && error[0] ? error : "ab_topology_readonly_evidence_incomplete");
 }
 
+static int otad_slot_status_observer_probe(struct otad_ab_topology *topology,
+                                           char *error, size_t error_len)
+{
+    struct otad_ab_topology identity;
+    struct otad_ab_topology verified_topology;
+    uint64_t metadata_fingerprint = 0;
+    int metadata_ok;
+    int identity_ok;
+    int64_t now_ms;
+    int64_t age_ms = 0;
+
+    if (error && error_len)
+        error[0] = '\0';
+    if (!topology)
+        return -1;
+    memset(&identity, 0, sizeof(identity));
+    memset(&verified_topology, 0, sizeof(verified_topology));
+    now_ms = otad_status_monotonic_ms();
+    identity_ok = otad_ab_topology_readonly_probe(
+        &identity, error, error_len) == 0;
+    metadata_ok = otad_status_ota_metadata_fingerprint(&metadata_fingerprint) == 0;
+
+    if (g_otad_status_probe_cache.valid) {
+        age_ms = otad_status_probe_age_ms(now_ms);
+        if (identity_ok && metadata_ok &&
+            metadata_fingerprint ==
+                g_otad_status_probe_cache.ota_metadata_fingerprint &&
+            otad_status_topology_identity_equal(
+                &identity, &g_otad_status_probe_cache.topology)) {
+            if (g_otad_status_probe_cache.state == OTAD_STATUS_PROBE_VERIFIED) {
+                *topology = g_otad_status_probe_cache.topology;
+                return 0;
+            }
+            if (!otad_status_probe_cache_expired(
+                    g_otad_status_probe_cache.state, age_ms)) {
+                if (error && error_len)
+                    snprintf(error, error_len, "%s",
+                             g_otad_status_probe_cache.error[0] ?
+                             g_otad_status_probe_cache.error :
+                             "ab_topology_readonly_evidence_incomplete");
+                return -1;
+            }
+        }
+        otad_slot_status_cache_invalidate();
+    }
+
+    if (identity_ok &&
+        otad_ab_topology_discover(&verified_topology, error, error_len) == 0 &&
+        otad_ab_boot_state_readonly_verify(&verified_topology,
+                                           error, error_len) == 0) {
+        *topology = verified_topology;
+        otad_status_probe_store_verified(topology, now_ms,
+                                         metadata_fingerprint);
+        return 0;
+    }
+    otad_status_probe_store_failure(identity_ok ? &identity : NULL,
+                                    error, now_ms, metadata_fingerprint);
+    if (error && error_len && !error[0])
+        snprintf(error, error_len, "%s", g_otad_status_probe_cache.error);
+    return -1;
+}
+
 static const char *otad_status_probe_source(
     enum otad_status_probe_state state, int live)
 {
@@ -2990,6 +3785,35 @@ static unsigned int g_otad_hard_failure_confirmations;
 static char g_otad_hard_failure_signature[sizeof(((struct otad_boot_readiness *)0)->dimension) +
                                           sizeof(((struct otad_boot_readiness *)0)->reason) +
                                           sizeof(((struct otad_boot_readiness *)0)->subject) + 2];
+static char g_otad_nonfatal_signature[sizeof(g_otad_hard_failure_signature)];
+static unsigned int g_otad_nonfatal_retry_delay_ms;
+static int64_t g_otad_nonfatal_last_log_ms;
+
+static void otad_schedule_nonfatal_retry(const char *observation)
+{
+    int64_t now_ms = otad_status_monotonic_ms();
+
+    if (!observation)
+        observation = "boot_readiness_unavailable";
+    if (strcmp(observation, g_otad_nonfatal_signature)) {
+        snprintf(g_otad_nonfatal_signature,
+                 sizeof(g_otad_nonfatal_signature), "%s", observation);
+        g_otad_nonfatal_retry_delay_ms = OTAD_BOOT_RETRY_DELAY_MS;
+        g_otad_nonfatal_last_log_ms = 0;
+    } else if (g_otad_nonfatal_retry_delay_ms < 900000U) {
+        g_otad_nonfatal_retry_delay_ms *= 2U;
+        if (g_otad_nonfatal_retry_delay_ms > 900000U)
+            g_otad_nonfatal_retry_delay_ms = 900000U;
+    }
+    if (!g_otad_nonfatal_last_log_ms ||
+        now_ms - g_otad_nonfatal_last_log_ms >= OTAD_BOOT_LOG_REPEAT_MS) {
+        fprintf(stderr,
+                "[dreamingwrt-otad] pending boot observation retry in %u ms: %s\n",
+                g_otad_nonfatal_retry_delay_ms, observation);
+        g_otad_nonfatal_last_log_ms = now_ms;
+    }
+    uloop_timeout_set(&g_otad_confirm_timer, g_otad_nonfatal_retry_delay_ms);
+}
 
 static int otad_pending_boot_rollback(const struct otad_boot_readiness *readiness)
 {
@@ -3053,7 +3877,7 @@ static int otad_pending_boot_rollback(const struct otad_boot_readiness *readines
 static void otad_confirm_timer_cb(struct uloop_timeout *timeout)
 {
     struct json_object *body = json_object_new_object();
-    struct json_object *resp = otad_confirm_boot(body);
+    struct json_object *resp;
     struct otad_boot_readiness readiness;
     const char *dimension;
     const char *reason;
@@ -3062,6 +3886,9 @@ static void otad_confirm_timer_cb(struct uloop_timeout *timeout)
     char observation[OTAD_MAX_TEXT];
 
     (void)timeout;
+    g_otad_confirm_observer_mode = 1;
+    resp = otad_confirm_boot(body);
+    g_otad_confirm_observer_mode = 0;
     if (!otad_json_bool(resp, "ok", 0)) {
         char *reboot_argv[] = { "/sbin/reboot", NULL };
         int observation_remaining;
@@ -3083,6 +3910,9 @@ static void otad_confirm_timer_cb(struct uloop_timeout *timeout)
             g_otad_hard_failure_signature[0] = '\0';
             otad_state_set("state", "pending_boot_observing");
             otad_state_set("last_error", "");
+            g_otad_nonfatal_signature[0] = '\0';
+            g_otad_nonfatal_retry_delay_ms = OTAD_BOOT_RETRY_DELAY_MS;
+            g_otad_nonfatal_last_log_ms = 0;
             fprintf(stderr,
                     "[dreamingwrt-otad] pending slot healthy; observation remaining=%d sec\n",
                     observation_remaining);
@@ -3095,11 +3925,7 @@ static void otad_confirm_timer_cb(struct uloop_timeout *timeout)
             g_otad_hard_failure_confirmations = 0;
             g_otad_hard_failure_signature[0] = '\0';
             otad_state_set("state", "pending_boot_observing");
-            fprintf(stderr,
-                    "[dreamingwrt-otad] pending boot observation is non-fatal; no reboot: %s\n",
-                    observation);
-            uloop_timeout_set(&g_otad_confirm_timer,
-                              OTAD_BOOT_RECHECK_DELAY_MS);
+            otad_schedule_nonfatal_retry(observation);
         } else {
             snprintf(signature, sizeof(signature), "%s:%s:%s",
                      readiness.dimension, readiness.reason, readiness.subject);
@@ -3111,14 +3937,9 @@ static void otad_confirm_timer_cb(struct uloop_timeout *timeout)
                 g_otad_hard_failure_confirmations++;
             }
             otad_state_set("state", "pending_boot_hard_failure");
-            fprintf(stderr,
-                    "[dreamingwrt-otad] pending boot hard failure confirmation=%u/%u: %s\n",
-                    g_otad_hard_failure_confirmations,
-                    OTAD_BOOT_HARD_FAILURE_CONFIRMATIONS, observation);
             if (g_otad_hard_failure_confirmations <
                 OTAD_BOOT_HARD_FAILURE_CONFIRMATIONS) {
-                uloop_timeout_set(&g_otad_confirm_timer,
-                                  OTAD_BOOT_RECHECK_DELAY_MS);
+                otad_schedule_nonfatal_retry(observation);
             } else if (otad_pending_boot_rollback(&readiness) == 0) {
                 sync();
                 if (otad_run(reboot_argv) != 0) {
@@ -3135,6 +3956,9 @@ static void otad_confirm_timer_cb(struct uloop_timeout *timeout)
     } else {
         g_otad_hard_failure_confirmations = 0;
         g_otad_hard_failure_signature[0] = '\0';
+        g_otad_nonfatal_signature[0] = '\0';
+        g_otad_nonfatal_retry_delay_ms = 0;
+        g_otad_nonfatal_last_log_ms = 0;
         fprintf(stderr, "[dreamingwrt-otad] pending slot confirmed active\n");
     }
 done:
@@ -3149,7 +3973,7 @@ void otad_confirm_timer_start(void)
     char pending[16];
 
     otad_state_get("pending_slot", pending, sizeof(pending), "");
-    if (pending[0] && otad_ab_topology_discover(&topology, NULL, 0) == 0) {
+    if (pending[0] && otad_slot_status_observer_probe(&topology, NULL, 0) == 0) {
         snprintf(current, sizeof(current), "%s", topology.current_slot);
     }
     if (pending[0] && current[0] && !strcmp(current, pending)) {

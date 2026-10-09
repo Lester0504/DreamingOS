@@ -1,0 +1,69 @@
+@import url('/static/desktop/dwrt-rail.css?v=20261008-desktop-material-01');
+.nb-host { min-height: 0; height: 100%; min-width: 0; color: var(--dwrt-glass-text); }
+.nb-workbench { display: flex; height: 100%; min-height: 0; min-width: 0; }
+.nb-sidebar { overflow: auto; }
+.nb-main { flex: 1; min-width: 0; overflow: auto; padding: var(--app-page-gutter, 16px); display: flex; flex-direction: column; gap: var(--app-page-gap, 16px); padding-bottom: 100px; }
+.nb-main h1 { font-size: 20px; margin: 0; }
+.nb-main h2,.nb-editor h2 { font-size: 16px; margin: 0; }
+.nb-main h3 { font-size: 15px; margin: 0; }
+.nb-panel { padding: var(--app-page-gutter, 16px); border-radius: var(--app-radius-card, 20px); min-width: 0; }
+.nb-toolbar { display: flex; align-items: center; justify-content: space-between; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; }
+.nb-summary,.nb-fields { display: grid; grid-template-columns: repeat(2, minmax(0,1fr)); gap: var(--app-page-gap, 16px); }
+.nb-summary { grid-template-columns: repeat(3,minmax(0,1fr)); }
+.nb-summary > div,.nb-field { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+.nb-summary strong { font-size: 18px; font-weight: 600; }
+.nb-row { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; padding: 12px 0; border-bottom: 1px solid var(--dwrt-glass-edge); }
+.nb-row code { flex-basis: 100%; overflow-wrap: anywhere; }
+.nb-muted { color: var(--dwrt-glass-muted); font-size: 13px; line-height: 1.6; }
+.nb-message { padding: 12px; border: 1px solid var(--dwrt-glass-edge-strong); border-radius: var(--app-radius-control); overflow-wrap: anywhere; line-height: 1.6; }
+.nb-empty { padding: 28px 0; color: var(--dwrt-glass-muted); text-align: center; }
+.nb-path,.nb-editor code { overflow-wrap: anywhere; white-space: normal; }
+.nb-metadata,.nb-actions { display: flex; flex-wrap: wrap; gap: 10px; align-items: center; }
+.nb-image { padding: 16px 0; border-bottom: 1px solid var(--dwrt-glass-edge); }
+.nb-image:last-child { border-bottom: 0; }
+.nb-table-scroll { min-width: 0; overflow: auto; }
+.nb-table-scroll table { min-width: 560px; width: 100%; }
+.nb-table-scroll td,.nb-table-scroll th { padding: 12px; text-align: left; }
+.nb-table-scroll td button { margin: 3px; }
+.nb-field { margin: 12px 0; }
+.nb-field input,.nb-field select { width: 100%; min-width: 0; box-sizing: border-box; padding: 10px 12px; }
+.nb-check { display: flex; align-items: flex-start; gap: 10px; padding: 10px 0; line-height: 1.5; }
+.nb-check input { margin: 4px 0 0; flex-shrink: 0; }
+.nb-lans { border: 1px solid var(--dwrt-glass-edge); border-radius: var(--app-radius-control); margin: 12px 0; min-width: 0; }
+.nb-editor-layer { z-index: 80; --nb-editor-floor: calc(var(--nb-savebar-height, 0px) + 32px + var(--nb-host-bottom-inset, 0px)); padding: 12px 12px var(--nb-editor-floor); }
+.nb-editor { width: min(560px,calc(100vw - 24px)); max-height: calc(100dvh - var(--nb-editor-floor) - 24px); display: flex; flex-direction: column; padding: var(--app-page-gutter, 16px); box-sizing: border-box; }
+.nb-editor-body { overflow: auto; min-height: 0; padding-bottom: 16px; }
+.nb-editor > .nb-actions { flex-shrink: 0; justify-content: flex-end; }
+.nb-file-browser { max-height: 240px; overflow: auto; display: flex; flex-direction: column; gap: 8px; }
+.nb-file-browser button { text-align: left; overflow-wrap: anywhere; }
+.netboot-app { margin: 0; height: 100dvh; font-family: var(--font-sans,system-ui,sans-serif); background: transparent; }
+html[data-theme-family="traditional"] .netboot-app { background: var(--dwrt-glass-surface); }
+.netboot-app #netbootRoot { height: 100%; }
+@media(max-width:720px) {
+  .nb-sidebar { --dwrt-rail-width: 64px; }
+  .nb-sidebar .dwrt-rail-brand,.nb-sidebar .dwrt-rail-item-text { display: none; }
+  .nb-summary,.nb-fields { grid-template-columns: minmax(0,1fr); }
+  .nb-main { padding: 12px; padding-bottom: 150px; }
+  .nb-panel { padding: 12px; }
+  .nb-host .dwrt-floating-savebar { flex-wrap: wrap; max-width: calc(100vw - 24px); box-sizing: border-box; }
+}
+
+.nb-traditional .nb-workbench { height: auto; min-height: 100%; }
+.nb-traditional .nb-main { overflow: visible; }
+.nb-tabs { flex-shrink: 0; overflow-x: auto; }
+.nb-host > [data-nb-savebar] { position: relative; z-index: 90; }
+.nb-host .dwrt-floating-savebar { z-index: 90; }
+
+.nb-host { --app-text: var(--dwrt-glass-text); --app-text-muted: var(--dwrt-glass-muted); }
+.nb-panel { flex-shrink: 0; }
+.nb-host .dwrt-kit-confirmation-layer { z-index: 100; }
+
+.nb-host,.nb-host * { box-sizing: border-box; }
+
+.nb-traditional { background: var(--dwrt-glass-surface); }
+.console-stage.is-netboot > .stage-header { display: none; }
+
+/* The desktop Dock can overlap the window; keep the shared save island in
+   the actually visible part of this app, including after moving/resizing it. */
+.netboot-app .nb-host .dwrt-floating-savebar { bottom: calc(max(12px, env(safe-area-inset-bottom)) + var(--nb-host-bottom-inset, 0px)); }
+.netboot-app .nb-main { padding-bottom: calc(100px + var(--nb-host-bottom-inset, 0px)); }

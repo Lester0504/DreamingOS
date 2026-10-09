@@ -21,6 +21,7 @@ struct ac_pki;
 struct ac_pki_issued_certificate;
 
 int ac_pki_init(struct ac_pki **out);
+const char *ac_pki_last_reason(void);
 void ac_pki_free(struct ac_pki *pki);
 const char *ac_pki_controller_id(const struct ac_pki *pki);
 const char *ac_pki_ca_key_id(const struct ac_pki *pki);
@@ -210,8 +211,12 @@ static int inspect(void)
     size_t ca_pem_len = 0;
     int rc = 2;
 
-    if (ac_pki_init(&pki) != 0)
+    if (ac_pki_init(&pki) != 0) {
+        /* Printed on the failure path so the test can assert the specific
+         * startup reason rather than only a non-zero exit. */
+        printf("reason=%s\n", ac_pki_last_reason());
         goto done;
+    }
     ca = ac_pki_ca_certificate_dup(pki);
     server = ac_pki_server_certificate_dup(pki);
     server_key = ac_pki_server_private_key_dup(pki);

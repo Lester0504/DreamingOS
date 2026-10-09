@@ -319,6 +319,8 @@
 .file-service-surface-footer button { flex: 0 0 auto; display: inline-flex; align-items: center; gap: 7px; }
 
 .file-service-drawer {
+  --app-menu-glass-width: 0px;
+  --app-dashboard-rail-width: 0px;
   --dwrt-kit-sheet-z: 76;
   --dwrt-kit-sheet-width: var(--dwrt-kit-sheet-width-form);
 }
@@ -480,3 +482,74 @@ html[data-theme-resolved="light"] .file-service-field select {
   gap: 8px;
   margin-left: auto;
 }
+
+/* Shared remote-share workbench: the host owns material, the module owns layout. */
+.remote-share-app { margin: 0; height: 100dvh; overflow: hidden; background: transparent; color: var(--app-text); font: 14px/1.5 -apple-system, BlinkMacSystemFont, sans-serif; }
+.remote-share-app #remoteShareRoot { height: 100%; min-width: 0; }
+/* Thin host fallback geometry from design.md; the console supplies these itself. */
+.remote-share-app {
+  --app-page-gutter: clamp(12px, 1.25vw, 20px);
+  --app-page-gap: clamp(12px, 1.15vw, 18px);
+  --app-radius-card: var(--dwrt-kit-radius);
+  --app-radius-panel: 18px;
+  --app-radius-control: 12px;
+  --app-radius-compact: 8px;
+}
+html[data-desktop-app="true"]:not([data-theme-family="traditional"]) .remote-share-app .file-service-main-surface {
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+/* Standalone pages have no console wallpaper sampler; use the shared resolved ink. */
+html[data-theme-family="liquid-glass"] .remote-share-app {
+  --dwrt-glass-ink: var(--dwrt-ink);
+  --dwrt-glass-text: var(--dwrt-text);
+  --dwrt-glass-muted: var(--dwrt-muted);
+}
+html:not([data-desktop-app="true"]) .remote-share-app { background-color: var(--color-surface-solid); }
+html[data-theme-family="traditional"] .remote-share-app { background: var(--dwrt-glass-surface); }
+.file-service-shell.is-standalone { flex-direction: row; gap: 0; }
+.file-service-shell .file-service-content { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; gap: var(--app-page-gap); }
+.file-service-shell.is-standalone .file-service-content { padding: var(--app-page-gutter); }
+.file-service-shell .file-service-workbench { display: block; min-height: 0; }
+.file-service-rail svg { width: 20px; height: 20px; }
+.file-service-path { display: block; color: var(--app-text-muted); white-space: normal; overflow-wrap: anywhere; font-size: 12px; margin-top: 4px; }
+.file-service-unified-table { min-width: 740px; }
+.file-service-unified-table td:first-child { max-width: 260px; }
+.file-service-table-actions input, .file-service-table-actions select { min-width: 0; max-width: 200px; font: inherit; color: var(--app-text); background: var(--dwrt-glass-surface); border: 1px solid var(--dwrt-glass-edge); border-radius: var(--app-radius-control); padding: 8px 10px; }
+.file-service-table-actions { min-width: 0; flex-wrap: wrap; }
+.file-service-table-card > .dwrt-kit-table-toolbar { flex-wrap: wrap; }
+.file-service-table-card > .dwrt-kit-table-toolbar > strong,
+.file-service-table-card > .dwrt-kit-table-toolbar > .dwrt-kit-table-count { flex-shrink: 0; white-space: nowrap; }
+.file-service-protocols { height: 100%; min-height: 0; display: flex; flex-direction: column; gap: var(--app-page-gap); overflow-y: auto; }
+.file-service-protocol-list { display: grid; grid-template-columns: repeat(auto-fit, minmax(112px, 1fr)); gap: 8px; }
+.file-service-protocol-list button { height: auto; min-height: 80px; display: flex; flex-direction: column; gap: 3px; }
+.file-service-protocol-list button.is-active { background: var(--dwrt-glass-surface-raised); }
+.file-service-protocol-list small { color: var(--app-text-muted); }
+.file-service-protocol-toolbar { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.file-service-protocol-detail { flex: 1; min-height: 240px; }
+.file-service-protocol-detail .file-service-settings-surface { height: 100%; overflow: auto; }
+.file-service-fields { border: 0; margin: 0; padding: 0; min-width: 0; }
+.file-service-picker { margin-top: var(--app-page-gap); display: grid; gap: 8px; min-width: 0; }
+.file-service-picker select { max-width: 100%; min-width: 0; }
+.file-service-picker-list { max-height: 220px; overflow: auto; }
+.file-service-picker code { overflow-wrap: anywhere; }
+.dwrt-kit-sheet.file-service-drawer { position: fixed; inset: 0 0 0 auto; height: 100dvh; display: grid; grid-template-rows: auto minmax(0, 1fr) auto; }
+.file-service-drawer .file-service-drawer-body { padding-bottom: 100px; }
+.file-service-drawer pre { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 180px; overflow-y: auto; }
+.file-service-drawer .dwrt-kit-savebar { max-width: calc(100% - 24px); }
+.file-service-link { display: block; border: 0; background: transparent; color: var(--app-text); padding: 4px 0; text-decoration: underline; cursor: pointer; }
+.file-service-sr-only { position: absolute; width: 1px; height: 1px; overflow: hidden; clip-path: inset(50%); }
+@media (max-width: 720px) {
+  .file-service-rail { --dwrt-rail-width: 64px; }
+  .file-service-rail .dwrt-rail-brand, .file-service-rail .dwrt-rail-item-text { display: none; }
+  .file-service-shell.is-standalone .file-service-content { padding: 10px; }
+  .file-service-table-actions input { max-width: 150px; }
+  .file-service-table-card > .dwrt-kit-table-toolbar { flex-wrap: wrap; }
+  .file-service-table-actions { margin-left: 0; }
+  .file-service-protocol-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
+
+.file-service-accounts-card { height: auto; min-height: 240px; flex: 1 0 300px; grid-template-rows: auto auto minmax(100px, 1fr); }
+.file-service-account-note { margin: 0; padding: 8px 12px; color: var(--app-text-muted); font-size: 12px; line-height: 1.5; }

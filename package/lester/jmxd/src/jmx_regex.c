@@ -25,6 +25,7 @@
 
 #define PCRE2_CODE_UNIT_WIDTH 8
 #include <pcre2.h>
+#include "dw_memory_diagnostics.h"
 
 #include "jmx_regex.h"
 #include "jmx_exec.h"
@@ -79,6 +80,7 @@ static struct nfq_handle *g_nfq_h;
 static struct nfq_q_handle *g_qh;
 static int g_nl_fd;
 static int g_netlink_fd;  /* netlink fd for sending results to kernel */
+static size_t g_rule_capacity;
 static pcre2_compile_context *g_compile_ctx;
 static pcre2_match_context  *g_match_ctx;
 
@@ -1278,6 +1280,7 @@ int jmx_regex_init(const jmx_rule_set_t *rs)
 
 	g_rules = calloc(count, sizeof(regex_rule_t));
 	if (!g_rules) return -1;
+	g_rule_capacity = (size_t)count;
 
 	g_compile_ctx = pcre2_compile_context_create(NULL);
 	g_match_ctx = pcre2_match_context_create(NULL);
@@ -1348,6 +1351,7 @@ void jmx_regex_exit(void)
 		if (g_rules[i].re) pcre2_code_free(g_rules[i].re);
 	free(g_rules);
 	g_rules = NULL;
+	g_rule_capacity = 0;
 	g_rule_count = 0;
 	if (g_match_ctx) pcre2_match_context_free(g_match_ctx);
 	if (g_compile_ctx) pcre2_compile_context_free(g_compile_ctx);
@@ -1433,3 +1437,22 @@ int jmx_regex_count(void) { return g_rule_count; }
 
 /* Set netlink fd for sending results to kernel */
 void jmx_regex_set_netlink_fd(int fd) { g_netlink_fd = fd; }
+
+struct json_object *jmx_regex_memory_json(void)
+{
+    struct json_object *o = json_object_new_object();
+    uint64_t code_bytes = 0;
+    int complete = 1;
+    /* Caller holds signature runtime lock, so init/exit cannot race this walk. */
+    for (int i = 0; i < g_rule_count; ++i) {
+        size_t bytes = 0;
+        if (pcre2_pattern_info(g_rules[i].re, PCRE2_INFO_SIZE, &bytes) != 0)
+            complete = 0;
+        else code_bytes += bytes;
+    }
+    dw_mem_u64(o, "compiled_rules", g_rule_count);
+    dw_mem_u64(o, "rule_array_bytes", g_rule_capacity * sizeof(*g_rules));
+    json_object_object_add(o, "compiled_code_bytes", complete ? json_object_new_int64(code_bytes) : NULL);
+    json_object_object_add(o, "contexts_and_transient_match_bytes", NULL);
+    return o;
+}

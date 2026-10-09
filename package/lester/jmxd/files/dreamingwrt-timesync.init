@@ -1,0 +1,213 @@
+#!/bin/sh /etc/rc.common
+
+# Boot clock calibration with bounded retry.
+#
+# sysntpd (START=98) launches ntpd as a daemon, which slews the clock in
+# gradually. Nothing forces a step correction first, so on a box whose RTC
+# drifted or lost power the system time can stay visibly wrong for a long
+# while after boot -- long enough that the user ends up clicking "sync now"
+# in the web UI by hand. Anything that consumes time early pays for it:
+# certificate validity checks, audit timestamps, and OTA epoch comparisons
+# all read a clock nobody has corrected yet.
+#
+# START=99 puts this immediately after sysntpd, so the daemon's own server
+# list is already in place and this only has to force the initial step.
+#
+# The configured peers are hostnames on a stock image, so a box with no
+# working resolver can never sync from them -- and an AP with no RTC boots
+# at the epoch and stays there, which is exactly the case the step was
+# added for. So when the configured peers fail, retry against IP literals,
+# which need no DNS: an operator override first, then the default route's
+# nexthop (the upstream router is usually the nearest working server, and
+# on a managed LAN it is the only one reachable at all), then public
+# literals.
+START=99
+STOP=99
+USE_PROCD=1
+
+# ntpd -q exits once it has set the clock. Bound every pass so a boot on an
+# isolated network is delayed by seconds rather than blocking. Passes with
+# an empty peer list cost nothing, and the two routed passes are skipped
+# outright when there is no default route, so a box with no upstream still
+# waits exactly TIMESYNC_TIMEOUT -- no slower than before the fallbacks.
+TIMESYNC_TIMEOUT=20
+TIMESYNC_FALLBACK_TIMEOUT=8
+TIMESYNC_RETRY_INTERVAL=30
+TIMESYNC_MAX_ATTEMPTS=20
+TIMESYNC_STATE_DIR=/etc/dreamingwrt
+TIMESYNC_STATE=$TIMESYNC_STATE_DIR/timesync-state.json
+TIMESYNC_RUNTIME_STATE=/var/run/dreamingwrt-timesync.json
+
+# Service addresses that stay put: ntp.aliyun.com and time.cloudflare.com.
+# Written as literals on purpose -- resolving them would defeat the point.
+# Override with `uci add_list system.ntp.fallback_server=<ip>`.
+TIMESYNC_PUBLIC_PEERS="203.107.6.88 162.159.200.1"
+
+TIMESYNC_TRIED=0
+TIMESYNC_PASS=none
+TIMESYNC_PEERS=""
+
+# Usable without a resolver: an IPv4 dotted quad, or an IPv6 literal.
+timesync_is_literal() {
+	case "$1" in
+	*:*) return 0 ;;
+	*[!0-9.]*) return 1 ;;
+	*.*) return 0 ;;
+	esac
+	return 1
+}
+
+timesync_override_peers() {
+	local p
+
+	for p in $(uci -q get system.ntp.fallback_server); do
+		timesync_is_literal "$p" && echo "$p"
+	done
+}
+
+# The nexthop of every default route, deduplicated. Already an address, so
+# no resolver is involved even on a box whose DNS never comes up.
+timesync_gateway_peers() {
+	ip route show default 2>/dev/null | awk '
+		{ for (i = 1; i < NF; i++) if ($i == "via") print $(i + 1) }
+	' | sort -u
+}
+
+timesync_have_default_route() {
+	[ -n "$(ip route show default 2>/dev/null)" ]
+}
+
+# One attempt over one peer list. -n keeps ntpd in the foreground so the
+# timeout bounds the process that matters rather than a parent that has
+# already forked away from it.
+timesync_try() {
+	local budget="$1"
+	local args=""
+	local p
+
+	shift
+	for p in "$@"; do
+		[ -n "$p" ] && args="$args -p $p"
+	done
+	[ -z "$args" ] && return 1
+	timeout "$budget" /usr/sbin/ntpd -n -q $args >/dev/null 2>&1
+}
+
+# Run one pass and remember which one won, so the state file can say where
+# the time came from instead of only that it arrived. Returns 0 only when
+# the clock was actually stepped, so start() can chain passes with `||`.
+timesync_pass() {
+	local name="$1"
+	local budget="$2"
+	local peers
+
+	shift 2
+	peers="$*"
+	[ -z "$peers" ] && return 1
+	TIMESYNC_TRIED=1
+	timesync_try "$budget" $peers || return 1
+	TIMESYNC_PASS="$name"
+	TIMESYNC_PEERS="$peers"
+	return 0
+}
+
+# Monotonic seconds. The point of recording a skew is to say how far the
+# clock was out, and `after - before` cannot: the passes themselves take
+# tens of seconds, so an already-correct clock would report a skew the size
+# of its own boot delay. Netting out the real time spent leaves the step.
+timesync_uptime() {
+	cut -d. -f1 /proc/uptime 2>/dev/null || echo 0
+}
+
+timesync_write_state() {
+	local tmp
+	local result="$1"
+	local before="$2"
+	local after="$3"
+	local pass="$4"
+	local peers="$5"
+	local elapsed="${6:-0}"
+	local skew=0
+
+	[ -n "$before" ] && [ -n "$after" ] && skew=$((after - before - elapsed))
+	mkdir -p "$TIMESYNC_STATE_DIR"
+	tmp="$TIMESYNC_STATE.tmp.$$"
+	cat > "$tmp" <<EOF
+{"result":"$result","pass":"$pass","peers":"$peers","before":$before,"after":$after,"skew":$skew,"elapsed":$elapsed,"at":$(date +%s)}
+EOF
+	mv "$tmp" "$TIMESYNC_STATE"
+	cp "$TIMESYNC_STATE" "$TIMESYNC_RUNTIME_STATE.tmp.$$"
+	mv "$TIMESYNC_RUNTIME_STATE.tmp.$$" "$TIMESYNC_RUNTIME_STATE"
+}
+
+timesync_once() {
+	local before
+	local after
+	local up_before
+	local elapsed
+
+	[ "$(uci -q get system.ntp.enabled)" = "0" ] && {
+		timesync_write_state "disabled" 0 0 "none" "" 0
+		return 0
+	}
+
+	before="$(date +%s)"
+	up_before="$(timesync_uptime)"
+	if timesync_pass configured "$TIMESYNC_TIMEOUT" $(uci -q get system.ntp.server) ||
+		timesync_pass override_literal "$TIMESYNC_FALLBACK_TIMEOUT" $(timesync_override_peers) ||
+		{ timesync_have_default_route &&
+			{ timesync_pass gateway_literal "$TIMESYNC_FALLBACK_TIMEOUT" $(timesync_gateway_peers) ||
+				timesync_pass public_literal "$TIMESYNC_FALLBACK_TIMEOUT" $TIMESYNC_PUBLIC_PEERS; }; }; then
+		after="$(date +%s)"
+		elapsed=$(($(timesync_uptime) - up_before))
+		# Push the corrected time into the RTC so the next boot starts from
+		# something sane even before the network is up. Absent on an AP.
+		{ [ -c /dev/rtc0 ] || [ -c /dev/rtc ]; } && hwclock -w -u >/dev/null 2>&1
+		timesync_write_state "stepped" "$before" "$after" "$TIMESYNC_PASS" "$TIMESYNC_PEERS" "$elapsed"
+		return 0
+	fi
+
+	after="$(date +%s)"
+	elapsed=$(($(timesync_uptime) - up_before))
+	if [ "$TIMESYNC_TRIED" = "0" ]; then
+		timesync_write_state "no_servers" "$before" "$after" "none" "" "$elapsed"
+	else
+		timesync_write_state "timeout" "$before" "$after" "none" "" "$elapsed"
+	fi
+	return 0
+}
+
+timesync_worker() {
+	local attempt=1
+
+	while [ "$attempt" -le "$TIMESYNC_MAX_ATTEMPTS" ]; do
+		TIMESYNC_TRIED=0
+		TIMESYNC_PASS=none
+		TIMESYNC_PEERS=""
+		timesync_once
+		grep -q '"result":"stepped"' "$TIMESYNC_STATE" 2>/dev/null && return 0
+		attempt=$((attempt + 1))
+		sleep "$TIMESYNC_RETRY_INTERVAL"
+	done
+	return 0
+}
+
+start_service() {
+	procd_open_instance
+	procd_set_param command /etc/init.d/dreamingwrt-timesync worker
+	procd_set_param respawn 3600 5 0
+	procd_close_instance
+}
+
+service_triggers() {
+	procd_add_reload_trigger system
+}
+
+extra_command "worker" "Run the bounded initial clock synchronisation worker"
+worker() {
+	timesync_worker
+}
+
+stop() {
+	return 0
+}

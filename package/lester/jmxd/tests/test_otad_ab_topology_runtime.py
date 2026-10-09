@@ -7,6 +7,8 @@ import shutil
 import subprocess
 import tempfile
 
+from otad_test_deps import find_host_dependencies
+
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -163,7 +165,25 @@ static int fixture_mount(const char *source, const char *target,
             "last_good_slot=A\nslot_a_valid=1\nslot_b_valid=0\n" :
             "active_slot=A\npending_slot=\ntries_left=0\n"
             "last_good_slot=A\nslot_a_valid=1\nslot_b_valid=1\n";
-    if (getenv("OTAD_FIXTURE_GRUBCFG_MISMATCH"))
+    if (getenv("OTAD_FIXTURE_GRUBCFG_NEW_SLOT"))
+        grubcfg =
+            "menuentry 'Dreaming OS slot A' --id dwrt_a {\n"
+            " linux /boot/vmlinuz root=PARTUUID=root-a-uuid dreamingos.slot=A\n}\n"
+            "menuentry 'Dreaming OS slot B' --id dwrt_b {\n"
+            " linux /boot/vmlinuz root=PARTUUID=root-b-uuid dreamingos.slot=B\n}\n";
+    else if (getenv("OTAD_FIXTURE_GRUBCFG_SAME_SLOT_ALIASES"))
+        grubcfg =
+            "menuentry 'Dreaming OS slot A' --id dwrt_a {\n"
+            " linux /boot/vmlinuz root=PARTUUID=root-a-uuid dreamingos.slot=A dreamingwrt.slot=A\n}\n"
+            "menuentry 'Dreaming OS slot B' --id dwrt_b {\n"
+            " linux /boot/vmlinuz root=PARTUUID=root-b-uuid dreamingos.slot=B dreamingwrt.slot=B\n}\n";
+    else if (getenv("OTAD_FIXTURE_GRUBCFG_SLOT_ALIAS_CONFLICT"))
+        grubcfg =
+            "menuentry 'Dreaming OS slot A' --id dwrt_a {\n"
+            " linux /boot/vmlinuz root=PARTUUID=root-a-uuid dreamingos.slot=B dreamingwrt.slot=A\n}\n"
+            "menuentry 'Dreaming OS slot B' --id dwrt_b {\n"
+            " linux /boot/vmlinuz root=PARTUUID=root-b-uuid dreamingos.slot=B dreamingwrt.slot=B\n}\n";
+    else if (getenv("OTAD_FIXTURE_GRUBCFG_MISMATCH"))
         grubcfg =
             "menuentry 'A' {\n"
             " linux /boot/vmlinuz root=PARTUUID=root-b-uuid dreamingwrt.slot=A\n}\n"
@@ -433,6 +453,20 @@ def fixture(root: Path) -> None:
 
 
 def mutate(root: Path, case: str) -> str:
+    if case == "cmdline_slot_new_only":
+        (root / "proc/cmdline").write_text(
+            "root=PARTUUID=root-a-uuid dreamingos.slot=A\n", encoding="ascii")
+        return "ok"
+    if case == "cmdline_slot_alias_same":
+        (root / "proc/cmdline").write_text(
+            "root=PARTUUID=root-a-uuid dreamingos.slot=A dreamingwrt.slot=A\n",
+            encoding="ascii")
+        return "ok"
+    if case == "cmdline_slot_alias_conflict":
+        (root / "proc/cmdline").write_text(
+            "root=PARTUUID=root-a-uuid dreamingos.slot=B dreamingwrt.slot=A\n",
+            encoding="ascii")
+        return "cmdline_slot_alias_conflict"
     if case == "cmdline_slot_mismatch":
         (root / "proc/cmdline").write_text(
             "root=PARTUUID=root-a-uuid dreamingwrt.slot=B\n", encoding="ascii")
@@ -524,41 +558,8 @@ def select_root_b(root: Path) -> None:
     )
 
 
-def dependency_roots() -> tuple[Path, ...]:
-    configured = os.environ.get("OTAD_TEST_DEP_ROOT", "")
-    roots: list[Path] = []
-
-    if configured:
-        root = Path(configured)
-        roots.append(root / "usr" if (root / "usr/include").is_dir() else root)
-    roots.extend((
-        Path("/opt/homebrew"),
-        Path("/usr/local"),
-        Path("/opt/homebrew/var/homebrew/tmp/.cellar/json-c/0.19"),
-    ))
-    return tuple(roots)
-
-
-def find_dependencies() -> tuple[Path, Path, Path, Path]:
-    roots = dependency_roots()
-    for root in roots:
-        json_header = root / "include/json-c/json.h"
-        json_library = root / "lib/libjson-c.a"
-        if not json_header.is_file() or not json_library.is_file():
-            continue
-        crypto_roots = (root, Path("/opt/homebrew/opt/openssl@3"), Path("/usr/local/opt/openssl@3"))
-        for crypto_root in crypto_roots:
-            if (crypto_root / "include/openssl/evp.h").is_file() and \
-                    ((crypto_root / "lib/libcrypto.a").is_file() or
-                     (crypto_root / "lib/libcrypto.so").is_file() or
-                     (crypto_root / "lib/libcrypto.dylib").is_file()):
-                return (root / "include", json_library,
-                        crypto_root / "include", crypto_root / "lib")
-    raise RuntimeError("json-c and OpenSSL development files not found")
-
-
 def main() -> None:
-    json_include, json_library, crypto_include, crypto_library_dir = find_dependencies()
+    deps = find_host_dependencies(ROOT)
     with tempfile.TemporaryDirectory(prefix="otad-topology-runtime-") as td:
         temp = Path(td)
         fixture_root = temp / "fixture"
@@ -573,22 +574,22 @@ def main() -> None:
         command = [
             os.environ.get("CC", "cc"), "-std=gnu11", "-Wall", "-Wextra",
             "-Werror=implicit-function-declaration", "-I", str(stub_root),
-            "-I", str(json_include),
-            "-I", str(crypto_include),
+            "-I", str(deps.json_include),
+            "-I", str(deps.openssl_include),
             "-I", str(ROOT / "src/otad"),
             f'-DOTAD_TOPOLOGY_SYS_BLOCK_DIR="{fixture_root / "sys/class/block"}"',
             f'-DOTAD_TOPOLOGY_DEV_DIR="{fixture_root / "dev"}"',
             f'-DOTAD_TOPOLOGY_PARTUUID_DIR="{fixture_root / "dev/disk/by-partuuid"}"',
             f'-DOTAD_TOPOLOGY_CMDLINE_PATH="{fixture_root / "proc/cmdline"}"',
             f'-DOTAD_TOPOLOGY_MOUNTINFO_PATH="{fixture_root / "proc/self/mountinfo"}"',
-            str(harness), str(json_library), "-L", str(crypto_library_dir),
+            str(harness), str(deps.json_library), "-L", str(deps.openssl_library_dir),
             "-lcrypto", "-o", str(binary),
         ]
         subprocess.run(command, check=True)
 
         run_env = os.environ.copy()
         current_library_path = run_env.get("LD_LIBRARY_PATH", "")
-        run_env["LD_LIBRARY_PATH"] = str(crypto_library_dir) + (
+        run_env["LD_LIBRARY_PATH"] = str(deps.openssl_library_dir) + (
             f":{current_library_path}" if current_library_path else ""
         )
 
@@ -597,6 +598,12 @@ def main() -> None:
         blank_env = run_env.copy()
         blank_env["OTAD_FIXTURE_ROOT_B_BLANK"] = "1"
         subprocess.run([str(binary), "ok"], check=True, env=blank_env)
+        for case in ("cmdline_slot_new_only", "cmdline_slot_alias_same",
+                     "cmdline_slot_alias_conflict"):
+            shutil.rmtree(fixture_root)
+            fixture(fixture_root)
+            expected = mutate(fixture_root, case)
+            subprocess.run([str(binary), expected], check=True, env=run_env)
         for env_key in ("OTAD_FIXTURE_ACTIVE_B", "OTAD_FIXTURE_PENDING_B"):
             shutil.rmtree(fixture_root)
             fixture(fixture_root)
@@ -604,6 +611,13 @@ def main() -> None:
             boot_b_env = run_env.copy()
             boot_b_env[env_key] = "1"
             subprocess.run([str(binary), "ok"], check=True, env=boot_b_env)
+        for env_key in ("OTAD_FIXTURE_GRUBCFG_NEW_SLOT",
+                        "OTAD_FIXTURE_GRUBCFG_SAME_SLOT_ALIASES"):
+            shutil.rmtree(fixture_root)
+            fixture(fixture_root)
+            grub_alias_env = run_env.copy()
+            grub_alias_env[env_key] = "1"
+            subprocess.run([str(binary), "ok"], check=True, env=grub_alias_env)
         for case in (
             "cmdline_slot_mismatch", "cmdline_root_mismatch",
             "cmdline_slot_missing", "cmdline_slot_duplicate",
@@ -633,6 +647,7 @@ def main() -> None:
             ("OTAD_FIXTURE_GRUBCFG_MISMATCH", "bootloader_slot_entry_mismatch"),
             ("OTAD_FIXTURE_GRUBCFG_COMMENT_SPOOF", "bootloader_slot_entry_mismatch"),
             ("OTAD_FIXTURE_GRUBCFG_CROSS_ENTRY", "bootloader_slot_entry_mismatch"),
+            ("OTAD_FIXTURE_GRUBCFG_SLOT_ALIAS_CONFLICT", "bootloader_slot_entry_mismatch"),
             ("OTAD_FIXTURE_GRUBCFG_MISSING", "bootloader_state_files_unavailable"),
             ("OTAD_FIXTURE_PENDING_ACTIVE", "bootloader_pending_active_slot_conflict"),
             ("OTAD_FIXTURE_TRIES_WITHOUT_PENDING", "bootloader_tries_without_pending_slot"),

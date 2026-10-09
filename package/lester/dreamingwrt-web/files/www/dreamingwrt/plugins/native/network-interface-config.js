@@ -5,7 +5,7 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (ch) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[ch])));
-  const VERSION = '20260806-lan-delete-gate-01';
+  const VERSION = '20260810-wan-health-modes-01';
   const kind = /(?:^|[-_/])wan(?:$|[-_/])/.test(`${item.id || ''} ${item.func_name || ''} ${item.path || ''}`) ? 'wan' : 'lan';
   const isWan = kind === 'wan';
   const embedded = context.embedded === true;
@@ -108,6 +108,26 @@ export function mount(context = {}) {
       if (Number.isFinite(number)) return number;
     }
     return 0;
+  }
+
+  function optionalNumber(...values) {
+    for (const value of values) {
+      if (value === '' || value === null || value === undefined) continue;
+      const number = Number(value);
+      if (Number.isFinite(number)) return number;
+    }
+    return null;
+  }
+
+  function normalizeHealthTargets(value) {
+    const parsed = parseJsonValue(value, {});
+    if (Array.isArray(parsed)) {
+      return { ping: firstText(parsed[0]), http: '' };
+    }
+    return {
+      ping: firstText(parsed?.ping, parsed?.host),
+      http: firstText(parsed?.http, parsed?.url)
+    };
   }
 
   function asArray(value, keys = []) {
@@ -343,7 +363,7 @@ export function mount(context = {}) {
         health_check: {
           enabled: booleanValue(advanced.health_check?.enabled, true),
           mode: firstText(advanced.health_check?.mode, 'ping'),
-          targets_json: firstText(advanced.health_check?.targets_json, '[]')
+          targets_json: firstText(advanced.health_check?.targets_json, '{}')
         },
         dhcp: {
           hostname: firstText(advanced.dhcp?.hostname),
@@ -368,7 +388,8 @@ export function mount(context = {}) {
       online: booleanValue(runtime.online, ['ok', 'up', 'online'].includes(firstText(row.status).toLowerCase())),
       uptime: firstNumber(row.connected_seconds, row.online_seconds, row.uptime, runtime.connected_seconds, runtime.uptime),
       latency: firstNumber(row.latency_ms, runtime.latency_ms),
-      loss: firstNumber(row.loss_pct, runtime.loss_pct),
+      up_loss: optionalNumber(row.up_loss_pct, runtime.up_loss_pct),
+      down_loss: optionalNumber(row.down_loss_pct, runtime.down_loss_pct),
       up_rate: firstNumber(row.up_rate, runtime.up_rate),
       down_rate: firstNumber(row.down_rate, runtime.down_rate)
     };
@@ -492,7 +513,7 @@ export function mount(context = {}) {
     return normalizeWan({
       id, name: id.toUpperCase(), ifname: id, device: '', access_mode: 'dhcp', enabled: true,
       mtu: 1500, metric: (state.rows.length + 1) * 10, role: state.rows.length ? 'failover' : 'primary',
-      advanced: { default_route: state.rows.length === 0, failover: true, health_check: { enabled: true, mode: 'ping', targets_json: '[]' } }
+      advanced: { default_route: state.rows.length === 0, failover: true, health_check: { enabled: true, mode: 'http_ping_gateway', targets_json: '{"ping":"223.5.5.5","http":"https://www.baidu.com/"}' } }
     }, state.rows.length);
   }
 
@@ -823,7 +844,7 @@ export function mount(context = {}) {
   }
 
   function switchField(field, checked, title, detail = '') {
-    return `<label class="network-interface-switch-row"><span><strong>${escapeHtml(title)}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</span><input type="checkbox" data-interface-field="${escapeHtml(field)}" ${checked ? 'checked' : ''}><i></i></label>`;
+    return `<label class="network-interface-switch-row dwrt-kit-switch" data-dwrt-component="switch"><span><strong>${escapeHtml(title)}</strong>${detail ? `<small>${escapeHtml(detail)}</small>` : ''}</span><input type="checkbox" data-interface-field="${escapeHtml(field)}" ${checked ? 'checked' : ''}></label>`;
   }
 
   /*
@@ -1071,6 +1092,9 @@ export function mount(context = {}) {
     const mode = draft.access_mode;
     const advanced = draft.advanced || {};
     const health = advanced.health_check || {};
+    const healthTargets = normalizeHealthTargets(health.targets_json);
+    const healthUsesPing = ['ping_gateway', 'http_ping_gateway', 'ping', 'http_ping'].includes(health.mode);
+    const healthUsesHttp = ['http_gateway', 'http_ping_gateway', 'http', 'http_ping'].includes(health.mode);
     const dhcp = advanced.dhcp || {};
     const pppoe = advanced.pppoe || {};
     const hybridWrite = state.capabilities.hybrid_wan_write === true;
@@ -1089,7 +1113,8 @@ export function mount(context = {}) {
     if (mode === 'bridge') accessFields = '<p class="network-interface-inline-note">Bridge 模式不在本接口配置 IPv4 地址，地址由下游设备管理。</p>';
     const access = `${segmentedField('access_mode', mode, accessOptions, '上网方式')}${accessFields ? dependentMarkup(accessFields, 'is-access-method') : ''}${!hybridWrite ? availabilityMarkup('物理网卡混合模式与 VLAN 混合模式需要后端提供子线路存储、运行态应用、readback 与失败回滚；当前 capability 为 hybrid_wan_write=false。') : ''}`;
     const ipv6 = `${segmentedField('ipv6_mode', draft.ipv6_mode, [['disabled', '关闭', '不配置 IPv6'], ['auto', '自动', '跟随上游'], ['dhcpv6', 'DHCPv6', '请求地址与前缀'], ['static', '静态', '手动指定地址']], 'IPv6 模式')}${draft.ipv6_mode !== 'disabled' ? dependentMarkup(`${formField('IPv6 地址', inputField('ipv6_addr', draft.ipv6_addr, { placeholder: '2001:db8::2/64' }))}${formField('委派前缀', inputField('delegated_prefix', draft.delegated_prefix, { placeholder: '2001:db8:1::/56' }))}`) : ''}`;
-    const routing = `<div class="network-interface-form-grid">${formField('MTU', inputField('mtu', draft.mtu, { type: 'number', min: 576, max: 9000 }))}${formField('路由 Metric', inputField('metric', draft.metric, { type: 'number', min: 0, max: 65535 }))}${formField('线路角色', selectField('role', draft.role, [['primary', '主线路'], ['failover', '故障转移'], ['backup', '备用线路']]))}${formField('预计下行（Mbps）', inputField('expected_down_mbps', draft.expected_down_mbps, { type: 'number', min: 0 }))}${formField('预计上行（Mbps）', inputField('expected_up_mbps', draft.expected_up_mbps, { type: 'number', min: 0 }))}${formField('上线时间段', inputField('advanced.link_time', advanced.link_time, { placeholder: '00:00-23:59' }))}${switchField('advanced.default_route', advanced.default_route, '默认路由', '优先作为默认出口')}${switchField('advanced.failover', advanced.failover, '参与故障转移', '线路异常时参与切换策略')}${switchField('advanced.health_check.enabled', health.enabled, '线路健康检查', '按目标持续验证可用性')}${health.enabled ? dependentMarkup(`${formField('探测方式', selectField('advanced.health_check.mode', health.mode, [['ping', 'Ping'], ['dns', 'DNS'], ['http', 'HTTP']]))}${formField('探测目标', inputField('advanced.health_check.targets_text', asArray(parseJsonValue(health.targets_json, [])).join(', ')), '多个目标使用逗号分隔')}`) : ''}${switchField('smart_queue', draft.smart_queue, '智能队列')}${switchField('upnp', draft.upnp, 'UPnP')}${switchField('ddns', draft.ddns, '动态 DNS')}</div>`;
+    const healthFields = health.enabled ? dependentMarkup(`${formField('线路检测', selectField('advanced.health_check.mode', health.mode, [['http_gateway', 'HTTP + 网关'], ['ping_gateway', 'PING + 网关'], ['http_ping_gateway', 'HTTP + PING + 网关'], ['http', 'HTTP'], ['ping', 'PING'], ['http_ping', 'HTTP + PING']]))}${healthUsesPing ? formField('PING 地址', inputField('advanced.health_check.ping_target', healthTargets.ping, { placeholder: '223.5.5.5' })) : ''}${healthUsesHttp ? formField('HTTP 地址', inputField('advanced.health_check.http_url', healthTargets.http, { placeholder: 'https://www.baidu.com/' })) : ''}`) : '';
+    const routing = `<div class="network-interface-form-grid">${formField('MTU', inputField('mtu', draft.mtu, { type: 'number', min: 576, max: 9000 }))}${formField('路由 Metric', inputField('metric', draft.metric, { type: 'number', min: 0, max: 65535 }))}${formField('线路角色', selectField('role', draft.role, [['primary', '主线路'], ['failover', '故障转移'], ['backup', '备用线路']]))}${formField('预计下行（Mbps）', inputField('expected_down_mbps', draft.expected_down_mbps, { type: 'number', min: 0 }))}${formField('预计上行（Mbps）', inputField('expected_up_mbps', draft.expected_up_mbps, { type: 'number', min: 0 }))}${formField('上线时间段', inputField('advanced.link_time', advanced.link_time, { placeholder: '00:00-23:59' }))}${switchField('advanced.default_route', advanced.default_route, '默认路由', '优先作为默认出口')}${switchField('advanced.failover', advanced.failover, '参与故障转移', '线路异常时参与切换策略')}${switchField('advanced.health_check.enabled', health.enabled, '线路健康检查', '按目标持续验证可用性')}${healthFields}${switchField('smart_queue', draft.smart_queue, '智能队列')}${switchField('upnp', draft.upnp, 'UPnP')}${switchField('ddns', draft.ddns, '动态 DNS')}</div>`;
     const protocol = `${switchField('vlan_enabled', draft.vlan_enabled, 'WAN VLAN', '在物理接口上绑定运营商 VLAN')}${draft.vlan_enabled ? dependentMarkup(formField('VLAN ID', inputField('vlan_id', draft.vlan_id, { type: 'number', min: 1, max: 4094 }))) : ''}${mode === 'dhcp' ? dependentMarkup(`${formField('Hostname / Option 12', inputField('advanced.dhcp.hostname', dhcp.hostname))}${formField('Vendor Class / Option 60', inputField('advanced.dhcp.vendor_class', dhcp.vendor_class))}${formField('Client ID / Option 61', inputField('advanced.dhcp.client_id', dhcp.client_id))}`, 'is-protocol-options') : ''}${mode === 'pppoe' ? dependentMarkup(`${formField('AC 名称', inputField('advanced.pppoe.ac', pppoe.ac))}${formField('AC MAC', inputField('advanced.pppoe.ac_mac', pppoe.ac_mac))}${formField('服务名称', inputField('advanced.pppoe.service', pppoe.service))}${switchField('advanced.pppoe.timing_restart', pppoe.timing_restart, '定时重拨')}${pppoe.timing_restart ? `${formField('重拨时间', inputField('advanced.pppoe.restart_time', pppoe.restart_time, { placeholder: '04:00' }))}${formField('重拨星期', inputField('advanced.pppoe.restart_week', pppoe.restart_week, { placeholder: '1234567' }))}` : ''}${switchField('advanced.pppoe.abnormal_ip_check', pppoe.abnormal_ip_check, '异常 IP 检测')}${pppoe.abnormal_ip_check ? formField('异常地址前缀', inputField('advanced.pppoe.abnormal_ip_prefixes', pppoe.abnormal_ip_prefixes)) : ''}`, 'is-protocol-options') : ''}`;
     const lines = asArray(draft.hybrid_lines);
     const multi = draft.pppoe_multi || {};
@@ -1306,7 +1331,7 @@ export function mount(context = {}) {
       state.draft.extra_ips = String(value).split(',').map((entry) => entry.trim()).filter(Boolean);
       return;
     }
-    if (['dns_text', 'dhcp.dns_text', 'ipv6.dns_text', 'ipv6.parent_text', 'advanced.health_check.targets_text', 'pppoe_multi.check_week_text', 'bond.members_text'].includes(field)) {
+    if (['dns_text', 'dhcp.dns_text', 'ipv6.dns_text', 'ipv6.parent_text', 'pppoe_multi.check_week_text', 'bond.members_text'].includes(field)) {
       const list = String(value).split(',').map((entry) => entry.trim()).filter(Boolean);
       if (field === 'dns_text') state.draft.dns = list;
       else if (field === 'dhcp.dns_text') state.draft.dhcp.dns = list;
@@ -1314,7 +1339,6 @@ export function mount(context = {}) {
       else if (field === 'ipv6.parent_text') state.draft.ipv6.parent_wans = list;
       else if (field === 'pppoe_multi.check_week_text') state.draft.pppoe_multi.check_week = String(value).split('').filter(Boolean);
       else if (field === 'bond.members_text') state.draft.bond.members_json = JSON.stringify(list);
-      else state.draft.advanced.health_check.targets_json = JSON.stringify(list);
       return;
     }
     if (field === 'address.ip' || field === 'address.prefix') {
@@ -1394,7 +1418,12 @@ export function mount(context = {}) {
       is_primary: index === 0
     })) : [];
     const advanced = clone(draft.advanced || {});
-    advanced.health_check.targets_json = firstText(advanced.health_check?.targets_json, '[]');
+    const healthTargets = normalizeHealthTargets(advanced.health_check?.targets_json);
+    healthTargets.ping = firstText(advanced.health_check?.ping_target, healthTargets.ping);
+    healthTargets.http = firstText(advanced.health_check?.http_url, healthTargets.http);
+    advanced.health_check.targets_json = JSON.stringify(healthTargets);
+    delete advanced.health_check.ping_target;
+    delete advanced.health_check.http_url;
     return {
       id: firstText(draft.id),
       name: firstText(draft.name, draft.id),
@@ -1781,7 +1810,7 @@ export function mount(context = {}) {
     if (!field) return;
     patchDraft(field.dataset.interfaceField, field);
     /* carrier_select 会决定「运营商名称」自由输入框是否出现，所以也要重绘抽屉内容。 */
-    const conditional = ['access_mode', 'mode', 'dhcp.enabled', 'ipv6.enabled', 'ipv6.use_dns6', 'ipv6.ra_mtu_set', 'ipv6_mode', 'advanced.health_check.enabled', 'advanced.pppoe.timing_restart', 'advanced.pppoe.abnormal_ip_check', 'vlan_enabled', 'carrier_select'].includes(field.dataset.interfaceField);
+    const conditional = ['access_mode', 'mode', 'dhcp.enabled', 'ipv6.enabled', 'ipv6.use_dns6', 'ipv6.ra_mtu_set', 'ipv6_mode', 'advanced.health_check.enabled', 'advanced.health_check.mode', 'advanced.pppoe.timing_restart', 'advanced.pppoe.abnormal_ip_check', 'vlan_enabled', 'carrier_select'].includes(field.dataset.interfaceField);
     if (conditional) patchDrawerContents(field.dataset.interfaceField);
   }
 

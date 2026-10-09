@@ -49,6 +49,8 @@ struct apd_config_job_assignment {
     char candidate_digest[APD_CONFIG_JOB_DIGEST_LEN + 1];
     char ap_id[APD_CONFIG_JOB_AP_ID_LEN + 1];
     char session_epoch[APD_CONFIG_JOB_SESSION_EPOCH_LEN + 1];
+    char operation[9];
+    char rollback_of_job_id[APD_CONFIG_JOB_UUID_LEN + 1];
 };
 
 struct apd_config_job_finish {
@@ -120,6 +122,9 @@ int apd_config_job_session_rebind(
     struct apd_config_job_journal_entry *out);
 int apd_config_job_journal_get(const char *job_id,
                                struct apd_config_job_journal_entry *out);
+int apd_config_job_previous_get(
+    const struct apd_config_job_assignment *assignment,
+    char **previous_json_out);
 int apd_config_job_journal_prune(int64_t now);
 
 #endif

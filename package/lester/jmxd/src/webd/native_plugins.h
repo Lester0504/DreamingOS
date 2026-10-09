@@ -8,6 +8,9 @@
 #define WEBD_NATIVE_API_PREFIX "/api/v1/plugins/native/"
 
 struct json_object *webd_native_plugins_scan(void);
+/* Same validated inventory; nonzero errors means it is incomplete. Missing
+ * optional registry root is an empty installation, not an I/O failure. */
+struct json_object *webd_native_plugins_scan_checked(int *errors);
 void webd_native_plugins_merge_menu(struct json_object *menu);
 const char *webd_native_required_permission(const char *method, const char *path);
 /* Read-only check on a permission's action suffix, for audit risk grading. */

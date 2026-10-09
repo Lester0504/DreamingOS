@@ -1,0 +1,79 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+    <meta name="robots" content="noindex,nofollow">
+    <title>网络工具箱 · Dreaming OS</title>
+    <link rel="icon" href="/static/images/logo-64.png">
+    <!-- 接入全局材质接口：与桌面壳/路由控制台同一套 data-theme-family × data-theme-resolved
+         令牌系统（液态玻璃/毛玻璃/传统）。此页在桌面窗口 iframe 内渲染，透明 body 让窗口
+         材质从头贯通到尾。左右结构：左侧手风琴分组导航（基础诊断/网络信息/HTTP/局域网/
+         性能/路由专属/实用工具），右侧 InputCard 表单 + ResultCard 结果。对标 RoceOS 网络
+         工具箱，并补齐我方独有的路由专属组与实时面板。前景一律消费令牌，绝不硬编码墨色。 -->
+    <script>
+      (function () {
+        var VALID = ['liquid-glass', 'frosted-glass', 'traditional'];
+        var DEFAULT_FAMILY = 'frosted-glass';
+        var root = document.documentElement;
+        function stamp() {
+          var fam = '';
+          try { fam = localStorage.getItem('dreamingwrt.web.themeFamily') || ''; } catch (e) {}
+          root.dataset.themeFamily = VALID.indexOf(fam) >= 0 ? fam : DEFAULT_FAMILY;
+          var pref = 'system';
+          try { pref = localStorage.getItem('dreamingwrt.web.themePref') || 'system'; } catch (e) {}
+          var dark = pref === 'dark' || (pref === 'system' && window.matchMedia && window.matchMedia('(prefers-color-scheme: dark)').matches);
+          root.dataset.themePref = pref;
+          root.dataset.themeResolved = dark ? 'dark' : 'light';
+        }
+        stamp();
+        try {
+          window.addEventListener('storage', function (e) {
+            if (e.key === 'dreamingwrt.web.themeFamily' || e.key === 'dreamingwrt.web.themePref') stamp();
+          });
+          if (window.matchMedia) {
+            window.matchMedia('(prefers-color-scheme: dark)').addEventListener('change', function () {
+              if ((root.dataset.themePref || 'system') === 'system') stamp();
+            });
+          }
+        } catch (e) {}
+      })();
+    </script>
+    <link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
+    <link rel="stylesheet" href="/static/css/theme-families.css?v=20261008-desktop-material-01">
+    <link rel="stylesheet" href="/static/desktop/dwrt-rail.css?v=20261008-desktop-material-01">
+    <link rel="stylesheet" href="/static/desktop/network-tools/network-tools.css?v=20260927-rail-spec-01">
+  </head>
+  <body>
+    <div class="nt-shell" id="ntApp">
+      <!-- 侧栏 = 桌面 App 统一左侧栏（dwrt-rail，规范 md/desktop-mode-layout-spec.md §9，以系统设置侧栏为准）。
+           应用名已在居中标题栏，不在侧栏重复「网络工具箱」。 -->
+      <aside class="nt-sidebar dwrt-rail">
+        <div class="dwrt-rail-brand" aria-hidden="true">
+          <img src="/static/images/logo-wide.png?v=20260919-brand-01" alt="DreamingOS">
+        </div>
+        <div class="dwrt-rail-search">
+          <span class="dwrt-rail-search-icon" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="7"></circle><path d="m20 20-3.5-3.5"></path></svg></span>
+          <input type="search" id="ntSearch" class="dwrt-rail-search-input" placeholder="搜索工具" aria-label="搜索工具" autocomplete="off" spellcheck="false">
+        </div>
+        <nav class="dwrt-rail-list" id="ntNav" aria-label="网络工具箱导航"></nav>
+        <div class="nt-foot dwrt-rail-foot" id="ntFoot">
+          <span class="nt-foot-dot" id="ntFootDot"></span>
+          <span id="ntFootText">就绪</span>
+        </div>
+      </aside>
+      <main class="nt-main" id="ntMain">
+        <div class="nt-empty" id="ntEmpty">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.4" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><circle cx="12" cy="12" r="9"></circle><path d="M3 12h18M12 3c2.6 2.7 4 6 4 9s-1.4 6.3-4 9c-2.6-2.7-4-6-4-9s1.4-6.3 4-9z"></path></svg>
+          <p>从左侧选择一个网络工具</p>
+        </div>
+      </main>
+    </div>
+    <div class="nt-toast" id="ntToast" role="status" hidden></div>
+
+    <script src="/static/js/dwrt-session-gate.js?v=20260808-region-ink-uses-painted-density-01" defer></script>
+    <script src="/static/ui-kit/lucide.min.js" defer></script>
+    <script src="/static/desktop/glass-foreground.js?v=20261008-desktop-material-01" defer></script>
+    <script src="/static/desktop/network-tools/network-tools.js?v=20260927-rail-spec-01" defer></script>
+  </body>
+</html>

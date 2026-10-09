@@ -638,6 +638,33 @@ int ap_control_json_get_int64(struct json_object *object, const char *name,
     return AP_CONTROL_WIRE_OK;
 }
 
+void ap_control_json_scrub_string(struct json_object *object, const char *name)
+{
+    struct json_object *value = NULL;
+    const char *serialized;
+    const char *text;
+    int length;
+
+    if (!object || !name)
+        return;
+
+    /* json-c retains a parent print buffer after serialization. Scrub that
+     * cache before removing the child, or the complete frame can outlive the
+     * string object even after its own storage has been cleansed. */
+    serialized = json_object_to_json_string_ext(object, JSON_C_TO_STRING_PLAIN);
+    if (serialized)
+        OPENSSL_cleanse((void *)serialized, strlen(serialized));
+
+    if (json_object_object_get_ex(object, name, &value) && value &&
+        json_object_is_type(value, json_type_string)) {
+        text = json_object_get_string(value);
+        length = json_object_get_string_len(value);
+        if (text && length > 0)
+            OPENSSL_cleanse((void *)text, (size_t)length);
+    }
+    json_object_object_del(object, name);
+}
+
 int ap_control_uuid4(char out[37])
 {
     static const char digits[] = "0123456789abcdef";
@@ -662,7 +689,8 @@ int ap_control_uuid4(char out[37])
 }
 
 static const char *const ap_control_capability_names[] = {
-    "config_executor", "validate", "stage", "apply", "readback", "rollback"
+    "config_executor", "validate", "stage", "apply", "readback", "rollback",
+    "secret_executor"
 };
 
 int ap_control_capabilities_add(struct json_object *object,
@@ -671,7 +699,8 @@ int ap_control_capabilities_add(struct json_object *object,
     const int values[AP_CONTROL_CAPABILITY_COUNT] = {
         caps ? caps->config_executor : 0, caps ? caps->validate : 0,
         caps ? caps->stage : 0, caps ? caps->apply : 0,
-        caps ? caps->readback : 0, caps ? caps->rollback : 0
+        caps ? caps->readback : 0, caps ? caps->rollback : 0,
+        caps ? caps->secret_executor : 0
     };
     size_t i;
 
@@ -682,6 +711,7 @@ int ap_control_capabilities_add(struct json_object *object,
     for (i = 0; i < AP_CONTROL_CAPABILITY_COUNT; i++)
         json_object_object_add(nested, ap_control_capability_names[i],
                                json_object_new_boolean(values[i] != 0));
+    json_object_object_add(nested, "certificate_executor", json_object_new_boolean(caps->certificate_executor != 0));
     json_object_object_add(object, "capabilities", nested);
     return AP_CONTROL_WIRE_OK;
 }
@@ -698,8 +728,9 @@ int ap_control_capabilities_parse(struct json_object *object,
     values[0] = &caps->config_executor; values[1] = &caps->validate;
     values[2] = &caps->stage; values[3] = &caps->apply;
     values[4] = &caps->readback; values[5] = &caps->rollback;
+    values[6] = &caps->secret_executor;
     memset(caps, 0, sizeof(*caps));
-    for (i = 0; i < AP_CONTROL_CAPABILITY_COUNT; i++) {
+    for (i = 0; i < AP_CONTROL_CAPABILITY_COUNT - 1; i++) {
         struct json_object *value = NULL;
 
         if (!json_object_object_get_ex(object, ap_control_capability_names[i],
@@ -708,9 +739,35 @@ int ap_control_capabilities_parse(struct json_object *object,
             return AP_CONTROL_WIRE_INVALID_FIELDS;
         *values[i] = json_object_get_boolean(value) ? 1 : 0;
     }
-    return ap_control_json_object_exact(object, ap_control_capability_names,
-        AP_CONTROL_CAPABILITY_COUNT, ap_control_capability_names,
-        AP_CONTROL_CAPABILITY_COUNT);
+    {
+        struct json_object *value = NULL;
+
+        if (json_object_object_get_ex(object, "secret_executor", &value)) {
+            if (!value || !json_object_is_type(value, json_type_boolean))
+                return AP_CONTROL_WIRE_INVALID_FIELDS;
+            caps->secret_executor = json_object_get_boolean(value) ? 1 : 0;
+        }
+    }
+    {
+        struct json_object *value = NULL;
+        if (json_object_object_get_ex(object, "certificate_executor", &value)) {
+            if (!value || !json_object_is_type(value, json_type_boolean)) return AP_CONTROL_WIRE_INVALID_FIELDS;
+            caps->certificate_executor = json_object_get_boolean(value) ? 1 : 0;
+        }
+    }
+    /*
+     * Deliberately no exact()/unknown-key check here.  The loop above already
+     * requires every core name to be present and boolean, so the only thing an
+     * exact() call added was rejecting names this build has never heard of --
+     * which made adding any capability a wire-compatibility break.  It broke
+     * exactly that way: an AC carrying `secret_executor` could not hold a
+     * session with an apd built before that name existed, and both sides logged
+     * transport noise (`connect_retry` / `session_closed stage=frame_read`)
+     * instead of a version mismatch.  A capability this build cannot name is one
+     * it cannot execute either, so leaving it zeroed is the honest reading, and
+     * ap_control_capabilities_all_true() still gates writes on the core six.
+     */
+    return AP_CONTROL_WIRE_OK;
 }
 
 int ap_control_capabilities_all_true(

@@ -259,6 +259,27 @@ static void test_normal_commit(void)
 	require_actions(actions, sizeof(actions) / sizeof(actions[0]));
 }
 
+static void test_empty_ruleset_forces_off_generation(void)
+{
+	static const uint32_t actions[] = {
+		JMX_NL_ACT_RULESET_BEGIN_V3,
+		JMX_NL_ACT_RULESET_COMMIT_V3,
+	};
+	jmx_chain_rule_set_t set;
+	jmx_v3_kernel_status_t status;
+
+	memset(&set, 0, sizeof(set));
+	reset_kernel(FIXTURE_NORMAL);
+	assert(jmx_nl_push_chain_rules(9, &set, 41, JMX_V3_MODE_SHADOW,
+				       &status) == 0);
+	assert(status.active_generation == 41);
+	assert(status.active_rules == 0);
+	assert(status.active_steps == 0);
+	assert(status.active_ports == 0);
+	assert(status.active_mode == JMX_V3_MODE_OFF);
+	require_actions(actions, sizeof(actions) / sizeof(actions[0]));
+}
+
 static void test_explicit_nack_aborts_without_status_probe(void)
 {
 	static const uint32_t actions[] = {
@@ -330,10 +351,11 @@ static void test_timeout_identity_mismatch_aborts_and_preserves_old_active(void)
 
 int main(void)
 {
-	assert(JMX_V3_PRODUCTION_GATE_ENABLED == 0);
-	assert(jmx_v3_effective_mode(JMX_V3_MODE_SHADOW) == JMX_V3_MODE_OFF);
-	assert(jmx_v3_effective_mode(JMX_V3_MODE_ACTIVE) == JMX_V3_MODE_OFF);
+	assert(JMX_V3_PRODUCTION_GATE_ENABLED == 1);
+	assert(jmx_v3_effective_mode(JMX_V3_MODE_SHADOW) == JMX_V3_MODE_SHADOW);
+	assert(jmx_v3_effective_mode(JMX_V3_MODE_ACTIVE) == JMX_V3_MODE_ACTIVE);
 	test_normal_commit();
+	test_empty_ruleset_forces_off_generation();
 	test_explicit_nack_aborts_without_status_probe();
 	test_commit_timeout_reconciles_full_active_identity();
 	test_timeout_identity_mismatch_aborts_and_preserves_old_active();

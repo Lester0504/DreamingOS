@@ -1,0 +1,153 @@
+#!/bin/sh
+# SPDX-License-Identifier: GPL-2.0-or-later
+#
+# Activates or deactivates the DreamingWrt console's TLS entrance on 443, and
+# (separately) native LuCI on 12517.
+#
+# Both config files ship as *.disabled, outside nginx's `include conf.d/*.conf`
+# glob, and this script is the only thing that activates them. That indirection
+# is the safety property: an nginx server block referencing a missing
+# ssl_certificate makes `nginx -t` fail, and a failing config makes nginx refuse
+# to start *entirely* — including the plaintext admin UI on 80. Shipping the
+# block pre-activated would mean one failed cert generation locks the user out
+# of their own router.
+#
+# So every activation here is: stage it, test it, and back the change out if the
+# test fails, leaving the running nginx untouched.
+
+set -u
+
+CONF_DIR="/etc/nginx/conf.d"
+SSL_CONF="$CONF_DIR/dreamingwrt-console-ssl.conf"
+LUCI_CONF="$CONF_DIR/luci-12517.conf"
+CERT_TOOL="/usr/libexec/dreamingwrt/dreamingwrt-web-tls-cert"
+CERT="/etc/dreamingwrt/tls/console.crt"
+KEY="/etc/dreamingwrt/tls/console.key"
+
+say() { echo "$*" >&2; }
+
+nginx_running() {
+	local p
+	# BusyBox ps cannot see daemons on this platform, so walk /proc instead.
+	for p in /proc/[0-9]*; do
+		tr '\0' ' ' < "$p/cmdline" 2>/dev/null | grep -q "nginx" && return 0
+	done
+	return 1
+}
+
+# Applies a staged config only if it tests clean; otherwise removes it again and
+# leaves the running server exactly as it was.
+apply_or_revert() {
+	local target="$1" label="$2"
+
+	if ! nginx -t >/dev/null 2>&1; then
+		say "FAIL: nginx config test failed with $label active. Reverting."
+		nginx -t 2>&1 | sed 's/^/    /' >&2
+		rm -f "$target"
+		if nginx -t >/dev/null 2>&1; then
+			say "Reverted; existing nginx config is valid and untouched."
+		else
+			say "WARNING: config still fails after revert. Something else is broken."
+		fi
+		return 1
+	fi
+
+	if nginx_running; then
+		# reload, not restart: an in-flight admin session survives a reload.
+		if /etc/init.d/nginx reload >/dev/null 2>&1; then
+			say "OK: $label active, nginx reloaded."
+		else
+			say "FAIL: reload failed. Reverting $label."
+			rm -f "$target"
+			/etc/init.d/nginx reload >/dev/null 2>&1
+			return 1
+		fi
+	else
+		say "OK: $label staged. nginx is not running; start it when ready."
+	fi
+	return 0
+}
+
+port_is_free() {
+	# netstat rather than a bind test, so this never briefly steals the port.
+	! netstat -tln 2>/dev/null | grep -qE "[:.]$1[[:space:]]"
+}
+
+enable_ssl() {
+	[ -f "$SSL_CONF.disabled" ] || [ -f "$SSL_CONF" ] || {
+		say "FAIL: $SSL_CONF.disabled is missing; is dreamingwrt-web installed?"
+		return 1
+	}
+
+	[ -x "$CERT_TOOL" ] && "$CERT_TOOL" ensure
+	if [ ! -s "$CERT" ] || [ ! -s "$KEY" ]; then
+		say "FAIL: no usable certificate at $CERT; refusing to activate 443."
+		return 1
+	fi
+
+	if ! port_is_free 443; then
+		say "FAIL: something already listens on 443. Refusing to fight over it."
+		return 1
+	fi
+
+	[ -f "$SSL_CONF.disabled" ] && cp "$SSL_CONF.disabled" "$SSL_CONF"
+	apply_or_revert "$SSL_CONF" "console TLS on 443"
+}
+
+disable_ssl() {
+	[ -f "$SSL_CONF" ] || { say "443 block is already inactive."; return 0; }
+	rm -f "$SSL_CONF"
+	if nginx_running && nginx -t >/dev/null 2>&1; then
+		/etc/init.d/nginx reload >/dev/null 2>&1
+	fi
+	say "OK: console TLS on 443 deactivated; 80 unaffected."
+}
+
+enable_luci() {
+	[ -f "$LUCI_CONF.disabled" ] || [ -f "$LUCI_CONF" ] || {
+		say "FAIL: $LUCI_CONF.disabled is missing."
+		return 1
+	}
+
+	# This is the ordering constraint from the migration: webd owns 12517 until
+	# it is moved, and two servers cannot bind the same port.
+	if ! port_is_free 12517; then
+		say "FAIL: 12517 is still in use (webd has not moved off it yet)."
+		say "      Move webd first, then run this again."
+		return 1
+	fi
+
+	[ -f "$LUCI_CONF.disabled" ] && cp "$LUCI_CONF.disabled" "$LUCI_CONF"
+	apply_or_revert "$LUCI_CONF" "LuCI on 12517"
+}
+
+disable_luci() {
+	[ -f "$LUCI_CONF" ] || { say "LuCI 12517 block is already inactive."; return 0; }
+	rm -f "$LUCI_CONF"
+	if nginx_running && nginx -t >/dev/null 2>&1; then
+		/etc/init.d/nginx reload >/dev/null 2>&1
+	fi
+	say "OK: LuCI on 12517 deactivated."
+}
+
+status() {
+	echo "console TLS (443):  $([ -f "$SSL_CONF" ] && echo active || echo inactive)"
+	echo "LuCI (12517):       $([ -f "$LUCI_CONF" ] && echo active || echo inactive)"
+	echo "certificate:        $([ -s "$CERT" ] && echo "$CERT" || echo "absent")"
+	[ -s "$CERT" ] && openssl x509 -in "$CERT" -noout -subject -dates \
+		-ext subjectAltName 2>/dev/null | sed 's/^/                    /'
+	echo "listeners:"
+	netstat -tln 2>/dev/null | grep -E "[:.](80|443|12517)[[:space:]]" | sed 's/^/  /'
+}
+
+case "${1:-status}" in
+	enable-ssl)   enable_ssl ;;
+	disable-ssl)  disable_ssl ;;
+	enable-luci)  enable_luci ;;
+	disable-luci) disable_luci ;;
+	status)       status ;;
+	*)
+		echo "usage: ${0##*/} [enable-ssl|disable-ssl|enable-luci|disable-luci|status]" >&2
+		exit 1
+		;;
+esac

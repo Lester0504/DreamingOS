@@ -31,10 +31,28 @@ int main(void)
     char encoded[65];
     char uuid[37];
     const char *protocol = NULL;
+    const char *secret_text = NULL;
+    const char *serialized = NULL;
     int64_t integer = 0;
     char many_keys[8192];
     size_t many_used = 0;
     unsigned int i;
+    struct ap_control_capabilities capabilities = {1, 1, 1, 1, 1, 1};
+    struct json_object *capability_object = json_object_new_object();
+    struct json_object *nested_capabilities = NULL;
+
+    assert(capability_object != NULL);
+    assert(ap_control_capabilities_add(capability_object, &capabilities) ==
+           AP_CONTROL_WIRE_OK);
+    assert(ap_control_capabilities_all_true(&capabilities));
+    assert(json_object_object_get_ex(capability_object, "capabilities",
+                                     &nested_capabilities));
+    assert(ap_control_capabilities_parse(nested_capabilities, &capabilities) ==
+           AP_CONTROL_WIRE_OK);
+    json_object_object_add(capability_object, "unknown", json_object_new_boolean(1));
+    assert(ap_control_capabilities_parse(capability_object, &capabilities) ==
+           AP_CONTROL_WIRE_INVALID_FIELDS);
+    json_object_put(capability_object);
 
     expect_parse("{\"protocol\":\"ap-control.v1\",\"kind\":\"hello\",\"payload\":{}}",
                  AP_CONTROL_WIRE_OK);
@@ -88,6 +106,17 @@ int main(void)
     assert(ap_control_json_get_int64(object, "number", 1, 100, &integer) ==
            AP_CONTROL_WIRE_OK && integer == 42);
     json_object_object_del(object, "number");
+    json_object_object_add(object, "secret",
+                           json_object_new_string("fixture-secret-123"));
+    assert(json_object_object_get_ex(object, "secret", &nested_capabilities));
+    secret_text = json_object_get_string(nested_capabilities);
+    serialized = json_object_to_json_string_ext(object, JSON_C_TO_STRING_PLAIN);
+    assert(secret_text && strstr(secret_text, "fixture-secret-123"));
+    assert(serialized && strstr(serialized, "fixture-secret-123"));
+    ap_control_json_scrub_string(object, "secret");
+    assert(strstr(secret_text, "fixture-secret-123") == NULL);
+    assert(strstr(serialized, "fixture-secret-123") == NULL);
+    assert(!json_object_object_get_ex(object, "secret", &nested_capabilities));
     memset(binary, 0xa5, sizeof(binary));
     assert(ap_control_hex_encode(binary, sizeof(binary), encoded,
                                  sizeof(encoded)) == AP_CONTROL_WIRE_OK);

@@ -58,5 +58,6 @@ void jmx_cache_gc(void);
  * Shutdown: free all cache memory.
  */
 void jmx_cache_done(void);
+struct json_object *jmx_cache_status_json(void);
 
 #endif

@@ -11,9 +11,10 @@
 
 #include "routed_control.h"
 
-#define ROUTED_INTERVAL_MS 30000
+#define ROUTED_INTERVAL_MS 3000
 #define ROUTED_INITIAL_DELAY_MS 1000
 #define ROUTED_RETRY_DELAY_MS 3000
+#define ROUTED_RETRY_MAX_DELAY_MS 60000
 #define JMX_ROUTE_PROC "/proc/dreamingwrt/jmx/jmx_route"
 
 static struct ubus_context *route_ubus;
@@ -28,6 +29,7 @@ static time_t route_last_warn;
  */
 static unsigned int route_tick_failures;
 static int route_runtime_loaded;
+static unsigned int route_reload_failures;
 
 struct route_invoke_result {
     int received;
@@ -171,21 +173,53 @@ static int route_invoke_reload(void)
         return -1;
     }
     route_runtime_loaded = 1;
+    route_reload_failures = 0;
     return 0;
 }
 
 static void route_tick_cb(struct uloop_timeout *t)
 {
-    if (!route_runtime_loaded || !route_proc_has_wan()) {
+    int runtime_present = route_proc_has_wan();
+
+    if (route_runtime_loaded && !runtime_present)
         route_runtime_loaded = 0;
-        if (route_invoke_reload() != 0) {
-            uloop_timeout_set(t, ROUTED_RETRY_DELAY_MS);
+
+    if (!route_runtime_loaded) {
+        /* A core restart can leave a valid kernel route graph in place while
+         * the replay call itself is temporarily unavailable or returns a
+         * degraded result.  Adopt that graph instead of flushing it again;
+         * otherwise routed turns one transient error into a 3-second reload
+         * storm and blocks the core uloop for several seconds per attempt. */
+        if (runtime_present) {
+            route_runtime_loaded = 1;
+            route_reload_failures = 0;
+            route_warn_throttled("adopting existing kernel route runtime", 0);
+        } else if (route_invoke_reload() != 0) {
+            unsigned int delay = ROUTED_RETRY_DELAY_MS;
+            unsigned int shift = route_reload_failures++;
+
+            if (shift < 5)
+                delay <<= shift;
+            if (delay > ROUTED_RETRY_MAX_DELAY_MS)
+                delay = ROUTED_RETRY_MAX_DELAY_MS;
+            uloop_timeout_set(t, delay);
             return;
         }
     }
     if (route_invoke_tick() != 0)
         route_runtime_loaded = route_proc_has_wan();
-    uloop_timeout_set(t, route_runtime_loaded ? ROUTED_INTERVAL_MS : ROUTED_RETRY_DELAY_MS);
+    if (route_runtime_loaded)
+        uloop_timeout_set(t, ROUTED_INTERVAL_MS);
+    else {
+        unsigned int delay = ROUTED_RETRY_DELAY_MS;
+        unsigned int shift = route_reload_failures++;
+
+        if (shift < 5)
+            delay <<= shift;
+        if (delay > ROUTED_RETRY_MAX_DELAY_MS)
+            delay = ROUTED_RETRY_MAX_DELAY_MS;
+        uloop_timeout_set(t, delay);
+    }
 }
 
 static void route_handle_signal(int signo)

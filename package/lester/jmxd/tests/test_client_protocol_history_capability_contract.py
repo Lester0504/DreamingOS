@@ -3,7 +3,10 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = (ROOT / "src/webd/jmx_app_api.c").read_text(encoding="utf-8")
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import webd_dispatch_text
+WEB = webd_dispatch_text()
 
 
 def body(text: str, start: str, end: str) -> str:

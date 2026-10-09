@@ -74,10 +74,38 @@ struct ac_device_model_report {
 struct ac_pki;
 struct ac_pki_issued_certificate;
 
+/* Standalone transport builds intentionally avoid the daemon's full header
+ * graph. Keep the narrow secret/audit/CA seams explicit so source additions
+ * cannot turn a fixture compile failure into a transport regression. */
+void ac_secret_rotation_session_begin(const char *ap_id, int capable);
+void ac_secret_rotation_session_end(const char *ap_id);
+struct json_object *ac_secret_rotation_poll(const char *ap_id,
+                                             const char *session_epoch,
+                                             int64_t reply_to);
+struct json_object *ac_secret_rotation_prepare(struct json_object *message,
+                                                const char *ap_id,
+                                                const char *session_epoch,
+                                                int64_t reply_to);
+struct json_object *ac_secret_rotation_commit(struct json_object *message,
+                                               const char *ap_id,
+                                               const char *session_epoch,
+                                               int64_t reply_to);
+void ac_secret_rotation_scrub_offer(struct json_object *message);
+int ac_db_ap_audit_store(const char *ap_id, const char *event_id,
+                         int64_t occurred_at, const char *session_epoch,
+                         const char *actor, const char *actor_session,
+                         const char *source_ip, const char *action,
+                         const char *risk, const char *target,
+                         const char *result, const char *failure_reason,
+                         const char *request_id, int64_t schema_version);
+int ac_pki_ca_pem(const struct ac_pki *pki, unsigned char **out,
+                  size_t *out_len);
+
 extern char fixture_current_session_epoch[AC_RADIO_JOB_SESSION_EPOCH_MAX + 1];
 void fixture_radio_jobs_reset(const char *session_epoch);
 
 int ac_pki_init(struct ac_pki **out);
+const char *ac_pki_last_reason(void);
 void ac_pki_free(struct ac_pki *pki);
 const char *ac_pki_controller_id(const struct ac_pki *pki);
 const unsigned char *ac_pki_ca_fingerprint_sha256(const struct ac_pki *pki);
@@ -122,6 +150,25 @@ int ac_db_enrollment_activate(const char *enrollment_id,
     struct ac_enrollment_record *out);
 int ac_db_ap_session_begin(const char *ap_id, const char *session_epoch,
                            int protocol_version, int64_t received_at);
+int ac_db_ap_session_begin_with_capabilities(
+    const char *ap_id, const char *session_epoch, int protocol_version,
+    int write_capable, int64_t received_at);
+#define AC_AP_UNBIND_ERROR_MAX 127
+#define AC_AP_UNBIND_OK 0
+#define AC_AP_UNBIND_NOT_FOUND (-1)
+struct ac_ap_unbind_request {
+    char request_id[37], ap_id[37], certificate_id[37], enrollment_id[37];
+    char state[16];
+    int64_t requested_at, acknowledged_at;
+    char error_code[128];
+};
+int ac_db_ap_session_begin_with_capabilities_and_unbind(
+    const char *ap_id, const char *session_epoch, int protocol_version,
+    int write_capable, int64_t received_at, struct ac_ap_unbind_request *out);
+int ac_db_ap_unbind_request_pending(const char *ap_id, struct ac_ap_unbind_request *out);
+int ac_db_ap_unbind_request_ack(const char *ap_id, const char *session_epoch,
+    const char *request_id, int unpaired, const char *error_code,
+    struct ac_ap_unbind_request *out);
 int ac_db_ap_session_end(const char *ap_id, const char *session_epoch);
 int ac_db_ap_heartbeat(const char *ap_id, const char *session_epoch,
                        int64_t received_at);
@@ -181,6 +228,8 @@ struct ac_config_job {
     char finish_id[AC_RADIO_JOB_ID_LEN + 1];
     char outcome[15];
     char error_code[AC_RADIO_JOB_ERROR_MAX + 1];
+    char operation[9];
+    char rollback_of_job_id[AC_RADIO_JOB_ID_LEN + 1];
 };
 int ac_db_config_job_lease_next(const char *ap_id,
                                 const char *session_epoch, int64_t now,

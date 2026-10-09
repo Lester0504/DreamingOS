@@ -32,6 +32,7 @@
 #include <openssl/sha.h>
 #include <openssl/x509.h>
 #include <openssl/x509v3.h>
+#include "ac_certificate_lifecycle.h"
 
 #ifndef O_DIRECTORY
 #error "dreamingwrt-ac PKI requires O_DIRECTORY"
@@ -59,12 +60,38 @@
 #define AC_PKI_CLIENT_LIFETIME ((int64_t)90 * 24 * 60 * 60)
 #define AC_PKI_CLOCK_SKEW 900
 
+/*
+ * Startup failure reasons.
+ *
+ * These strings leave the process: they reach the operator through the
+ * transport status, the capability payload and the supervisor log, so a caller
+ * can branch on them. Treat every spelling here as a contract and add rather
+ * than rename. Folding everything into one "pki_init_failed" is what made the
+ * 31.250 restart loop undiagnosable from the log alone.
+ */
+enum ac_pki_reason {
+    AC_PKI_REASON_NONE = 0,
+    AC_PKI_REASON_DIRECTORY_PATH_INVALID,
+    AC_PKI_REASON_PARENT_UNTRUSTED,
+    AC_PKI_REASON_DIRECTORY_UNTRUSTED,
+    AC_PKI_REASON_DIRECTORY_CREATE_FAILED,
+    AC_PKI_REASON_DIRECTORY_MODE_INVALID,
+    AC_PKI_REASON_LOCK_INVALID,
+    AC_PKI_REASON_KEY_INVALID,
+    AC_PKI_REASON_CERTIFICATE_INVALID,
+    AC_PKI_REASON_CLOCK_INVALID,
+    AC_PKI_REASON_LISTEN_NAMES_INVALID,
+    AC_PKI_REASON_INTERNAL,
+};
+
 struct ac_pki {
     char directory[1024];
     char controller_id[AC_PKI_CONTROLLER_ID_LEN + 1];
     char ca_key_id[AC_PKI_KEY_ID_LEN + 1];
     char ca_fingerprint_text[AC_PKI_KEY_ID_LEN + 1];
     unsigned char ca_fingerprint[AC_PKI_FINGERPRINT_LEN];
+    char generation[37];
+    X509 *alternate_ca;
     EVP_PKEY *ca_key;
     X509 *ca_cert;
     EVP_PKEY *server_key;
@@ -99,6 +126,55 @@ struct ac_pki_name_list {
     struct ac_pki_name values[AC_PKI_MAX_LISTEN_NAMES];
     size_t count;
 };
+
+static _Thread_local enum ac_pki_reason g_ac_pki_reason = AC_PKI_REASON_NONE;
+
+static const char *ac_pki_reason_text(enum ac_pki_reason reason)
+{
+    switch (reason) {
+    case AC_PKI_REASON_DIRECTORY_PATH_INVALID:
+        return "pki_directory_path_invalid";
+    case AC_PKI_REASON_PARENT_UNTRUSTED:
+        return "pki_parent_untrusted";
+    case AC_PKI_REASON_DIRECTORY_UNTRUSTED:
+        return "pki_directory_untrusted";
+    case AC_PKI_REASON_DIRECTORY_CREATE_FAILED:
+        return "pki_directory_create_failed";
+    case AC_PKI_REASON_DIRECTORY_MODE_INVALID:
+        return "pki_directory_mode_invalid";
+    case AC_PKI_REASON_LOCK_INVALID:
+        return "pki_lock_invalid";
+    case AC_PKI_REASON_KEY_INVALID:
+        return "pki_key_invalid";
+    case AC_PKI_REASON_CERTIFICATE_INVALID:
+        return "pki_certificate_invalid";
+    case AC_PKI_REASON_CLOCK_INVALID:
+        return "pki_clock_invalid";
+    case AC_PKI_REASON_LISTEN_NAMES_INVALID:
+        return "pki_listen_names_invalid";
+    case AC_PKI_REASON_INTERNAL:
+        return "pki_internal_error";
+    case AC_PKI_REASON_NONE:
+        break;
+    }
+    return "pki_init_failed";
+}
+
+static void ac_pki_reason_set(enum ac_pki_reason reason)
+{
+    g_ac_pki_reason = reason;
+}
+
+static int ac_pki_fail(enum ac_pki_reason reason)
+{
+    ac_pki_reason_set(reason);
+    return -1;
+}
+
+const char *ac_pki_last_reason(void)
+{
+    return ac_pki_reason_text(g_ac_pki_reason);
+}
 
 static int ac_pki_write_full(int fd, const unsigned char *data, size_t len)
 {
@@ -175,6 +251,43 @@ static int ac_pki_sync_directory(int dirfd)
     return fsync(dirfd) == 0 ? 0 : -1;
 }
 
+/*
+ * Bring an already existing PKI directory back to 0700.
+ *
+ * The startup contract wants exactly 0700, but a directory that was created by
+ * an earlier install path, restored from a config archive, or unpacked from an
+ * image can legitimately arrive as 0755 with the key material inside it intact.
+ * Refusing forever in that state is what put 31.250 in a five-second restart
+ * loop: the material was fine, only the directory bit was wrong, and nothing
+ * in the product could repair it.
+ *
+ * Converging is safe only when the directory is ours and was never writable by
+ * anyone else, because a group- or world-writable directory may already have
+ * had files planted or swapped inside it. In that case tightening the mode
+ * would paper over a real compromise, so it stays fail-closed with its own
+ * reason. The mode is changed through the open descriptor, so the path cannot
+ * be swapped between the check and the change.
+ */
+static int ac_pki_converge_directory_mode(int pki_fd, const char *path,
+                                          const struct stat *observed)
+{
+    struct stat after;
+
+    if (!observed)
+        return ac_pki_fail(AC_PKI_REASON_INTERNAL);
+    if ((observed->st_mode & 0022) != 0)
+        return ac_pki_fail(AC_PKI_REASON_DIRECTORY_MODE_INVALID);
+    if (fchmod(pki_fd, 0700) != 0 || fstat(pki_fd, &after) != 0 ||
+        !S_ISDIR(after.st_mode) || !ac_pki_owner_secure(after.st_uid) ||
+        after.st_dev != observed->st_dev || after.st_ino != observed->st_ino ||
+        (after.st_mode & 0777) != 0700)
+        return ac_pki_fail(AC_PKI_REASON_DIRECTORY_MODE_INVALID);
+    fprintf(stderr, "[dreamingwrt-ac] pki directory %s was %04o, tightened to "
+                    "0700 (owner and write bits verified first)\n",
+            path ? path : "(unknown)", (unsigned)(observed->st_mode & 0777));
+    return 0;
+}
+
 static int ac_pki_prepare_directory(const char *path)
 {
     char parent[1024];
@@ -185,26 +298,41 @@ static int ac_pki_prepare_directory(const char *path)
     int pki_fd = -1;
     int rc = -1;
 
-    if (ac_pki_split_path(path, parent, sizeof(parent), &base) != 0 ||
-        lstat(parent, &parent_st) != 0 || !S_ISDIR(parent_st.st_mode) ||
+    if (ac_pki_split_path(path, parent, sizeof(parent), &base) != 0)
+        return ac_pki_fail(AC_PKI_REASON_DIRECTORY_PATH_INVALID);
+    if (lstat(parent, &parent_st) != 0 || !S_ISDIR(parent_st.st_mode) ||
         !ac_pki_owner_secure(parent_st.st_uid) ||
         (parent_st.st_mode & 0022) != 0)
-        return -1;
+        return ac_pki_fail(AC_PKI_REASON_PARENT_UNTRUSTED);
     parent_fd = open(parent, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
     if (parent_fd < 0 || fstat(parent_fd, &parent_st) != 0 ||
         !S_ISDIR(parent_st.st_mode) ||
         !ac_pki_owner_secure(parent_st.st_uid) ||
-        (parent_st.st_mode & 0022) != 0)
+        (parent_st.st_mode & 0022) != 0) {
+        ac_pki_reason_set(AC_PKI_REASON_PARENT_UNTRUSTED);
         goto done;
-    if (mkdirat(parent_fd, base, 0700) != 0 && errno != EEXIST)
+    }
+    if (mkdirat(parent_fd, base, 0700) != 0 && errno != EEXIST) {
+        ac_pki_reason_set(AC_PKI_REASON_DIRECTORY_CREATE_FAILED);
         goto done;
-    if (ac_pki_sync_directory(parent_fd) != 0)
+    }
+    if (ac_pki_sync_directory(parent_fd) != 0) {
+        ac_pki_reason_set(AC_PKI_REASON_DIRECTORY_CREATE_FAILED);
         goto done;
+    }
     pki_fd = openat(parent_fd, base, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
     if (pki_fd < 0 || fstat(pki_fd, &pki_st) != 0 ||
-        !S_ISDIR(pki_st.st_mode) || !ac_pki_owner_secure(pki_st.st_uid) ||
-        (pki_st.st_mode & 0777) != 0700)
+        !S_ISDIR(pki_st.st_mode) || !ac_pki_owner_secure(pki_st.st_uid)) {
+        ac_pki_reason_set(AC_PKI_REASON_DIRECTORY_UNTRUSTED);
         goto done;
+    }
+    if ((pki_st.st_mode & 0777) != 0700 &&
+        ac_pki_converge_directory_mode(pki_fd, path, &pki_st) != 0)
+        goto done;
+    if (ac_pki_sync_directory(pki_fd) != 0) {
+        ac_pki_reason_set(AC_PKI_REASON_DIRECTORY_UNTRUSTED);
+        goto done;
+    }
     rc = pki_fd;
     pki_fd = -1;
 done:
@@ -397,7 +525,7 @@ static int ac_pki_lock(int dirfd)
         (st.st_mode & 0777) != 0600 || lock_rc != 0) {
         if (fd >= 0)
             close(fd);
-        return -1;
+        return ac_pki_fail(AC_PKI_REASON_LOCK_INVALID);
     }
     return fd;
 }
@@ -1339,14 +1467,15 @@ static int ac_pki_material_initialize(struct ac_pki *pki, int dirfd,
                                -1, AC_PKI_MAX_CERT_DER) != 0 ||
             !(pki->ca_key = ac_pki_key_generate()) ||
             ac_pki_key_store(dirfd, AC_PKI_CA_KEY_FILE, pki->ca_key) != 0)
-            return -1;
+            return ac_pki_fail(AC_PKI_REASON_KEY_INVALID);
         if (ac_pki_test_interrupt("ca-key"))
-            return -1;
+            return ac_pki_fail(AC_PKI_REASON_INTERNAL);
     }
     if (ac_pki_key_id(pki->ca_key, pki->ca_key_id,
                       ca_public_digest) != 0)
-        return -1;
-    ac_pki_controller_id_from_digest(ca_public_digest, pki->controller_id);
+        return ac_pki_fail(AC_PKI_REASON_KEY_INVALID);
+    if (!pki->controller_id[0])
+        ac_pki_controller_id_from_digest(ca_public_digest, pki->controller_id);
     pki->ca_cert = ac_pki_certificate_load(dirfd, AC_PKI_CA_CERT_FILE,
                                             &ca_cert_missing);
     if (!pki->ca_cert) {
@@ -1355,15 +1484,15 @@ static int ac_pki_material_initialize(struct ac_pki *pki, int dirfd,
                                                pki->controller_id)) ||
             ac_pki_certificate_store(dirfd, AC_PKI_CA_CERT_FILE,
                                      pki->ca_cert) != 0)
-            return -1;
+            return ac_pki_fail(AC_PKI_REASON_CERTIFICATE_INVALID);
         if (ac_pki_test_interrupt("ca-cert"))
-            return -1;
+            return ac_pki_fail(AC_PKI_REASON_INTERNAL);
     }
     if (!ac_pki_ca_valid(pki->ca_cert, pki->ca_key) ||
         ac_pki_certificate_fingerprint(pki->ca_cert,
                                        pki->ca_fingerprint,
                                        pki->ca_fingerprint_text) != 0)
-        return -1;
+        return ac_pki_fail(AC_PKI_REASON_CERTIFICATE_INVALID);
     /*
      * With a trustworthy CA in hand, use it as a floor on the clock before
      * signing anything. A current time earlier than the CA's own start cannot be
@@ -1375,7 +1504,7 @@ static int ac_pki_material_initialize(struct ac_pki *pki, int dirfd,
     if (!ac_pki_clock_plausible(pki->ca_cert)) {
         fprintf(stderr, "[dreamingwrt-ac] refusing to sign: clock reads before "
                         "the CA's own notBefore, time is not yet trustworthy\n");
-        return -1;
+        return ac_pki_fail(AC_PKI_REASON_CLOCK_INVALID);
     }
     pki->server_key = ac_pki_key_load(dirfd, AC_PKI_SERVER_KEY_FILE,
                                       &server_key_missing);
@@ -1386,9 +1515,9 @@ static int ac_pki_material_initialize(struct ac_pki *pki, int dirfd,
             !(pki->server_key = ac_pki_key_generate()) ||
             ac_pki_key_store(dirfd, AC_PKI_SERVER_KEY_FILE,
                              pki->server_key) != 0)
-            return -1;
+            return ac_pki_fail(AC_PKI_REASON_KEY_INVALID);
         if (ac_pki_test_interrupt("server-key"))
-            return -1;
+            return ac_pki_fail(AC_PKI_REASON_INTERNAL);
     }
     pki->server_cert = ac_pki_certificate_load(dirfd,
                                                 AC_PKI_SERVER_CERT_FILE,
@@ -1400,9 +1529,9 @@ static int ac_pki_material_initialize(struct ac_pki *pki, int dirfd,
                   pki->controller_id, names)) ||
             ac_pki_certificate_store(dirfd, AC_PKI_SERVER_CERT_FILE,
                                      pki->server_cert) != 0)
-            return -1;
+            return ac_pki_fail(AC_PKI_REASON_CERTIFICATE_INVALID);
         if (ac_pki_test_interrupt("server-cert"))
-            return -1;
+            return ac_pki_fail(AC_PKI_REASON_INTERNAL);
     }
     if (!ac_pki_server_valid(pki->server_cert, pki->server_key,
                              pki->ca_cert, pki->ca_key,
@@ -1425,7 +1554,7 @@ static int ac_pki_material_initialize(struct ac_pki *pki, int dirfd,
               ac_pki_server_structure_valid(pki->server_cert,
                                             pki->server_key,
                                             pki->ca_cert, pki->ca_key)))
-            return -1;
+            return ac_pki_fail(AC_PKI_REASON_CERTIFICATE_INVALID);
         if (ac_pki_not_yet_valid(pki->server_cert))
             fprintf(stderr, "[dreamingwrt-ac] server certificate notBefore is in "
                             "the future, reissuing against the current clock\n");
@@ -1439,10 +1568,63 @@ static int ac_pki_material_initialize(struct ac_pki *pki, int dirfd,
             !ac_pki_server_valid(pki->server_cert, pki->server_key,
                                  pki->ca_cert, pki->ca_key,
                                  pki->controller_id, names))
-            return -1;
+            return ac_pki_fail(AC_PKI_REASON_CERTIFICATE_INVALID);
     }
     OPENSSL_cleanse(ca_public_digest, sizeof(ca_public_digest));
     return 0;
+}
+
+/* Generations are immutable private directories. Only this small public marker
+ * changes at activation, so a power loss cannot pair one generation's key with
+ * another generation's certificate. The original CA-derived identity is pinned
+ * once and is never recalculated when a CA generation changes. */
+static int ac_pki_public_commit(int fd, const char *name, const unsigned char *data, size_t len)
+{
+    int status = ac_pki_file_status(fd, name, -1, AC_PKI_MAX_CERT_DER);
+    return status == 0 ? ac_pki_atomic_write(fd, name, data, len) :
+           status == 1 ? ac_pki_atomic_replace(fd, name, data, len) : -1;
+}
+
+static int ac_pki_generation_id(const char *id)
+{
+    size_t i;
+    if (!id || strlen(id) != 36) return 0;
+    for (i = 0; i < 36; i++) {
+        if (i == 8 || i == 13 || i == 18 || i == 23) {
+            if (id[i] != '-') return 0;
+        } else if (!((id[i] >= '0' && id[i] <= '9') ||
+                     (id[i] >= 'a' && id[i] <= 'f'))) return 0;
+    }
+    return 1;
+}
+
+static int ac_pki_marker_read(int fd, const char *name, char out[37])
+{
+    unsigned char *data = NULL;
+    size_t length = 0;
+    int rc = ac_pki_read_file(fd, name, -1, 36, &data, &length);
+    out[0] = 0;
+    if (rc == 1) return 1;
+    if (rc || (length != 36 && length != 4)) { OPENSSL_free(data); return -1; }
+    memcpy(out, data, length); out[length] = 0;
+    OPENSSL_free(data);
+    return ac_pki_generation_id(out) || !strcmp(out, "base") ? 0 : -1;
+}
+
+static int ac_pki_generation_dir(int root, const char *id, int create)
+{
+    char name[48];
+    struct stat st;
+    int fd;
+    if (!strcmp(id, "base")) return dup(root);
+    if (!ac_pki_generation_id(id)) return -1;
+    snprintf(name, sizeof(name), "gen-%s", id);
+    if (create && mkdirat(root, name, 0700) != 0 && errno != EEXIST) return -1;
+    fd = openat(root, name, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (fd < 0) return -1;
+    if (fstat(fd, &st) || !S_ISDIR(st.st_mode) || st.st_uid != geteuid() ||
+        (st.st_mode & 0777) != 0700 || fsync(root)) { close(fd); return -1; }
+    return fd;
 }
 
 int ac_pki_init(struct ac_pki **out)
@@ -1454,24 +1636,57 @@ int ac_pki_init(struct ac_pki **out)
     struct ac_pki *pki = NULL;
     int dirfd = -1;
     int lockfd = -1;
+    int materialfd = -1;
+    int identity_missing = 0;
+    int missing = 0;
     int rc = -1;
 
-    if (!out || strlen(directory) >= sizeof(pki->directory) ||
-        ac_pki_listen_names(&names) != 0)
-        return -1;
+    ac_pki_reason_set(AC_PKI_REASON_NONE);
+    if (!out)
+        return ac_pki_fail(AC_PKI_REASON_INTERNAL);
+    if (strlen(directory) >= sizeof(pki->directory))
+        return ac_pki_fail(AC_PKI_REASON_DIRECTORY_PATH_INVALID);
+    if (ac_pki_listen_names(&names) != 0)
+        return ac_pki_fail(AC_PKI_REASON_LISTEN_NAMES_INVALID);
     *out = NULL;
     dirfd = ac_pki_prepare_directory(directory);
-    if (dirfd < 0 || (lockfd = ac_pki_lock(dirfd)) < 0 ||
-        !(pki = calloc(1, sizeof(*pki))))
+    if (dirfd < 0)
         goto done;
+    if ((lockfd = ac_pki_lock(dirfd)) < 0)
+        goto done;
+    if (!(pki = calloc(1, sizeof(*pki)))) {
+        ac_pki_reason_set(AC_PKI_REASON_INTERNAL);
+        goto done;
+    }
     snprintf(pki->directory, sizeof(pki->directory), "%s", directory);
-    if (ac_pki_material_initialize(pki, dirfd, &names) != 0)
+    identity_missing = ac_pki_marker_read(dirfd, "controller.id", pki->controller_id);
+    if (identity_missing < 0 || (identity_missing == 0 &&
+        !ac_pki_generation_id(pki->controller_id))) goto done;
+    if (ac_pki_marker_read(dirfd, "active.generation", pki->generation) < 0) goto done;
+    if (!pki->generation[0]) snprintf(pki->generation, sizeof(pki->generation), "base");
+    if (strcmp(pki->generation, "base") && identity_missing) goto done;
+    materialfd = ac_pki_generation_dir(dirfd, pki->generation, 0);
+    if (materialfd < 0 || ac_pki_material_initialize(pki, materialfd, &names) != 0)
         goto done;
+    if (identity_missing && ac_pki_atomic_write(dirfd, "controller.id",
+        (unsigned char *)pki->controller_id, 36)) goto done;
+    pki->alternate_ca = ac_pki_certificate_load(materialfd, "previous-ca.crt.der", &missing);
+    if (!pki->alternate_ca && !missing) goto done;
+    if (!pki->alternate_ca) {
+        pki->alternate_ca = ac_pki_certificate_load(dirfd, "trusted-next.der", &missing);
+        if (!pki->alternate_ca && !missing) goto done;
+    }
     *out = pki;
     pki = NULL;
     rc = 0;
 done:
+    if (rc != 0 && g_ac_pki_reason == AC_PKI_REASON_NONE)
+        ac_pki_reason_set(AC_PKI_REASON_INTERNAL);
+    if (rc != 0)
+        fprintf(stderr, "[dreamingwrt-ac] pki init failed dir=%s reason=%s\n",
+                directory, ac_pki_reason_text(g_ac_pki_reason));
     if (pki) {
+        X509_free(pki->alternate_ca);
         X509_free(pki->server_cert);
         EVP_PKEY_free(pki->server_key);
         X509_free(pki->ca_cert);
@@ -1479,6 +1694,7 @@ done:
         OPENSSL_cleanse(pki, sizeof(*pki));
         free(pki);
     }
+    if (materialfd >= 0) close(materialfd);
     ac_pki_unlock(lockfd);
     if (dirfd >= 0)
         close(dirfd);
@@ -1490,6 +1706,7 @@ void ac_pki_free(struct ac_pki *pki)
 {
     if (!pki)
         return;
+    X509_free(pki->alternate_ca);
     X509_free(pki->server_cert);
     EVP_PKEY_free(pki->server_key);
     X509_free(pki->ca_cert);
@@ -1803,4 +2020,160 @@ int64_t ac_pki_issued_certificate_not_after(
     const struct ac_pki_issued_certificate *certificate)
 {
     return certificate ? certificate->not_after : 0;
+}
+
+const char *ac_pki_generation(const struct ac_pki *pki)
+{
+    return pki ? pki->generation : NULL;
+}
+
+X509 *ac_pki_alternate_ca_dup(const struct ac_pki *pki)
+{
+    if (!pki || !pki->alternate_ca || X509_up_ref(pki->alternate_ca) != 1) return NULL;
+    return pki->alternate_ca;
+}
+
+int ac_pki_generation_prepare(const char *id, int rotate_ca, struct ac_pki **out)
+{
+    struct ac_pki *current = NULL, *next = NULL;
+    struct ac_pki_name_list names;
+    int root = -1, fd = -1, lock = -1, rc = -1;
+    if (!out || !ac_pki_generation_id(id)) return -1;
+    *out = NULL;
+    if (ac_pki_init(&current) || ac_pki_listen_names(&names)) goto done;
+    root = ac_pki_prepare_directory(current->directory);
+    if (root < 0 || (lock = ac_pki_lock(root)) < 0 ||
+        (fd = ac_pki_generation_dir(root, id, 1)) < 0 ||
+        !(next = calloc(1, sizeof(*next)))) goto done;
+    snprintf(next->directory, sizeof(next->directory), "%s", current->directory);
+    snprintf(next->controller_id, sizeof(next->controller_id), "%s", current->controller_id);
+    snprintf(next->generation, sizeof(next->generation), "%s", id);
+    if (!rotate_ca) {
+        if (ac_pki_file_status(fd, AC_PKI_CA_KEY_FILE, -1, -1) == 0 &&
+            ac_pki_key_store(fd, AC_PKI_CA_KEY_FILE, current->ca_key)) goto done;
+        if (ac_pki_file_status(fd, AC_PKI_CA_CERT_FILE, -1, -1) == 0 &&
+            ac_pki_certificate_store(fd, AC_PKI_CA_CERT_FILE, current->ca_cert)) goto done;
+    }
+    if (ac_pki_material_initialize(next, fd, &names)) goto done;
+    if (rotate_ca) {
+        if (ac_pki_file_status(fd, "previous-ca.crt.der", -1, -1) == 0 &&
+            ac_pki_certificate_store(fd, "previous-ca.crt.der", current->ca_cert)) goto done;
+        next->alternate_ca = ac_pki_ca_certificate_dup(current);
+        /* Publish new trust while still presenting the old server certificate. */
+        {
+            unsigned char *der = NULL; size_t length = 0;
+            if (ac_pki_x509_der(next->ca_cert, &der, &length)) goto done;
+            int saved = ac_pki_public_commit(root, "trusted-next.der", der, length);
+            OPENSSL_free(der);
+            if (saved) goto done;
+        }
+    }
+    if (ac_pki_public_commit(fd, "ready", (const unsigned char *)id, 36)) goto done;
+    *out = next; next = NULL; rc = 0;
+done:
+    if (fd >= 0) close(fd);
+    ac_pki_unlock(lock);
+    if (root >= 0) close(root);
+    ac_pki_free(next); ac_pki_free(current);
+    return rc;
+}
+
+int ac_pki_generation_open(const char *id, struct ac_pki **out)
+{
+    struct ac_pki *current = NULL, *next = NULL;
+    struct ac_pki_name_list names;
+    char ready[37];
+    int root = -1, fd = -1, rc = -1, missing;
+    if (!out || !id || (!ac_pki_generation_id(id) && strcmp(id, "base"))) return -1;
+    *out = NULL;
+    if (ac_pki_init(&current) || ac_pki_listen_names(&names)) goto done;
+    if (!strcmp(id, current->generation)) { *out = current; current = NULL; return 0; }
+    root = ac_pki_prepare_directory(current->directory);
+    if (root < 0 || (fd = ac_pki_generation_dir(root, id, 0)) < 0 ||
+        (strcmp(id, "base") && (ac_pki_marker_read(fd, "ready", ready) || strcmp(ready, id))) ||
+        !(next = calloc(1, sizeof(*next)))) goto done;
+    snprintf(next->directory, sizeof(next->directory), "%s", current->directory);
+    snprintf(next->generation, sizeof(next->generation), "%s", id);
+    snprintf(next->controller_id, sizeof(next->controller_id), "%s", current->controller_id);
+    if (ac_pki_material_initialize(next, fd, &names)) goto done;
+    next->alternate_ca = ac_pki_certificate_load(fd, "previous-ca.crt.der", &missing);
+    if (!next->alternate_ca && !missing) goto done;
+    *out = next; next = NULL; rc = 0;
+done:
+    if (fd >= 0) close(fd);
+    if (root >= 0) close(root);
+    ac_pki_free(next); ac_pki_free(current); return rc;
+}
+
+int ac_pki_generation_activate(const char *id)
+{
+    struct ac_pki *next = NULL;
+    int root = -1, lock = -1, rc = -1;
+    if (ac_pki_generation_open(id, &next)) return -1;
+    root = ac_pki_prepare_directory(next->directory);
+    if (root < 0 || (lock = ac_pki_lock(root)) < 0) goto done;
+    rc = ac_pki_public_commit(root, "active.generation", (const unsigned char *)id, strlen(id));
+done:
+    ac_pki_unlock(lock); if (root >= 0) close(root); ac_pki_free(next); return rc;
+}
+
+int ac_pki_generation_retire(const char *id)
+{
+    struct ac_pki *current = NULL;
+    int root = -1, fd = -1, lock = -1, rc = -1;
+    if (ac_pki_init(&current) || strcmp(current->generation, id)) goto done;
+    root = ac_pki_prepare_directory(current->directory);
+    if (root < 0 || (lock = ac_pki_lock(root)) < 0 ||
+        (fd = ac_pki_generation_dir(root, id, 0)) < 0) goto done;
+    if (unlinkat(fd, "previous-ca.crt.der", 0) && errno != ENOENT) goto done;
+    if (unlinkat(root, "trusted-next.der", 0) && errno != ENOENT) goto done;
+    if (fsync(fd) || fsync(root)) goto done;
+    rc = 0;
+done:
+    if (fd >= 0) close(fd);
+    ac_pki_unlock(lock);
+    if (root >= 0) close(root);
+    ac_pki_free(current);
+    return rc;
+}
+
+int ac_pki_trust_pem(const struct ac_pki *pki, unsigned char **out, size_t *length)
+{
+    BIO *bio = BIO_new(BIO_s_mem()); BUF_MEM *memory = NULL;
+    int rc = -1;
+    if (!pki || !out || !length || !bio || PEM_write_bio_X509(bio, pki->ca_cert) != 1 ||
+        (pki->alternate_ca && PEM_write_bio_X509(bio, pki->alternate_ca) != 1)) goto done;
+    BIO_get_mem_ptr(bio, &memory);
+    if (!memory || !(*out = OPENSSL_malloc(memory->length))) goto done;
+    memcpy(*out, memory->data, memory->length); *length = memory->length; rc = 0;
+done:
+    BIO_free(bio); return rc;
+}
+
+/* Read public validity even when a bad clock prevents transport initialization. */
+int ac_pki_certificate_window(const char *kind, int64_t *not_before, int64_t *not_after)
+{
+    const char *configured = getenv("DREAMINGWRT_AC_PKI_DIR");
+    const char *directory = configured && configured[0] ? configured : AC_PKI_DEFAULT_DIR;
+    const char *file = !strcmp(kind, "server") ? AC_PKI_SERVER_CERT_FILE :
+                       !strcmp(kind, "ca") ? AC_PKI_CA_CERT_FILE : NULL;
+    char generation[37]; struct stat status;
+    int root = -1, fd = -1, missing = 0, days = 0, seconds = 0, rc = -1;
+    X509 *cert = NULL; ASN1_TIME *epoch = NULL;
+    if (!file || !not_before || !not_after) return -1;
+    root = open(directory, O_RDONLY | O_DIRECTORY | O_NOFOLLOW);
+    if (root < 0 || fstat(root, &status) || status.st_uid != geteuid() ||
+        (status.st_mode & 0777) != 0700 || ac_pki_marker_read(root, "active.generation", generation) < 0) goto done;
+    if (!generation[0]) snprintf(generation, sizeof(generation), "base");
+    if ((fd = ac_pki_generation_dir(root, generation, 0)) < 0 ||
+        !(cert = ac_pki_certificate_load(fd, file, &missing)) || !(epoch = ASN1_TIME_set(NULL, 0))) goto done;
+    if (ASN1_TIME_diff(&days, &seconds, epoch, X509_get0_notBefore(cert)) != 1) goto done;
+    *not_before = (int64_t)days * 86400 + seconds;
+    if (ASN1_TIME_diff(&days, &seconds, epoch, X509_get0_notAfter(cert)) != 1) goto done;
+    *not_after = (int64_t)days * 86400 + seconds; rc = 0;
+done:
+    ASN1_TIME_free(epoch); X509_free(cert);
+    if (fd >= 0) close(fd);
+    if (root >= 0) close(root);
+    return rc;
 }

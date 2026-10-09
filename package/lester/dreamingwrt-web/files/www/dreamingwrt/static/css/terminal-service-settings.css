@@ -1,0 +1,125 @@
+@import url('/static/css/policy-table.css?v=20260716-09');
+
+.console-stage.is-terminal-service {
+  grid-template-rows: minmax(0, 1fr);
+  width: 100%;
+  height: var(--app-stage-height);
+  min-height: 0;
+  padding: var(--app-page-gutter-block) var(--app-page-gutter-inline);
+  overflow: hidden;
+}
+
+.console-stage.is-terminal-service .stage-header { display: none; }
+.console-stage.is-terminal-service .route-preview.terminal-service-route-host {
+  width: 100%;
+  max-width: none;
+  height: 100%;
+  min-height: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+  border-radius: 0;
+  background: transparent;
+  box-shadow: none;
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+  overflow: hidden;
+}
+
+.terminal-service-route-host,
+.terminal-service-route-host * { box-sizing: border-box; }
+.terminal-service-shell { width: 100%; height: 100%; min-width: 0; min-height: 0; display: grid; grid-template-rows: auto minmax(0, 1fr); gap: var(--app-page-gap, 14px); overflow: hidden; }
+.terminal-service-navigation { min-width: 0; min-height: 52px; display: flex; align-items: center; justify-content: space-between; gap: 16px; }
+.terminal-service-tabs { width: max-content; min-width: 0; }
+.terminal-service-tabs .dwrt-kit-tab { min-width: 116px; height: 42px; }
+.terminal-service-page-status { min-width: 0; display: flex; align-items: center; }
+.terminal-service-loading { min-height: 280px; display: grid; place-items: center; border-radius: var(--app-radius-card); color: var(--app-text-muted); }
+
+.terminal-service-console { min-width: 0; min-height: 0; display: grid; grid-template-rows: 58px minmax(0, 1fr); overflow: hidden; border-radius: var(--app-radius-card); }
+.terminal-service-console-bar { min-width: 0; display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 0 14px 0 18px; border-bottom: 1px solid color-mix(in srgb, var(--app-text-muted) 16%, transparent); }
+.terminal-service-console-title { min-width: 0; display: flex; align-items: center; gap: 10px; }
+.terminal-service-console-title > svg { width: 21px; height: 21px; flex: 0 0 21px; color: var(--app-accent); }
+.terminal-service-console-title > span { min-width: 0; display: grid; gap: 1px; }
+.terminal-service-console-title strong { color: var(--app-text); font-size: 13px; }
+.terminal-service-console-title small { color: var(--app-text-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-service-console-actions { display: flex; align-items: center; gap: 7px; }
+.terminal-service-console-actions > button,
+.terminal-service-instance-list > header button,
+.terminal-service-delete { width: 34px; height: 34px; display: grid; place-items: center; border: 0; border-radius: var(--app-radius-compact); padding: 0; color: var(--app-text-secondary); background: transparent; cursor: pointer; }
+.terminal-service-console-actions > button:hover:not(:disabled),
+.terminal-service-instance-list > header button:hover:not(:disabled),
+.terminal-service-delete:hover:not(:disabled) { background: var(--dwrt-interactive-hover-bg); box-shadow: inset 0 0 0 1px var(--dwrt-interactive-hover-border); }
+.terminal-service-console-actions > button:disabled,
+.terminal-service-instance-list > header button:disabled,
+.terminal-service-delete:disabled { opacity: .42; cursor: not-allowed; }
+.terminal-service-console-actions svg,
+.terminal-service-instance-list > header svg,
+.terminal-service-delete svg { width: 17px; height: 17px; }
+.terminal-service-frame-wrap { min-width: 0; min-height: 0; overflow: hidden; background: #080b10; }
+.terminal-service-frame { width: 100%; height: 100%; display: block; border: 0; background: #080b10; }
+.terminal-service-unavailable { width: 100%; height: 100%; display: grid; place-items: center; align-content: center; gap: 9px; padding: 30px; color: #aeb7c4; text-align: center; }
+.terminal-service-unavailable svg { width: 34px; height: 34px; }
+.terminal-service-unavailable strong { color: #f3f6fa; font-size: 15px; }
+.terminal-service-unavailable span { max-width: 540px; font-size: 12px; line-height: 1.55; }
+
+.terminal-service-settings { min-width: 0; min-height: 0; display: grid; grid-template-columns: minmax(210px, 25%) minmax(0, 1fr); gap: var(--app-page-gap, 14px); overflow: hidden; }
+.terminal-service-instance-list,
+.terminal-service-form { min-width: 0; min-height: 0; overflow: hidden; border-radius: var(--app-radius-card); }
+.terminal-service-instance-list { display: grid; grid-template-rows: 56px minmax(0, 1fr); }
+.terminal-service-instance-list > header,
+.terminal-service-form > header { min-width: 0; min-height: 56px; display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 0 15px 0 18px; border-bottom: 1px solid color-mix(in srgb, var(--app-text-muted) 16%, transparent); }
+.terminal-service-instance-list > header strong,
+.terminal-service-form > header strong { color: var(--app-text); font-size: 14px; }
+.terminal-service-instance-list > div { min-height: 0; overflow: auto; padding: 8px; }
+.terminal-service-instance-list > div > button { width: 100%; min-width: 0; min-height: 58px; display: flex; align-items: center; justify-content: space-between; gap: 10px; border: 0; border-radius: var(--app-radius-control); padding: 9px 10px; color: var(--app-text-secondary); background: transparent; text-align: left; cursor: pointer; }
+.terminal-service-instance-list > div > button:hover { background: var(--dwrt-interactive-hover-bg); }
+.terminal-service-instance-list > div > button.is-active { background: color-mix(in srgb, var(--app-accent) 12%, transparent); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--app-accent) 22%, transparent); }
+.terminal-service-instance-list button > span { min-width: 0; display: grid; gap: 3px; }
+.terminal-service-instance-list button strong { color: var(--app-text); font-size: 12px; }
+.terminal-service-instance-list button small { color: var(--app-text-muted); font-size: 10px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.terminal-service-instance-list button > i { width: 7px; height: 7px; flex: 0 0 7px; border-radius: 50%; background: var(--app-text-muted); }
+.terminal-service-instance-list button > i.is-on { background: #42ce8b; box-shadow: 0 0 0 4px rgba(66,206,139,.12); }
+
+.terminal-service-form { display: grid; grid-template-rows: auto minmax(0, 1fr) auto; align-content: start; overflow: auto; scrollbar-gutter: stable; }
+.terminal-service-form > header { position: sticky; z-index: 4; top: 0; background: color-mix(in srgb, var(--dwrt-glass-surface) 88%, transparent); backdrop-filter: blur(10px); }
+.terminal-service-form > header > div { min-width: 0; display: grid; gap: 2px; }
+.terminal-service-form > header span { color: var(--app-text-muted); font-size: 10px; }
+.terminal-service-capability { margin: 14px 18px 0; padding: 10px 12px; border-radius: var(--app-radius-control); color: var(--dwrt-status-warn-text, #f5c166); background: var(--dwrt-status-warn-bg, rgba(245,166,35,.10)); box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--dwrt-status-warn-text, #f5c166) 18%, transparent); font-size: 11px; line-height: 1.5; }
+.terminal-service-form-section { padding: 18px; border-bottom: 1px solid color-mix(in srgb, var(--app-text-muted) 14%, transparent); }
+.terminal-service-form-section h3 { margin: 0 0 14px; color: var(--app-text); font-size: 13px; font-weight: 760; }
+.terminal-service-grid { min-width: 0; display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 14px; }
+.terminal-service-field { min-width: 0; display: grid; align-content: start; gap: 7px; color: var(--app-text-secondary); }
+.terminal-service-field.is-wide { grid-column: 1 / -1; }
+.terminal-service-field > span { font-size: 11px; font-weight: 680; }
+.terminal-service-field > small { color: var(--app-text-muted); font-size: 10px; }
+.terminal-service-field input,
+.terminal-service-field select,
+.terminal-service-field textarea { width: 100%; min-width: 0; border: 1px solid color-mix(in srgb, var(--app-text-muted) 24%, transparent); border-radius: var(--app-radius-compact); padding: 0 11px; color: var(--app-text); background: color-mix(in srgb, var(--app-text) 6%, transparent); font: inherit; font-size: 12px; outline: 0; }
+.terminal-service-field input,
+.terminal-service-field select { height: 40px; }
+.terminal-service-field textarea { min-height: 92px; padding-block: 10px; resize: vertical; }
+.terminal-service-field input:focus,
+.terminal-service-field select:focus,
+.terminal-service-field textarea:focus { border-color: color-mix(in srgb, var(--app-accent) 70%, transparent); box-shadow: 0 0 0 3px color-mix(in srgb, var(--app-accent) 12%, transparent); }
+.terminal-service-field :disabled { opacity: .72; cursor: not-allowed; }
+.terminal-service-switch-field { min-height: 48px; display: grid; grid-template-columns: minmax(0, 1fr) auto; align-items: center; gap: 12px; }
+.terminal-service-switch-field > span { min-width: 0; display: grid; gap: 2px; }
+.terminal-service-switch-field strong { color: var(--app-text); font-size: 12px; }
+.terminal-service-switch-field small { color: var(--app-text-muted); font-size: 10px; line-height: 1.4; }
+.terminal-service-switch-field:has(input:disabled) { opacity: .68; }
+@media (max-width: 860px) {
+  .terminal-service-settings { grid-template-columns: 1fr; overflow: auto; }
+  .terminal-service-instance-list { min-height: 150px; }
+  .terminal-service-instance-list > div { display: flex; overflow-x: auto; }
+  .terminal-service-instance-list > div > button { min-width: 180px; }
+  .terminal-service-form { min-height: 520px; overflow: visible; }
+}
+
+@media (max-width: 600px) {
+  .console-stage.is-terminal-service { padding-inline: 8px; }
+  .terminal-service-navigation { align-items: stretch; flex-direction: column; }
+  .terminal-service-page-status { justify-content: flex-end; }
+  .terminal-service-grid { grid-template-columns: 1fr; }
+  .terminal-service-field.is-wide { grid-column: auto; }
+  .terminal-service-console-actions .dwrt-kit-status-badge { display: none; }
+}

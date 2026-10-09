@@ -70,6 +70,9 @@
           status: 'empty',
           value: undefined,
           error: null,
+          capabilities: null,
+          permissions: null,
+          entitlement: null,
           observedAt: 0,
           updatedAt: 0,
           stale: false,
@@ -91,6 +94,9 @@
         cache_key: String(options.cacheKey || ''),
         status: entry.status,
         value: entry.value,
+        capabilities: entry.capabilities,
+        permissions: entry.permissions,
+        entitlement: entry.entitlement,
         error: entry.error,
         observed_at: entry.observedAt || null,
         updated_at: entry.updatedAt || null,
@@ -106,6 +112,9 @@
         cache_key: entry.cacheKey || '',
         status: entry.status,
         value: entry.value,
+        capabilities: entry.capabilities,
+        permissions: entry.permissions,
+        entitlement: entry.entitlement,
         error: entry.error,
         observed_at: entry.observedAt || null,
         updated_at: entry.updatedAt || null,
@@ -116,6 +125,73 @@
         try { listener(snapshot); } catch (error) { queueMicrotask(() => { throw error; }); }
       });
       return snapshot;
+    }
+
+    projectAccess(entry, payload) {
+      // Envelope fields belong to this resource; never turn entitlement into a global gate.
+      const source = payload?.contract === 'product-plane.v1' ? payload : unwrap(payload);
+      entry.capabilities = source?.capabilities ?? null;
+      entry.permissions = source?.permissions ?? null;
+      entry.entitlement = source?.entitlement ?? null;
+    }
+
+    hasCapability(key, capability, options = {}) {
+      const caps = this.snapshot(key, options).capabilities;
+      if (caps == null) return true; // Legacy resource, keep its existing page gates.
+      const value = caps[capability];
+      if (typeof value === 'boolean') return value;
+      if (!value || typeof value !== 'object') return false;
+      return value.supported !== false && value.readable !== false && value.writable !== false;
+    }
+
+    hasPermission(key, permission, options = {}) {
+      const permissions = this.snapshot(key, options).permissions;
+      if (permissions == null) return true;
+      const action = String(permission).split(':').pop();
+      const value = permissions[permission] ?? permissions[action];
+      return value === true || value?.allowed === true;
+    }
+
+    access(key, requirements = {}, options = {}) {
+      const snap = this.snapshot(key, options);
+      const { capability, permission } = requirements;
+      if (permission && !this.hasPermission(key, permission, options)) {
+        return { allowed: false, state: 'forbidden', reason: snap.permissions?.reason || `缺少权限 ${permission}` };
+      }
+      if (capability && !this.hasCapability(key, capability, options)) {
+        return { allowed: false, state: 'unavailable', reason: snap.capabilities?.[capability]?.reason || snap.capabilities?.reasons?.[capability] || `当前设备不支持 ${capability}` };
+      }
+      const entitlement = snap.entitlement;
+      if (entitlement?.required === true && entitlement.valid !== true) {
+        return { allowed: false, state: 'license_required', reason: entitlement.reason || '此功能需要有效授权' };
+      }
+      return { allowed: true, state: 'ready', reason: '' };
+    }
+
+    bindControl(key, control, requirements = {}, options = {}) {
+      return this.subscribe(key, () => {
+        const access = this.access(key, requirements, options);
+        control.disabled = !access.allowed;
+        control.setAttribute('aria-disabled', String(!access.allowed));
+        control.setAttribute('data-dwrt-tooltip', access.reason);
+        control.title = access.reason;
+      }, options);
+    }
+
+    accept(key, payload, options = {}) {
+      const entry = this.entry(this.entryKey(key, options));
+      entry.schemaKey = key;
+      entry.cacheKey = String(options.cacheKey || '');
+      this.projectAccess(entry, payload);
+      const schema = this.schemas.get(key);
+      entry.value = (options.project || schema?.project || unwrap)(payload);
+      entry.stale = payload?.meta?.stale === true;
+      entry.status = entry.stale ? 'stale' : 'ready';
+      entry.error = null;
+      entry.observedAt = Number(options.observedAt || payload?.meta?.observed_at || entry.value?.observed_at || payload?.meta?.generated_at || this.now());
+      entry.updatedAt = this.now();
+      entry.revision += 1;
+      return this.notify(entry);
     }
 
     subscribe(key, listener, options = {}) {
@@ -178,15 +254,12 @@
             }
             payload = await response.json();
           }
-          const projected = (options.project || schema.project)(payload);
-          entry.value = projected;
-          entry.status = 'ready';
-          entry.stale = false;
-          entry.error = null;
-          entry.observedAt = Number(options.observedAt || projected?.observed_at || payload?.meta?.generated_at || this.now());
-          entry.updatedAt = this.now();
-          entry.revision += 1;
-          return this.notify(entry);
+          if (payload?.ok === false) {
+            const error = new Error(payload.error?.message || payload.error?.code || '读取资源失败');
+            error.code = payload.error?.code;
+            throw error;
+          }
+          return this.accept(key, payload, { ...options, project: options.project || schema.project });
         } catch (error) {
           if (controller.signal.aborted || error?.name === 'AbortError') {
             entry.status = entry.value === undefined ? 'empty' : 'stale';

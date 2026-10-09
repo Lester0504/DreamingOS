@@ -1,0 +1,28 @@
+#!/bin/sh
+
+# A PPPoE transition commonly emits events for both wanN and wanN_6. Keep one
+# worker, wait for a five-second quiet period, and repeat if another event lands
+# during apply. This coalesces the burst without dropping the final PD state.
+case "$INTERFACE" in
+    wan|wan_6|wan[2-9]|wan[2-9]_6|wan[1-9][0-9]*|wan[1-9][0-9]*_6)
+        case "$ACTION" in
+            ifup|ifdown|ifupdate)
+                pending=/var/run/dreamingwrt-ipv6-mw-hotplug.pending
+                lock=/var/run/dreamingwrt-ipv6-mw-hotplug.lock
+                touch "$pending"
+                (
+                    exec 9>"$lock" || exit 1
+                    flock -w 30 9 || exit 0
+                    [ -f "$pending" ] || exit 0
+                    while :; do
+                        rm -f "$pending"
+                        sleep 5
+                        [ -f "$pending" ] && continue
+                        /etc/dreamingwrt/ipv6-multiwan.sh apply
+                        [ -f "$pending" ] || break
+                    done
+                ) >/dev/null 2>&1 &
+                ;;
+        esac
+        ;;
+esac

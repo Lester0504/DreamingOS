@@ -121,5 +121,6 @@ struct json_object *jmx_gen_api_response_data(int code, struct json_object *data
 
 int jmx_runtime_reload_signature_db(const char *path);
 struct json_object *jmx_core_status_json(void);
+struct json_object *jmx_core_memory_json(void);
 
 #endif

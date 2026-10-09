@@ -33,6 +33,7 @@ const char *ac_transport_reason(void);
 int ac_transport_port(void);
 const char *ac_transport_controller_id(void);
 int ac_pki_init(struct ac_pki **out);
+const char *ac_pki_last_reason(void);
 const char *ac_pki_controller_id(const struct ac_pki *pki);
 const unsigned char *ac_pki_ca_fingerprint_sha256(const struct ac_pki *pki);
 X509 *ac_pki_ca_certificate_dup(const struct ac_pki *pki);
@@ -102,6 +103,82 @@ struct ac_pki_issued_certificate {
     int64_t not_before;
     int64_t not_after;
 };
+
+void ac_secret_rotation_session_begin(const char *ap_id, int capable)
+{
+    (void)ap_id; (void)capable;
+}
+
+void ac_secret_rotation_session_end(const char *ap_id)
+{
+    (void)ap_id;
+}
+
+static struct json_object *fixture_secret_response(const char *kind)
+{
+    struct json_object *response = json_object_new_object();
+    json_object_object_add(response, "protocol",
+                           json_object_new_string(AC_CONTRACT_VERSION));
+    json_object_object_add(response, "kind", json_object_new_string(kind));
+    return response;
+}
+
+struct json_object *ac_secret_rotation_poll(const char *ap_id,
+                                             const char *session_epoch,
+                                             int64_t reply_to)
+{
+    (void)ap_id; (void)session_epoch; (void)reply_to;
+    return fixture_secret_response("secret_job_idle");
+}
+
+struct json_object *ac_secret_rotation_prepare(struct json_object *message,
+                                                const char *ap_id,
+                                                const char *session_epoch,
+                                                int64_t reply_to)
+{
+    (void)message; (void)ap_id; (void)session_epoch; (void)reply_to;
+    return fixture_secret_response("secret_job_prepare_ack");
+}
+
+struct json_object *ac_secret_rotation_commit(struct json_object *message,
+                                               const char *ap_id,
+                                               const char *session_epoch,
+                                               int64_t reply_to)
+{
+    (void)message; (void)ap_id; (void)session_epoch; (void)reply_to;
+    return fixture_secret_response("secret_job_commit_ack");
+}
+
+void ac_secret_rotation_scrub_offer(struct json_object *message)
+{
+    (void)message;
+}
+
+int ac_db_ap_audit_store(const char *ap_id, const char *event_id,
+                         int64_t occurred_at, const char *session_epoch,
+                         const char *actor, const char *actor_session,
+                         const char *source_ip, const char *action,
+                         const char *risk, const char *target,
+                         const char *result, const char *failure_reason,
+                         const char *request_id, int64_t schema_version)
+{
+    (void)ap_id; (void)event_id; (void)occurred_at; (void)session_epoch;
+    (void)actor; (void)actor_session; (void)source_ip; (void)action;
+    (void)risk; (void)target; (void)result; (void)failure_reason;
+    (void)request_id; (void)schema_version;
+    return 0;
+}
+
+int ac_pki_ca_pem(const struct ac_pki *pki, unsigned char **out,
+                  size_t *out_len)
+{
+    (void)pki;
+    if (!out || !out_len)
+        return -1;
+    *out = NULL;
+    *out_len = 0;
+    return -1;
+}
 
 static volatile sig_atomic_t fixture_stop;
 static int fixture_write_activation_marker(void);
@@ -266,6 +343,13 @@ int ac_pki_init(struct ac_pki **out)
     fixture_active_pki = pki;
     *out = pki;
     return 0;
+}
+
+/* The fixture's PKI always succeeds, so the transport never reads a real
+ * reason; it exists only to satisfy the link. */
+const char *ac_pki_last_reason(void)
+{
+    return "pki_fixture_ok";
 }
 
 void ac_pki_free(struct ac_pki *pki)
@@ -522,18 +606,54 @@ int ac_db_enrollment_activate(const char *enrollment_id,
     return AC_ENROLLMENT_OK;
 }
 
-int ac_db_ap_session_begin(const char *ap_id, const char *session_epoch,
-                           int protocol_version, int64_t received_at)
+int ac_db_ap_session_begin_with_capabilities(
+    const char *ap_id, const char *session_epoch, int protocol_version,
+    int write_capable, int64_t received_at)
 {
     if (!fixture_adopted || !ap_id || strcmp(ap_id, FIXTURE_AP_ID) != 0 ||
         !session_epoch || strlen(session_epoch) != 64 ||
-        (protocol_version != 1 && protocol_version != 2) || received_at <= 0)
+        (protocol_version != 1 && protocol_version != 2 &&
+         protocol_version != 3) ||
+        (write_capable != 0 && write_capable != 1) ||
+        (write_capable && protocol_version != 3) || received_at <= 0)
         return -1;
     snprintf(fixture_current_session_epoch,
              sizeof(fixture_current_session_epoch), "%s", session_epoch);
     fixture_radio_jobs_reset(session_epoch);
     fixture_session_protocol_version = protocol_version;
     return 0;
+}
+
+int ac_db_ap_unbind_request_pending(const char *ap_id, struct ac_ap_unbind_request *out)
+{
+    (void)ap_id;
+    memset(out, 0, sizeof(*out));
+    return AC_AP_UNBIND_NOT_FOUND;
+}
+
+int ac_db_ap_session_begin_with_capabilities_and_unbind(
+    const char *ap_id, const char *session_epoch, int protocol_version,
+    int write_capable, int64_t received_at, struct ac_ap_unbind_request *out)
+{
+    memset(out, 0, sizeof(*out));
+    return ac_db_ap_session_begin_with_capabilities(ap_id, session_epoch,
+        protocol_version, write_capable, received_at);
+}
+
+int ac_db_ap_unbind_request_ack(const char *ap_id, const char *session_epoch,
+    const char *request_id, int unpaired, const char *error_code,
+    struct ac_ap_unbind_request *out)
+{
+    (void)ap_id; (void)session_epoch; (void)request_id;
+    (void)unpaired; (void)error_code; (void)out;
+    return -1;
+}
+
+int ac_db_ap_session_begin(const char *ap_id, const char *session_epoch,
+                           int protocol_version, int64_t received_at)
+{
+    return ac_db_ap_session_begin_with_capabilities(
+        ap_id, session_epoch, protocol_version, 0, received_at);
 }
 
 int ac_db_ap_session_end(const char *ap_id, const char *session_epoch)

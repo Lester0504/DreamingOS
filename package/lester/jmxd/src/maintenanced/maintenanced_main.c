@@ -4,6 +4,10 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <time.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/wait.h>
+#include <errno.h>
 
 #include <libubox/blobmsg.h>
 #include <libubox/uloop.h>
@@ -26,6 +30,43 @@
 static struct ubus_context *maintenance_ubus;
 static struct blob_buf maintenance_blob;
 static struct uloop_timeout maintenance_timer;
+static struct uloop_timeout resource_timer;
+static struct uloop_process resource_process;
+static int resource_running;
+
+static void resource_done(struct uloop_process *p, int ret)
+{
+    (void)p;
+    (void)ret;
+    resource_running = 0;
+    uloop_timeout_set(&resource_timer, 900000);
+}
+
+static void resource_tick(struct uloop_timeout *t)
+{
+    if (resource_running)
+        return;
+    pid_t pid = fork();
+    if (pid == 0) {
+        signal(SIGINT, SIG_DFL);
+        signal(SIGTERM, SIG_DFL);
+        execl("/usr/bin/dreamingwrt-resource-sync", "dreamingwrt-resource-sync", "--sync", NULL);
+        _exit(127);
+    }
+    if (pid < 0) {
+        uloop_timeout_set(t, 900000);
+        return;
+    }
+    resource_process.pid = pid;
+    resource_process.cb = resource_done;
+    if (uloop_process_add(&resource_process) != 0) {
+        kill(pid, SIGTERM);
+        while (waitpid(pid, NULL, 0) < 0 && errno == EINTR) {}
+        uloop_timeout_set(t, 900000);
+        return;
+    }
+    resource_running = 1;
+}
 static unsigned int maintenance_tick_count;
 static time_t maintenance_last_warn;
 static int maintenance_pending_health_status;
@@ -242,9 +283,17 @@ int main(int argc, char **argv)
     uloop_init();
     maintenance_timer.cb = maintenance_tick_cb;
     uloop_timeout_set(&maintenance_timer, MAINTENANCED_INITIAL_DELAY_MS);
+    resource_timer.cb = resource_tick;
+    uloop_timeout_set(&resource_timer, 120000);
     uloop_run();
 
     uloop_timeout_cancel(&maintenance_timer);
+    uloop_timeout_cancel(&resource_timer);
+    if (resource_running) {
+        uloop_process_delete(&resource_process);
+        kill(resource_process.pid, SIGTERM);
+        while (waitpid(resource_process.pid, NULL, 0) < 0 && errno == EINTR) {}
+    }
     maintenance_ubus_close();
     uloop_done();
     return 0;

@@ -1,0 +1,104 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex,nofollow">
+  <title>文件管理器 · DreamingOS</title>
+  <link rel="icon" href="/static/desktop/assets/file-manager.png">
+  <script>
+    (() => {
+      const root = document.documentElement;
+      function theme() {
+        let family = 'frosted-glass', pref = 'system';
+        try {
+          family = localStorage.getItem('dreamingwrt.web.themeFamily') || family;
+          pref = localStorage.getItem('dreamingwrt.web.themePref') || pref;
+        } catch (_) {}
+        root.dataset.themeFamily = ['frosted-glass', 'liquid-glass', 'traditional'].includes(family) ? family : 'frosted-glass';
+        root.dataset.themeResolved = pref === 'dark' || (pref === 'system' && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+      }
+      theme();
+      addEventListener('storage', theme);
+      matchMedia('(prefers-color-scheme: dark)').addEventListener('change', theme);
+      try {
+        if (parent !== window && parent.location.origin === location.origin && parent.DWRT_DESKTOP_HOST) {
+          window.DWRT_SESSION = parent.DWRT_SESSION;
+          root.dataset.desktopApp = 'true';
+        }
+      } catch (_) {}
+      // Storage tools below are existing same-origin console pages.
+      window.DWRT_DESKTOP_HOST = true;
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/ui-kit/dwrt-ui-kit.css?v=20260905-sidebar-tabs-01">
+  <link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
+  <link rel="stylesheet" href="/static/css/theme-families.css?v=20261008-desktop-material-01">
+  <link rel="stylesheet" href="/static/desktop/dwrt-rail.css?v=20261008-desktop-material-01">
+  <link rel="stylesheet" href="/static/desktop/file-manager/file-manager.css?v=20260927-rail-spec-01">
+</head>
+<body>
+  <div class="fm-shell" id="fmApp">
+    <button class="fm-rail-backdrop" data-action="sidebar-close" aria-label="关闭位置栏" hidden></button>
+    <aside class="fm-sidebar dwrt-rail" aria-label="文件位置">
+      <div class="dwrt-rail-brand" aria-hidden="true">
+        <img src="/static/images/logo-wide.png?v=20260919-brand-01" alt="DreamingOS">
+      </div>
+      <button class="dwrt-kit-button fm-icon-button fm-rail-close" data-action="sidebar-close" aria-label="关闭位置栏" title="关闭位置栏"><i data-lucide="panel-left-close"></i></button>
+      <nav id="fmRoots" class="fm-roots" aria-label="存储位置"></nav>
+      <nav id="fmStorageTools" class="fm-storage-tools" aria-label="存储管理"></nav>
+      <div class="fm-volume" id="fmVolume"></div>
+    </aside>
+    <main class="fm-main" id="fmMain">
+      <div class="fm-files" id="fmFiles">
+        <div class="fm-pathbar">
+          <button class="dwrt-kit-button fm-icon-button fm-sidebar-toggle" data-action="sidebar" aria-label="显示文件位置" title="文件位置"><i data-lucide="panel-left"></i></button>
+          <div class="fm-history">
+            <button class="dwrt-kit-button fm-icon-button" data-action="back" aria-label="后退" title="后退" disabled><i data-lucide="chevron-left"></i></button>
+            <button class="dwrt-kit-button fm-icon-button" data-action="forward" aria-label="前进" title="前进" disabled><i data-lucide="chevron-right"></i></button>
+            <button class="dwrt-kit-button fm-icon-button" data-action="up" aria-label="上一级" title="上一级" disabled><i data-lucide="arrow-up"></i></button>
+          </div>
+          <nav class="fm-breadcrumbs" id="fmBreadcrumbs" aria-label="当前路径"></nav>
+          <form id="fmPathForm" class="fm-path-form" hidden><input class="dwrt-kit-input" id="fmPath" aria-label="目录路径" autocomplete="off"><button class="dwrt-kit-button fm-icon-button" aria-label="打开路径" title="打开路径"><i data-lucide="corner-down-left"></i></button></form>
+          <button class="dwrt-kit-button fm-icon-button" data-action="address" aria-label="输入路径" title="输入路径"><i data-lucide="square-pen"></i></button>
+          <button class="dwrt-kit-button fm-icon-button" data-action="refresh" aria-label="刷新" title="刷新"><i data-lucide="refresh-cw"></i></button>
+        </div>
+        <div class="fm-toolbar dwrt-kit-table-toolbar">
+          <div class="fm-commands">
+            <button class="dwrt-kit-button" data-action="upload" disabled><i data-lucide="upload"></i><span>上传</span></button>
+            <button class="dwrt-kit-button" data-action="mkdir" disabled><i data-lucide="folder-plus"></i><span>新建文件夹</span></button>
+            <button class="dwrt-kit-button fm-icon-button" data-action="download" aria-label="下载" title="下载" disabled><i data-lucide="download"></i></button>
+            <button class="dwrt-kit-button fm-icon-button" data-action="delete" aria-label="删除" title="删除" disabled><i data-lucide="trash-2"></i></button>
+            <button class="dwrt-kit-button fm-icon-button" data-action="more" aria-label="更多操作" title="更多操作" aria-haspopup="menu"><i data-lucide="ellipsis"></i></button>
+          </div>
+          <form class="fm-search" id="fmSearchForm" role="search">
+            <i data-lucide="search"></i>
+            <input id="fmSearch" type="search" placeholder="搜索文件" aria-label="搜索文件" autocomplete="off">
+            <select id="fmSearchScope" aria-label="搜索范围"><option value="current">当前目录</option></select>
+          </form>
+          <div class="dwrt-kit-segmented fm-views" role="group" aria-label="文件视图">
+            <button class="dwrt-kit-button fm-icon-button is-active" data-action="list" aria-label="列表视图" title="列表视图" aria-pressed="true"><i data-lucide="list"></i></button>
+            <button class="dwrt-kit-button fm-icon-button" data-action="grid" aria-label="网格视图" title="网格视图" aria-pressed="false"><i data-lucide="grid-2x2"></i></button>
+          </div>
+        </div>
+        <div class="fm-notice" id="fmNotice" role="status" hidden></div>
+        <div class="fm-content dwrt-kit-table-scroll" id="fmContent" tabindex="0" aria-label="文件列表"></div>
+        <footer class="fm-statusbar"><span id="fmCount" role="status">正在读取...</span><span id="fmClipboard"></span><button class="dwrt-kit-button fm-icon-button" data-action="hidden" aria-label="显示隐藏文件" title="显示隐藏文件" aria-pressed="false"><i data-lucide="eye-off"></i></button></footer>
+      </div>
+      <section class="fm-tool-view" id="fmToolView" hidden>
+        <div class="fm-pathbar"><button class="dwrt-kit-button" data-action="files"><i data-lucide="arrow-left"></i><span>文件管理器</span></button><span id="fmToolTitle"></span></div>
+        <iframe id="fmToolFrame" aria-label="存储管理" hidden></iframe>
+      </section>
+    </main>
+  </div>
+  <div class="fm-menu dwrt-kit-dropdown" id="fmMenu" role="menu" hidden></div>
+  <div id="fmSheetHost"></div>
+  <div id="fmConfirmHost"></div>
+  <script src="/static/js/dwrt-session-gate.js?v=20260808-region-ink-uses-painted-density-01" defer></script>
+  <script src="/static/ui-kit/lucide.min.js" defer></script>
+  <script src="/static/ui-kit/dwrt-ui-kit.js?v=20260905-sidebar-tabs-01" defer></script>
+  <script src="/static/desktop/glass-foreground.js?v=20261008-desktop-material-01" defer></script>
+  <script src="/static/desktop/file-tools/file-api.js?v=20261001-nas-p0-01" defer></script>
+  <script src="/static/desktop/file-manager/file-manager.js?v=20260927-rail-spec-01" defer></script>
+</body>
+</html>

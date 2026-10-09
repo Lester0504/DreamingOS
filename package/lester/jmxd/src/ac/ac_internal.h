@@ -23,7 +23,7 @@
 
 #define AC_CONFIG_DB_PATH "/etc/dreamingwrt/config.db"
 #define AC_CONTRACT_VERSION "ap-control.v1"
-#define AC_SCHEMA_VERSION 14
+#define AC_SCHEMA_VERSION 20
 #define AC_SECRETS_KEY_PATH "/etc/dreamingwrt/ac-secrets.key"
 #define AC_SERVICE_NAME "dreamingwrt-ac"
 #define AC_NODE_TRANSPORT_ENABLED 1
@@ -240,15 +240,34 @@ typedef int (*ac_pairing_token_visit_fn)(
 typedef int (*ac_radio_job_visit_fn)(const struct ac_radio_job *job,
                                     void *opaque);
 
+#include "ac_certificate_lifecycle.h"
+
 extern sqlite3 *g_ac_db;
 extern struct ubus_context *g_ac_ubus;
 extern struct blob_buf g_ac_blob;
 extern int64_t g_ac_started_at;
 
+/*
+ * Forwards a structured failure event to the log center over
+ * dreamingwrt.logd event_add, so an AC-internal error reaches the operator's
+ * log/alert surface instead of dying in stderr/logread. event_id is a
+ * dw_event_definitions[] catalog id (e.g. "AP_COMMIT_ERROR"); severity is the
+ * catalog severity string ("error"/"warning"/...). ap_id/reason/detail may be
+ * NULL. Fire-and-forget: returns 0 on a delivered invoke, -1 otherwise, and
+ * never blocks the caller's own reply on the outcome.
+ */
+int ac_report_device_event(const char *event_id, const char *severity,
+                           const char *ap_id, const char *operation,
+                           const char *reason, const char *title);
+
 int64_t ac_now_s(void);
 const char *ac_db_path(void);
 int ac_db_init(void);
 void ac_db_close(void);
+/* Hands the opened secret store to the db layer, which needs it to derive
+ * 802.11r R0KH/R1KH key material.  Until this is called the FT fan-out fails
+ * closed rather than falling back to a fixed key. */
+void ac_db_set_secrets(struct ac_secrets *secrets);
 int ac_db_count(const char *table);
 int ac_db_managed_ap_counts(int64_t online_since, int *total, int *online);
 int ac_db_ap_session_begin(const char *ap_id, const char *session_epoch,
@@ -256,12 +275,18 @@ int ac_db_ap_session_begin(const char *ap_id, const char *session_epoch,
 int ac_db_ap_session_begin_with_capabilities(
     const char *ap_id, const char *session_epoch, int protocol_version,
     int write_capable, int64_t received_at);
+struct ac_ap_unbind_request;
+int ac_db_ap_session_begin_with_capabilities_and_unbind(
+    const char *ap_id, const char *session_epoch, int protocol_version,
+    int write_capable, int64_t received_at,
+    struct ac_ap_unbind_request *unbind_out);
 int ac_db_ap_session_end(const char *ap_id, const char *session_epoch);
 int ac_db_ap_heartbeat(const char *ap_id, const char *session_epoch,
                        int64_t received_at);
 int ac_db_scan_execution_available(int64_t online_since, int *ap_count);
 int ac_db_wifi_write_execution_available(int64_t online_since,
                                          int *ap_count);
+int64_t ac_db_wifi_desired_revision(void);
 int ac_db_ap_identity_report(const char *ap_id,
                              const struct ac_device_model_report *report);
 int ac_db_ap_telemetry_store(const char *ap_id, const char *session_epoch,
@@ -352,6 +377,15 @@ struct json_object *ac_db_station_events_json(const char *ap_id,
                                               const char *event,
                                               int64_t start, int64_t end,
                                               int limit, int64_t after_id);
+int ac_db_ap_audit_store(const char *ap_id, const char *event_id,
+                         int64_t occurred_at, const char *session_epoch,
+                         const char *actor, const char *actor_session,
+                         const char *source_ip, const char *action,
+                         const char *risk, const char *target,
+                         const char *result, const char *failure_reason,
+                         const char *request_id, int64_t schema_version);
+struct json_object *ac_db_ap_audit_events_json(const char *ap_id, int limit,
+                                               int64_t before_received_at);
 struct json_object *ac_db_aps_list_json(int64_t observed_at,
                                         int64_t online_since);
 struct json_object *ac_db_wifi_transaction_validate_json(
@@ -392,6 +426,8 @@ struct ac_config_job {
     char finish_id[AC_RADIO_JOB_ID_LEN + 1];
     char outcome[15];
     char error_code[AC_RADIO_JOB_ERROR_MAX + 1];
+    char operation[9];
+    char rollback_of_job_id[AC_RADIO_JOB_ID_LEN + 1];
 };
 
 int ac_db_config_job_create(const char *ap_id, const char *candidate_json,
@@ -426,6 +462,20 @@ int ac_db_config_jobs_recover(int64_t now);
 
 #define AC_WIFI_TX_TARGETS_MAX 32
 #define AC_WIFI_TX_CANDIDATE_MAX_BYTES (16 * 1024)
+/* base_revision for a caller making no optimistic-concurrency claim; resolved
+ * to the current desired revision inside the transaction.
+ *
+ * A hostapd runtime action -- BTM request, deauth, SET_NEIGHBOR -- is not a
+ * config edit: it has no earlier read of the desired state to be stale
+ * against, so gating it on the global revision only means an unrelated radio
+ * edit landing first silently drops a steer.  Resolving inside the
+ * transaction also closes the read-then-apply race a caller would have if it
+ * called the revision getter itself.
+ *
+ * Callers that *are* editing config must still pass a real base revision, so
+ * this is deliberately not the default: only -1 selects it, and every other
+ * negative value stays invalid. */
+#define AC_WIFI_TX_BASE_REVISION_CURRENT ((int64_t)-1)
 
 int ac_db_wifi_transaction_apply(const char *actor_id,
                                  const char *idempotency_key,
@@ -442,6 +492,32 @@ struct json_object *ac_wifi_transaction_apply_json(
     const char *targets_json);
 struct json_object *ac_wifi_transaction_status_json(
     const char *transaction_id);
+
+/* Managed SSID lifecycle. A put is an upsert; each binding becomes one
+ * wifi-iface section in the target AP's candidate. */
+int ac_db_ssid_put(const char *ssid_id, const char *site_id, const char *name,
+                   int enabled, struct json_object *options,
+                   struct json_object *bindings, int64_t base_revision,
+                   const char *actor, int64_t now,
+                   char ssid_id_out[AC_RADIO_JOB_ID_LEN + 1],
+                   char transaction_id_out[AC_RADIO_JOB_ID_LEN + 1],
+                   char *error_out, size_t error_len);
+struct json_object *ac_db_ssid_adopt_json(
+    const char *ssid_id, const char *site_id, const char *name,
+    const char *group_id, struct json_object *bindings, int64_t now);
+int ac_db_ssid_delete(const char *ssid_id, int64_t base_revision,
+                      const char *actor, int64_t now,
+                      char transaction_id_out[AC_RADIO_JOB_ID_LEN + 1],
+                      char *error_out, size_t error_len);
+struct json_object *ac_db_ssids_json(void);
+struct json_object *ac_ssid_put_json(const char *ssid_id, const char *site_id,
+                                     const char *name, int enabled,
+                                     struct json_object *options,
+                                     struct json_object *bindings,
+                                     int64_t base_revision, const char *actor);
+struct json_object *ac_ssid_delete_json(const char *ssid_id,
+                                        int64_t base_revision,
+                                        const char *actor);
 int ac_db_pairing_token_create(int64_t ttl_seconds, int max_attempts,
                                const char *site_id,
                                const char *hardware_digest,
@@ -456,7 +532,96 @@ int ac_db_ap_label_valid(const char *value);
 #define AC_AP_UPDATE_NOT_FOUND (-2)
 #define AC_AP_UPDATE_DB_ERROR  (-3)
 int ac_db_ap_update(const char *ap_id, const char *name,
-                    const char *model_override);
+                     const char *model_override);
+
+/* Phase 1 managed-AP roaming-domain inventory. These APIs manage controller
+ * intent and preflight evidence only. They do not dispatch BTM or Deauth. */
+#define AC_ROAMING_DOMAIN_INVALID   (-1)
+#define AC_ROAMING_DOMAIN_NOT_FOUND (-2)
+#define AC_ROAMING_DOMAIN_CONFLICT  (-3)
+#define AC_ROAMING_DOMAIN_DB_ERROR  (-4)
+
+struct json_object *ac_db_roaming_domains_json(void);
+struct json_object *ac_db_roaming_domain_json(const char *domain_id);
+struct json_object *ac_db_roaming_domain_preflight_json(
+    const char *domain_id, int64_t now);
+struct json_object *ac_db_roaming_domain_observe_json(
+    const char *domain_id, const char *station_mac, const char *mode, int64_t now);
+struct json_object *ac_roam_btm_history_json(const char *domain_id,
+    const char *station_mac, int limit, int64_t now);
+int ac_roam_steering_enable(const char *domain_id, int64_t now);
+int ac_roam_steering_enable_scoped(const char *domain_id,
+    const char *station_mac, int64_t now);
+int ac_db_roaming_schedule_tick(int64_t now, int *dispatched);
+struct json_object *ac_db_roaming_neighbor_sync_json(const char *domain_id,
+                                                    int64_t now);
+struct json_object *ac_db_roaming_neighbor_sync_set_json(const char *domain_id,
+    int enabled, int64_t now);
+
+struct ac_roaming_policy {
+    int weak_rssi_dbm;
+    int minimum_candidate_gain_db;
+    int candidate_min_rssi_dbm;
+    int decision_min_interval_sec;
+    int post_roam_cooldown_sec;
+    int max_btm_attempts_per_hour;
+    int deauth_after_btm_failures;
+    int deauth_cooldown_sec;
+    int domain_action_rate_limit;
+    int64_t revision;
+    int64_t updated_at;
+    char updated_by[65];
+    int reassoc_block_enabled;
+    int reassoc_block_sec;
+    char reassoc_block_scope[6];
+    char steering_preference[16];
+    int high_band_steer_enabled;
+    int force_disassoc_on_reject;
+    int lower_band_block_enabled;
+    int band_steer_mode;
+    int band_steer_min_rssi_dbm;
+};
+
+struct json_object *ac_db_roaming_policy_json(const char *domain_id);
+int ac_db_roaming_policy_put(const char *domain_id,
+                             const struct ac_roaming_policy *policy,
+                             int64_t base_revision);
+int ac_db_roaming_domain_put(const char *domain_id, const char *name,
+                             const char *ssid_ids_json,
+                             const char *ap_group_ids_json,
+                             const char *security_profile_id,
+                             const char *mobility_domain,
+                             int ft_enabled, const char *ft_mode,
+                             int neighbor_report_enabled,
+                             int bss_transition_enabled,
+                             int deauth_enabled,
+                             const char *deauth_confirmation,
+                             int64_t base_revision,
+                             const char *updated_by,
+                             char domain_id_out[AC_RADIO_JOB_ID_LEN + 1]);
+int ac_db_roaming_domain_delete(const char *domain_id,
+                                int64_t base_revision);
+struct json_object *ac_db_roaming_deauth_evaluate_json(const char *domain_id,
+                                                       const char *station_mac,
+                                                       const char *triggered_by,
+                                                       int execute,
+                                                       const char *confirmation,
+                                                       int64_t now);
+struct json_object *ac_db_roaming_domain_apply_json(
+    const char *domain_id, const char *consistency, int64_t now);
+
+/* Phase 2: cooldown, exclusions, candidate scoring, audit. */
+int ac_db_roaming_exclusion_put(const char *exclusion_id,
+                                const char *domain_id,
+                                const char *rule_type,
+                                const char *pattern,
+                                const char *label,
+                                int64_t now);
+int ac_db_roaming_exclusion_delete(const char *exclusion_id);
+struct json_object *ac_db_roaming_exclusions_json(const char *domain_id);
+struct json_object *ac_db_roaming_audit_json(const char *domain_id,
+                                             const char *station_mac,
+                                             int limit);
 int ac_db_pairing_token_redeem(const char *token_id, const char *token,
                                const char *site_id,
                                const char *hardware_digest,
@@ -484,6 +649,36 @@ int ac_db_enrollment_activate(
     const unsigned char peer_fingerprint_sha256[32],
     const unsigned char *challenge, size_t challenge_len,
     struct ac_enrollment_record *out);
+
+#define AC_AP_UNBIND_REQUEST_ID_LEN 36
+#define AC_AP_UNBIND_ERROR_MAX 127
+#define AC_AP_UNBIND_OK 0
+#define AC_AP_UNBIND_NOT_FOUND (-1)
+#define AC_AP_UNBIND_NOT_ADOPTED (-2)
+#define AC_AP_UNBIND_DB (-3)
+
+struct ac_ap_unbind_request {
+    char request_id[AC_AP_UNBIND_REQUEST_ID_LEN + 1];
+    char ap_id[AC_ENROLLMENT_ID_LEN + 1];
+    char certificate_id[AC_ENROLLMENT_ID_LEN + 1];
+    char enrollment_id[AC_ENROLLMENT_ID_LEN + 1];
+    char state[16];
+    int64_t requested_at;
+    int64_t acknowledged_at;
+    char error_code[AC_AP_UNBIND_ERROR_MAX + 1];
+};
+
+int ac_db_ap_unbind_request_create(const char *ap_id,
+                                   struct ac_ap_unbind_request *out);
+int ac_db_ap_unbind_request_pending(const char *ap_id,
+                                    struct ac_ap_unbind_request *out);
+int ac_db_ap_unbind_request_status(const char *ap_id,
+                                   struct ac_ap_unbind_request *out);
+int ac_db_ap_unbind_request_ack(const char *ap_id,
+                                const char *session_epoch,
+                                const char *request_id, int unpaired,
+                                const char *error_code,
+                                struct ac_ap_unbind_request *out);
 int ac_enrollment_verify_and_claim(
     const struct ac_enrollment_signed_request *request,
     struct ac_enrollment_record *out);
@@ -492,6 +687,10 @@ int ac_enrollment_transcript_build(
     unsigned char **out, size_t *out_len);
 
 int ac_pki_init(struct ac_pki **out);
+/* Stable, machine-checkable reason for the most recent ac_pki_init() failure on
+ * this thread. Never NULL; "pki_init_failed" only when nothing more specific was
+ * recorded. Callers surface it verbatim, so treat the strings as a contract. */
+const char *ac_pki_last_reason(void);
 /* Server certificate validity window, so status can show an unusable
  * certificate instead of leaving it to be found with openssl by hand. */
 int ac_transport_server_certificate_window(int64_t *not_before,
@@ -567,8 +766,114 @@ int ac_transport_listening(void);
 int ac_transport_port(void);
 const char *ac_transport_controller_id(void);
 const char *ac_transport_reason(void);
+int ac_transport_bootstrap_ready(void);
+int ac_transport_ca_pem(unsigned char **out, size_t *out_len);
+struct json_object *ac_transport_txpower_mode_json(const char *ap_id,
+                                                    const char *mode,
+                                                    int confirm, int write);
 
 int ac_ubus_start(void);
 void ac_ubus_stop(void);
+
+/* ── AP Binding (dreamingwrt-ap-binding QR → gateway adoption) ── */
+
+#define AC_BINDING_ID_LEN         36
+#define AC_BINDING_NONCE_LEN      16
+#define AC_BINDING_TICKET_TTL     300   /* 5 min */
+#define AC_BINDING_PREVIEW_TTL    600   /* 10 min */
+#define AC_BINDING_REQUEST_TTL    3600  /* 1 hour */
+#define AC_BINDING_NONCE_RETAIN   86400 /* 24 h nonce dedup window */
+#define AC_BINDING_IDEMPOTENCY_TTL 86400
+
+#define AC_BINDING_OK              0
+#define AC_BINDING_ERR_QR         (-1)
+#define AC_BINDING_ERR_VERSION    (-2)
+#define AC_BINDING_ERR_EXPIRED    (-3)
+#define AC_BINDING_ERR_TICKET     (-4)
+#define AC_BINDING_ERR_CONSUMED   (-5)
+#define AC_BINDING_ERR_REPLAYED   (-6)
+#define AC_BINDING_ERR_AP_NOT_FOUND   (-7)
+#define AC_BINDING_ERR_AP_MISMATCH    (-8)
+#define AC_BINDING_ERR_GW_NOT_FOUND   (-9)
+#define AC_BINDING_ERR_GW_MISMATCH    (-10)
+#define AC_BINDING_ERR_SITE_NOT_FOUND (-11)
+#define AC_BINDING_ERR_AP_BOUND       (-12)
+#define AC_BINDING_ERR_PERMISSION     (-13)
+#define AC_BINDING_ERR_ENROLL_PENDING (-14)
+#define AC_BINDING_ERR_NOT_FOUND      (-15)
+#define AC_BINDING_ERR_NOT_CANCELLABLE (-16)
+#define AC_BINDING_ERR_IDEMPOTENCY    (-17)
+#define AC_BINDING_ERR_DB             (-18)
+#define AC_BINDING_ERR_BOOTSTRAP      (-19)
+
+struct ac_binding_request {
+    char binding_id[AC_BINDING_ID_LEN + 1];
+    char bootstrap_id[AC_ENROLLMENT_ID_LEN + 1];
+    char key_fingerprint[AC_ENROLLMENT_KEY_ID_LEN + 1];
+    char ticket_nonce[AC_BINDING_NONCE_LEN * 2 + 1]; /* base62 encoded */
+    int64_t ticket_expires_at;
+    int64_t ticket_consumed_at;
+    char controller_id[AC_ENROLLMENT_ID_LEN + 1];
+    char site_id[AC_PAIRING_SITE_ID_LEN + 1];
+    char state[32];
+    char enrollment_id[AC_ENROLLMENT_ID_LEN + 1];
+    char pairing_token_id[AC_PAIRING_TOKEN_ID_LEN + 1];
+    char idempotency_key[AC_BINDING_ID_LEN + 1];
+    char client_info[256];
+    char error_code[64];
+    char failure_code[64];
+    int64_t created_at;
+    int64_t updated_at;
+    int64_t expires_at;
+};
+
+int ac_db_binding_schema_init(void);
+int ac_db_binding_create(const char *bootstrap_id, const char *key_fingerprint,
+                         const char *ticket_nonce, int64_t ticket_expires_at,
+                         const char *controller_id, const char *site_id,
+                         const char *idempotency_key, const char *client_info,
+                         struct ac_binding_request *out);
+int ac_db_binding_get(const char *binding_id,
+                      struct ac_binding_request *out);
+int ac_db_binding_pending(const char *bootstrap_id,
+                          const char *exclude_binding_id);
+int ac_db_binding_update_state(const char *binding_id, const char *new_state,
+                               const char *enrollment_id,
+                               const char *pairing_token_id,
+                               const char *error_code,
+                               const char *failure_code);
+int ac_db_binding_consume_ticket(const char *binding_id);
+int ac_db_binding_activate(const char *binding_id,
+                           const char *pairing_token_id,
+                           const char *ticket_nonce);
+int ac_db_binding_cancel(const char *binding_id);
+int ac_db_binding_check_idempotency(const char *idempotency_key,
+                                     const char *bootstrap_id,
+                                     const char *controller_id,
+                                     const char *site_id,
+                                     struct ac_binding_request *out);
+int ac_db_binding_expire_stale(void);
+int ac_db_binding_cleanup_nonces(void);
+
+struct json_object *ac_binding_preview_json(
+    const char *bootstrap_id, const char *key_fingerprint,
+    const char *ticket, int64_t ticket_expires_at,
+    const char *controller_id, const char *site_id,
+    const char *idempotency_key, const char *client_info);
+struct json_object *ac_binding_confirm_json(
+    const char *binding_id, const char *bootstrap_id,
+    const char *key_fingerprint, const char *ticket,
+    int64_t ticket_expires_at, const char *controller_id,
+ const char *site_id, const char *idempotency_key,
+    const char *client_info);
+struct json_object *ac_binding_status_json(const char *binding_id);
+struct json_object *ac_binding_cancel_json(const char *binding_id);
+struct json_object *ac_ap_unpair_json(const char *ap_id);
+struct json_object *ac_ap_unpair_status_json(const char *ap_id);
+struct json_object *ac_discovery_confirm_json(
+    const char *ap_id, const char *key_fingerprint, const char *ticket,
+    int64_t ticket_expires_at, const char *controller_id,
+    const char *site_id, const char *client_info);
+const char *ac_binding_error_str(int rc);
 
 #endif

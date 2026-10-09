@@ -1,7 +1,5 @@
 #!/usr/bin/env python3
-"""W2a config executor core: candidate contract, stage/apply/readback/
-rollback state machine over injected fake uci/wifi commands, and the
-production-dormancy contract (ops table and capabilities stay disabled)."""
+"""Candidate-aware AP config executor and fail-closed runtime capability contract."""
 
 from __future__ import annotations
 
@@ -19,6 +17,7 @@ EXECUTOR = ROOT / "src/apd/apd_config_executor.c"
 HEADER = ROOT / "src/apd/apd_config_executor.h"
 BACKEND = ROOT / "src/apd/apd_backend_openwrt.c"
 PROTOCOL = ROOT / "src/apd/apd_protocol.c"
+TRANSPORT = ROOT / "src/apd/apd_transport.c"
 COMMAND = ROOT / "src/apd/apd_readonly_command.c"
 FIXTURE = ROOT / "tests/apd_config_executor_fixture.c"
 MAKEFILE = ROOT / "src/Makefile"
@@ -29,6 +28,7 @@ def static_contract() -> None:
     header = HEADER.read_text(encoding="utf-8")
     backend = BACKEND.read_text(encoding="utf-8")
     protocol = PROTOCOL.read_text(encoding="utf-8")
+    transport = TRANSPORT.read_text(encoding="utf-8")
     for token in (
         "uci-wireless-candidate.v1",
         '"candidate_digest_mismatch"',
@@ -41,24 +41,16 @@ def static_contract() -> None:
     ):
         assert token in executor, f"missing executor contract: {token}"
     assert "APD_CONFIG_SECTIONS_MAX 16U" in header
-    # Production dormancy: the backend ops table still refuses every write
-    # phase and the capability surface still reports them false.  The W2b
-    # config_job wire is the only future caller and it must sit behind
-    # these gates.
-    for gate in ("phase2_candidate_validation_pending",
-                 "phase2_atomic_staging_pending",
-                 "phase2_transactional_apply_pending",
-                 "phase2_canonical_readback_pending",
-                 "phase2_rollback_readback_pending"):
-        assert gate in backend, f"ops gate missing: {gate}"
-    assert "apd_config_apply" not in backend, (
-        "backend ops must not reach the executor before the W2b wire gate"
-    )
-    for capability in ('"validate", 0', '"stage", 0', '"apply", 0',
-                       '"readback", 0', '"rollback", 0'):
-        assert capability in protocol, (
-            f"apd capability no longer fail-closed: {capability}"
-        )
+    assert "apd_config_candidate_validate(candidate, out)" in backend
+    assert "apd_config_stage(&paths, candidate, out)" in backend
+    assert "apd_config_apply(&paths, uci_candidate, out)" in backend
+    assert "apd_config_readback(&paths, candidate, out)" in backend
+    assert "apd_config_rollback(&paths, rollback_ref, out)" in backend
+    assert "config_executor_unavailable" in protocol
+    assert "apd_config_executor_available_default()" in protocol
+    assert "apd_config_executor_available_default()" in transport
+    assert "connection.protocol_version == 3 && g_apd_transport.write_capable" in transport
+    assert "APD_CONFIG_JOBS_TEST_ENABLE" not in transport
     assert "apd/apd_config_executor.o" in MAKEFILE.read_text(
         encoding="utf-8")
 
@@ -96,7 +88,7 @@ def test_runtime() -> None:
         completed = subprocess.run([str(binary), "run", str(temp)],
                                    check=True, capture_output=True,
                                    text=True)
-        assert completed.stdout.strip() == "ok", completed.stdout
+        assert completed.stdout.strip() == "ok", completed.stdout + completed.stderr
 
 
 def main() -> None:

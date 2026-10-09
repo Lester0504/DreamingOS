@@ -405,6 +405,27 @@ static void require_delete_point(const char *path) {
     assert(!strstr(buf, "/mnt/dwrt-usb1"));
 }
 
+static void require_atomic_batch_readback_rollback(const char *path) {
+    struct jmx_system_mount_spec specs[2];
+    struct jmx_system_mount_txn_opts o;
+    struct jmx_system_mount_txn_result r;
+    FILE *fp;
+    char buf[512];
+    specs[0] = good_spec();
+    specs[1] = good_spec();
+    snprintf(specs[1].source, sizeof(specs[1].source),
+             "UUID=87654321-4321-4321-4321-cba987654321");
+    snprintf(specs[1].target, sizeof(specs[1].target), "/mnt/dwrt-usb2");
+    memset(&o, 0, sizeof(o)); o.fstab_path = path;
+    fp = fopen(path, "wb"); assert(fp);
+    assert(fputs("# original atomic batch\n", fp) >= 0); assert(fclose(fp) == 0);
+    reset_io_hooks(); readback_fault_mode = 1;
+    assert(jmx_system_mount_save_batch(specs, 2, &o, &r) == JMX_SYSTEM_MOUNT_ERR_IO);
+    assert(r.changed == 1 && r.rolled_back == 1);
+    read_file(path, buf, sizeof(buf));
+    assert(!strcmp(buf, "# original atomic batch\n"));
+}
+
 int main(int argc, char **argv) {
     char path[512];
     char partial_path[512];
@@ -413,6 +434,7 @@ int main(int argc, char **argv) {
     char parent_fsync_path[512];
     char pre_rename_path[512];
     char threshold_path[512];
+    char batch_path[512];
     assert(argc == 2);
     snprintf(path, sizeof(path), "%s/fstab", argv[1]);
     snprintf(partial_path, sizeof(partial_path), "%s/fstab-partial", argv[1]);
@@ -421,6 +443,7 @@ int main(int argc, char **argv) {
     snprintf(parent_fsync_path, sizeof(parent_fsync_path), "%s/fstab-parent-fsync", argv[1]);
     snprintf(pre_rename_path, sizeof(pre_rename_path), "%s/fstab-pre-rename", argv[1]);
     snprintf(threshold_path, sizeof(threshold_path), "%s/fstab-threshold", argv[1]);
+    snprintf(batch_path, sizeof(batch_path), "%s/fstab-batch", argv[1]);
     require_invalid_source();
     require_dangerous_targets_rejected();
     require_options_injection_rejected();
@@ -435,6 +458,7 @@ int main(int argc, char **argv) {
     require_pre_rename_failure_not_rollback(pre_rename_path);
     require_rollback_success_threshold(threshold_path);
     require_delete_point(path);
+    require_atomic_batch_readback_rollback(batch_path);
     puts("system_mount_contract: PASS");
     return 0;
 }

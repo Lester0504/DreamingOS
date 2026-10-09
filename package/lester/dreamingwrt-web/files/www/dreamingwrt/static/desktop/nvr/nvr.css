@@ -1,0 +1,47 @@
+.nvr-shell { height:100dvh; overflow:auto; display:flex; flex-direction:column; gap:16px; padding:var(--app-page-gutter,12px); }
+.nvr-shell > * { flex:0 0 auto; min-width:0; }
+.nvr-shell p { margin:4px 0; overflow-wrap:anywhere; }
+.nvr-shell h2 { font-size:14px; margin:0 0 8px; }
+.nvr-shell button { white-space:nowrap; }
+#nvrCameras { display:grid; grid-template-columns:repeat(auto-fit,minmax(min(100%,280px),1fr)); gap:8px; }
+.nvr-camera { border:1px solid var(--color-border-subtle); border-radius:var(--radius-md,8px); padding:12px; min-width:0; }
+.nvr-camera strong { overflow-wrap:anywhere; }
+.nvr-camera p { color:var(--color-text-secondary); font-size:13px; margin:6px 0; }
+.nvr-table-wrap { width:100%; overflow:auto; margin-top:8px; }
+.nvr-table { width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums; }
+.nvr-table th,.nvr-table td { text-align:left; padding:10px 8px; border-bottom:1px solid var(--color-border-subtle); vertical-align:top; }
+.nvr-table th { color:var(--color-text-secondary); font-weight:500; white-space:nowrap; }
+.nvr-table td { overflow-wrap:anywhere; }
+.nvr-table td:first-child { min-width:155px; }
+.nvr-table td:last-child { min-width:170px; }
+#nvrPlayer { border:1px solid var(--color-border-subtle); border-radius:var(--radius-md,8px); padding:10px; }
+#nvrPlayer video { width:100%; max-height:420px; aspect-ratio:16/9; display:block; margin-top:8px; background:#000; }
+#nvrPlaying { flex:1 1 160px; overflow-wrap:anywhere; }
+#nvrPlaybackState { min-height:1.5em; color:var(--color-text-secondary); }
+#nvrNotice { color:var(--color-text-secondary); }
+.nvr-sheet-form { min-height:0; display:flex; flex-direction:column; }
+.nvr-form { flex:1; padding:16px var(--dwrt-kit-sheet-padding-x); display:flex; flex-direction:column; gap:12px; }
+.nvr-form label { display:flex; flex-direction:column; gap:6px; }
+.nvr-form input { width:100%; min-width:0; }
+@media(max-width:480px) { .nvr-table th,.nvr-table td { padding:8px 6px; } #nvrPlayer video { max-height:240px; } }
+.nvr-shell { gap:8px; overflow:hidden; }
+.nvr-shell > .nvr-view { flex:1; min-height:0; overflow:auto; }
+#nvrViews { border-bottom:1px solid var(--color-border-subtle); padding-bottom:8px; }
+#nvrViews [aria-pressed="true"] { color:var(--color-accent); border-bottom-color:var(--color-accent); }
+#nvrViews #nvrState { font-size:12px; margin-left:auto; }
+#nvrNotice { font-size:12px; }
+#nvrNotice:empty { display:none; }
+#nvrPlayer { max-height:45%; overflow:auto; }
+#nvrPlayer video { max-height:220px; margin-top:4px; }
+.nvr-view > .ft-toolbar { padding-bottom:8px; }
+.nvr-view h2 { margin-top:8px; }
+.nvr-empty { padding:32px 16px; text-align:center; color:var(--color-text-secondary); display:flex; flex-direction:column; align-items:center; justify-content:center; min-height:280px; height:100%; }
+.nvr-empty strong { color:var(--color-text-primary); font-weight:500; font-size:20px; }
+.nvr-empty p { max-width:420px; margin:12px 0 24px; }
+.nvr-view > h2 { display:none; }
+.nvr-view:has(.nvr-empty) { display:flex; flex-direction:column; }
+.nvr-view:has(.nvr-empty) > div:last-child { flex:1; }
+#nvrCameras:has(.nvr-empty) { display:block; }
+.nvr-shell .dwrt-kit-button { font-weight:500; }
+.nvr-empty .dwrt-kit-button svg { width:18px; height:18px; }
+@media(max-width:480px) { #nvrViews { gap:4px; } #nvrViews #nvrState { flex:1 1 100%; margin:0; } #nvrPlayer video { max-height:160px; } }

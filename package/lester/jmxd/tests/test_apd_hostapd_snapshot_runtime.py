@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import tempfile
 
+import apd_test_deps
+
 
 ROOT = Path(__file__).resolve().parents[1]
 FIXTURE = ROOT / "tests/apd_hostapd_snapshot_fixture.c"
@@ -26,7 +28,9 @@ def main() -> None:
                 "-Wall",
                 "-Wextra",
                 "-Werror",
+                f"-I{ROOT / 'src'}",
                 str(FIXTURE),
+                *apd_test_deps.package_flags("openssl"),
                 "-o",
                 str(binary),
             ],
@@ -35,6 +39,8 @@ def main() -> None:
         )
         for scenario in (
             "success",
+            "native-acl-quarantined",
+            "native-acl-patched",
             "partial-mlo",
             "timeout",
             "malformed",
@@ -48,6 +54,7 @@ def main() -> None:
             "missing-dir",
             "untrusted-dir",
             "untrusted-local-dir",
+            "service-user-reply",
             "vendor-dir",
             "stale-global",
         ):

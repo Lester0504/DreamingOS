@@ -24,7 +24,7 @@ SCHEMA_VERSION = 1
 REQUIRED_TABLES = (
     "network_meta", "wan", "lan", "network_global", "web_users",
     "system_ui_settings", "appearance_settings", "system_settings",
-    "work_mode_settings",
+    "work_mode_settings", "observability_retention_profile",
 )
 
 DRIVER = r"""
@@ -169,6 +169,12 @@ def main():
         assert conn.execute(
             "SELECT password_hash FROM web_users WHERE username='admin'"
         ).fetchone()[0] == "$5$legacyhash", "secret reference was not preserved"
+        assert conn.execute(
+            "SELECT profile_name,version,age_days,row_cap,byte_cap "
+            "FROM observability_retention_profile WHERE id=1"
+        ).fetchone() == (
+            "dwrt-observability-v1", 1, 90, 65536, 268435456
+        )
         conn.close()
 
         report = json.loads(report_path.read_text())
@@ -180,7 +186,8 @@ def main():
         actions = {t["name"]: t["action"] for t in report["tables"]}
         assert len(report["tables"]) == report["table_count"] >= 86
         for table in ("system_settings", "system_ui_settings",
-                      "appearance_settings", "work_mode_settings"):
+                      "appearance_settings", "work_mode_settings",
+                      "observability_retention_profile"):
             assert actions[table] == "created", table + " should be reported as created"
         assert actions["web_users"] == "migrated"
         assert actions["dhcp_lease_cache"] == "dropped", "volatile cache must be reported"

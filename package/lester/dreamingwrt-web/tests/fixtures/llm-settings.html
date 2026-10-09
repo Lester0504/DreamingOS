@@ -37,13 +37,14 @@
     const root = document.getElementById('routePreview');
     const writes = [];
     const config = {
-      provider: 'openai', api_base: '', api_key_set: true, api_key: 'sk-***abcd',
+      provider: 'openai_compatible', api_base: 'http://fixture.invalid/v1', api_key_set: true, api_key: 'sk-***abcd',
       auth_mode: 'api_key', model: 'gpt-4o', temperature: 0.7, max_tokens: 4096,
       system_prompt: '', tool_policy: 'confirm_medium', enabled: true,
       reasoning_effort: 'auto', reasoning_api_shape: 'chat_completions',
       capabilities: {
         reasoning_effort_supported: true, reasoning_effort_values: ['auto', 'low', 'medium', 'high'],
-        provider_test: true, provider_models_sync: true, chat_runtime: true
+        provider_test: true, provider_models_sync: true, chat_runtime: true,
+        multi_provider: true, dispatch_strategies: ['single', 'failover', 'load_balance']
       },
       oauth: { available: false, catalog: [] }
     };
@@ -52,9 +53,13 @@
     window.fetch = async (url, init = {}) => {
       const target = new URL(url, location.href).pathname;
       const method = String(init.method || 'GET').toUpperCase();
+      if (target.startsWith('/static/images/logo/')) return new Response('', { status: 204 });
       if (!target.startsWith('/api/v1/ai/')) return originalFetch(url, init);
       if (method !== 'GET') writes.push({ target, method, body: init.body || '' });
-      const payload = target.endsWith('/models') ? ['gpt-4o', 'gpt-4o-mini'] : config;
+      const payload = target.endsWith('/models') ? ['gpt-4o', 'gpt-4o-mini']
+        : target.endsWith('/providers') ? { providers: [{ id: 'provider-fixture', provider: 'openai_compatible', display_name: 'Fixture API', role: 'primary', enabled: true }], count: 1, capabilities: { multi_provider: true, dispatch_strategies: ['single', 'failover', 'load_balance'] } }
+        : target.endsWith('/dispatch-policy') ? { strategy: 'single', available_strategies: ['single', 'failover', 'load_balance'], provider_count: 1, enabled_provider_count: 1, primary_ready: true }
+        : config;
       return new Response(JSON.stringify({ code: 2000, data: payload }), { status: 200, headers: { 'Content-Type': 'application/json' } });
     };
 
@@ -64,6 +69,7 @@
       ui: {
         mountAll: node => window.DWRT_UI_KIT.mountAll(node),
         confirmationMarkup: (...args) => window.DWRT_UI_KIT.confirmationMarkup(...args),
+        floatingSavebarMarkup: (...args) => window.DWRT_UI_KIT.floatingSavebarMarkup(...args),
         statusBadgeMarkup: (...args) => window.DWRT_UI_KIT.statusBadgeMarkup(...args),
         overviewCardsMarkup: (...args) => window.DWRT_UI_KIT.overviewCardsMarkup(...args),
         scheduleAdaptiveForegroundSample: (delay = 0, scopeRoot = root) => setTimeout(() => {

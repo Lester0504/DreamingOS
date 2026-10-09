@@ -5,6 +5,28 @@
 extern void aegisxd_feed_scheduler_start(void);
 extern void aegisxd_feed_scheduler_stop(void);
 
+static int aegisxd_load_storage_assignment(void)
+{
+    char provider_id[128] = "";
+    char active_path[AEGISXD_MAX_PATH] = "";
+    char state[32] = "";
+    char reason[96] = "";
+
+    if (jmx_storage_binding_read("aegis", provider_id, sizeof(provider_id),
+                                 active_path, sizeof(active_path), state,
+                                 sizeof(state), reason, sizeof(reason)) != 0)
+        return -1;
+    if (active_path[0]) {
+        if (!jmx_storage_binding_path_ready(active_path, 0)) {
+            fprintf(stderr, "[dreamingwrt-aegisxd] external_storage_unavailable path=%s reason=%s\n",
+                    active_path, reason);
+            return -1;
+        }
+        snprintf(g_aegisxd_db_path, sizeof(g_aegisxd_db_path), "%s", active_path);
+    }
+    return 0;
+}
+
 static void aegisxd_handle_signal(int signo)
 {
     (void)signo;
@@ -19,6 +41,8 @@ int main(int argc, char **argv)
 
     if (curl_global_init(CURL_GLOBAL_DEFAULT) != CURLE_OK)
         return 1;
+    if (aegisxd_load_storage_assignment() != 0)
+        goto fail_curl;
     if (argc >= 2 && !strcmp(argv[1], "--feed-import-worker")) {
         const char *job_id = argc >= 3 ? argv[2] : "";
         const char *feed_id = argc >= 4 ? argv[3] : "";
@@ -55,6 +79,7 @@ int main(int argc, char **argv)
     }
     if (aegisxd_honeypot_reconcile() != 0)
         fprintf(stderr, "[dreamingwrt-aegisxd] honeypot runtime reconciliation failed\n");
+    aegisxd_ad_dns_start();
     aegisxd_hit_producer_start();
     aegisxd_feed_scheduler_start();
 
@@ -62,6 +87,7 @@ int main(int argc, char **argv)
             AEGISXD_CONFIG_DB_PATH, AEGISXD_DB_PATH);
     uloop_run();
 
+    aegisxd_ad_dns_stop();
     aegisxd_feed_scheduler_stop();
     aegisxd_hit_producer_stop();
     aegisxd_ubus_stop();

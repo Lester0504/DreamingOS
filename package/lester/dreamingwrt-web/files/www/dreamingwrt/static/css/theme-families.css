@@ -1,0 +1,608 @@
+/* theme-families.css — user-selectable UI material families.
+ *
+ * Loaded AFTER dwrt-theme.css. It ONLY redefines the shared composite glass
+ * tokens (defined at dwrt-theme.css :root) per data-theme-family, orthogonal to
+ * data-theme-resolved (light|dark). Business/page CSS is never touched — every
+ * page consumes var(--dwrt-glass-*), so swapping the family swaps the material
+ * everywhere at once.
+ *
+ *   liquid-glass  — sampled wallpaper canvas + backdrop-filter (STATUS QUO).
+ *                   Keeps dwrt-theme.css :root values; also the fallback when
+ *                   data-theme-family is absent. No block needed here.
+ *   frosted-glass — static backdrop blur + translucent neutral surface, argon
+ *                   look, no optical sampler or visible canvas.
+ *   traditional   — fully opaque solid panels, 1px borders + layered shadow,
+ *                   backdrop-filter: none, roceos look.
+ *
+ * theme_family is orthogonal to material_glass.mode (mode is the liquid family's
+ * render-precision tier and only matters under liquid-glass) and to accent_color
+ * (a separate user setting). This file does NOT touch --app-accent: the accent is
+ * the user's own orthogonal choice, so hard-coding a per-family accent would
+ * pollute it. The SPEC's argon "#5e72e4" is a reference feel, not an override.
+ */
+
+/* ── liquid-glass: inherit dwrt-theme.css :root verbatim (backward compatible).
+ * Declared explicitly so the intent is documented; values equal the :root set,
+ * and a missing data-theme-family attribute also resolves to these via :root. */
+html[data-theme-family="liquid-glass"] {
+  /* intentionally empty — inherits the shared optical baseline from :root */
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * frosted-glass — argon / LesterWrt. Static blur, no optical sampler.
+ * Reference: 31.4's current Argon footer tokens, not upstream cascade.css.
+ * Keep tint, blur and relief separate; embedded pages share the window's glass.
+ * ══════════════════════════════════════════════════════════════════════════ */
+html[data-theme-family="frosted-glass"][data-theme-resolved="light"] {
+  --dwrt-glass-backdrop: blur(6px) saturate(140%);
+  --dwrt-glass-surface:
+    linear-gradient(rgba(255, 255, 255, 0.45), rgba(255, 255, 255, 0.45));
+  --dwrt-glass-surface-raised:
+    linear-gradient(rgba(255, 255, 255, 0.46), rgba(255, 255, 255, 0.46));
+  --dwrt-glass-highlight: rgba(255, 255, 255, 0.22);
+  --dwrt-glass-edge: rgba(255, 255, 255, 0.22);
+  --dwrt-glass-edge-strong: rgba(116, 132, 150, 0.24);
+  --dwrt-glass-shadow: 0 10px 24px rgba(15, 23, 42, 0.08);
+  --dwrt-glass-shadow-raised: 0 16px 36px rgba(15, 23, 42, 0.14);
+  --dwrt-glass-inset-surface: linear-gradient(rgba(255, 255, 255, 0.12), rgba(255, 255, 255, 0.12));
+  --dwrt-glass-inset-edge: rgba(20, 30, 45, 0.14);
+  --dwrt-glass-inset-shadow: 0 2px 8px rgba(15, 23, 42, 0.05);
+  /* Shared foreground adaptation may strengthen this baseline, never the tint. */
+  --dwrt-glass-ink: rgba(20, 30, 45, 0.96);
+  --dwrt-glass-text: rgba(30, 42, 60, 0.86);
+  --dwrt-glass-muted: rgba(60, 72, 92, 0.70);
+  /* ── liquid private blur sub-layer (defined at :root in menu-shell.css /
+     dwrt-theme.css). Business CSS consumes these var() chains DIRECTLY for
+     backdrop-filter — e.g. .dashboard-metric-card blur(calc(var(--lg-blur-radius)*0.20)),
+     the menu pill blur(var(--lg-material-blur-soft)), .dwrt-glass-card
+     blur(var(--lg-material-blur-panel)). Until now theme-families only redefined
+     the flat --dwrt-glass-* composites, so this whole blur layer stayed pinned to
+     liquid values and never switched. Redefine it per family so blur switches too. */
+  --lg-blur-radius: 30px;
+  --lg-material-blur: 6px;
+  --lg-material-blur-soft: 5px;      /* menu selection pill + control backdrop */
+  --lg-material-blur-panel: 6px;
+  --dwrt-glass-base-blur: 6px;
+  --dwrt-glass-saturation: 140%;
+}
+
+html[data-theme-family="frosted-glass"][data-theme-resolved="dark"] {
+  --dwrt-glass-backdrop: blur(6px) saturate(140%);
+  --dwrt-glass-surface:
+    linear-gradient(rgba(20, 28, 38, 0.42), rgba(20, 28, 38, 0.42));
+  --dwrt-glass-surface-raised:
+    linear-gradient(rgba(20, 28, 38, 0.46), rgba(20, 28, 38, 0.46));
+  --dwrt-glass-highlight: rgba(255, 255, 255, 0.08);
+  --dwrt-glass-edge: rgba(255, 255, 255, 0.10);
+  --dwrt-glass-edge-strong: rgba(255, 255, 255, 0.14);
+  --dwrt-glass-shadow: 0 12px 30px rgba(0, 0, 0, 0.18);
+  --dwrt-glass-shadow-raised: 0 18px 46px rgba(0, 0, 0, 0.28);
+  --dwrt-glass-inset-surface: linear-gradient(rgba(255, 255, 255, 0.055), rgba(255, 255, 255, 0.055));
+  --dwrt-glass-inset-edge: rgba(255, 255, 255, 0.16);
+  --dwrt-glass-inset-shadow: 0 2px 8px rgba(0, 0, 0, 0.14);
+  --dwrt-glass-ink: rgba(248, 251, 255, 0.97);
+  --dwrt-glass-text: rgba(234, 242, 252, 0.90);
+  --dwrt-glass-muted: rgba(215, 226, 240, 0.78);
+  /* Keep both text-shadow chains aligned; the foreground pass supplies contrast. */
+  --adaptive-text-shadow: 0 1px 1px rgba(0, 0, 0, 0.28);
+  --dwrt-text-shadow: 0 1px 1px rgba(0, 0, 0, 0.28);
+  /* Direct blur consumers use the same static family baseline. */
+  --lg-blur-radius: 30px;
+  --lg-material-blur: 6px;
+  --lg-material-blur-soft: 6px;
+  --lg-material-blur-panel: 6px;
+  --dwrt-glass-base-blur: 6px;
+  --dwrt-glass-saturation: 140%;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * traditional — roceos. Opaque solid panels, zero blur, 1px borders.
+ * ---------------------------------------------------------------------------
+ * SPEC (PM-theme-family-tri-mode-SPEC.md:38): traditional = 实心卡浮在壁纸上 —
+ * the wallpaper STAYS VISIBLE; only the cards/panels are fully opaque solids with
+ * 1px borders + restrained shadows, zero blur. So --app-scrim-bg is left TRANSPARENT
+ * (the console wallpaper .app-wallpaper z0 <img> shows through the gaps between cards).
+ * ---------------------------------------------------------------------------
+ * CORRECTION (2026-09-19 late): an earlier pass painted an OPAQUE scrim here
+ * (#171717 dark / #f5f5f5 light) to stop the wallpaper "bleeding through" — that was
+ * wrong, it covered the whole wallpaper and the user reported 壁纸没了. The real
+ * causes of the two prior symptoms were elsewhere and are already fixed independently:
+ *   - "背景采样层还在继续" = the liquid sampler was not torn down (JS/menu-shell side;
+ *     verified sampler_nodes=0 in traditional now), NOT the wallpaper <img>.
+ *   - "这个黑太彻底了" = cards were near-black #171717 with nothing lifting them; the
+ *     surface lift below (card #232323 < raised #2d2d2d over the visible wallpaper)
+ *     fixes that. So the scrim must NOT cover the wallpaper. Region-ink neutralization
+ *     (below) keeps ink legible on the opaque cards.
+ * ══════════════════════════════════════════════════════════════════════════ */
+html[data-theme-family="traditional"][data-theme-resolved="light"] {
+  --dwrt-glass-backdrop: none;                 /* computed style MUST be none */
+  --app-scrim-bg: transparent;                 /* wallpaper stays visible; opaque white cards float above it */
+  --dwrt-glass-surface: #ffffff;
+  --dwrt-glass-surface-raised: #ffffff;
+  --dwrt-glass-highlight: transparent;
+  --dwrt-glass-edge: #d4d4d4;                  /* roceos --border-default */
+  --dwrt-glass-edge-strong: #c4c4c4;
+  /* roceos --shadow-sm */
+  --dwrt-glass-shadow: 0 1px 3px rgba(0, 0, 0, 0.1), 0 1px 2px rgba(0, 0, 0, 0.06);
+  --dwrt-glass-shadow-raised: 0 4px 6px rgba(0, 0, 0, 0.1), 0 2px 4px rgba(0, 0, 0, 0.06);
+  --dwrt-glass-ink: #171717;                   /* roceos --text-primary */
+  --dwrt-glass-text: #404040;
+  --dwrt-glass-muted: #737373;
+  /* Zero the liquid private blur sub-layer so the direct var() consumers
+     (metric card, menu pill, glass-card, account/health cards) also go flat.
+     blur(0px) is NOT enough for the indirection backdrops — they wrap the blur
+     in saturate()/brightness(), which keep tinting at 0 blur — so pin those to
+     none outright to satisfy the "computed backdrop-filter: none" requirement. */
+  --lg-blur-radius: 0px;
+  --lg-material-blur: 0px;
+  --lg-material-blur-soft: 0px;
+  --lg-material-blur-panel: 0px;
+  --dwrt-glass-base-blur: 0px;
+  --dwrt-glass-saturation: 100%;
+  --dwrt-active-pill-backdrop: none;
+  --dwrt-kit-liquid-backdrop: none;
+  --dwrt-control-backdrop: none;
+}
+
+html[data-theme-family="traditional"][data-theme-resolved="dark"] {
+  --dwrt-glass-backdrop: none;
+  --app-scrim-bg: transparent;                 /* wallpaper stays visible; opaque cards float above it */
+  --dwrt-glass-surface: #232323;               /* card lifts above the visible wallpaper */
+  --dwrt-glass-surface-raised: #2d2d2d;
+  --dwrt-glass-highlight: transparent;
+  --dwrt-glass-edge: #404040;
+  --dwrt-glass-edge-strong: #525252;
+  --dwrt-glass-shadow: 0 1px 3px rgba(0, 0, 0, 0.5), 0 1px 2px rgba(0, 0, 0, 0.4);
+  --dwrt-glass-shadow-raised: 0 8px 16px rgba(0, 0, 0, 0.6), 0 2px 4px rgba(0, 0, 0, 0.4);
+  --dwrt-glass-ink: #fafafa;                   /* roceos dark --text-primary */
+  --dwrt-glass-text: rgba(250, 250, 250, 0.86);
+  --dwrt-glass-muted: #a3a3a3;
+  /* Zero the liquid private blur sub-layer (see traditional-light note). */
+  --lg-blur-radius: 0px;
+  --lg-material-blur: 0px;
+  --lg-material-blur-soft: 0px;
+  --lg-material-blur-panel: 0px;
+  --dwrt-glass-base-blur: 0px;
+  --dwrt-glass-saturation: 100%;
+  --dwrt-active-pill-backdrop: none;
+  --dwrt-kit-liquid-backdrop: none;
+  --dwrt-control-backdrop: none;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * traditional — per-region ink neutralization.  "字有黑有白，黑的字隐身了" (2026-09-19)
+ * ---------------------------------------------------------------------------
+ * The liquid sampler stamps data-adaptive-region="dark|light" on ~33 regions by the
+ * wallpaper luminance seen THROUGH liquid glass, and dwrt-theme.css flips --adaptive-*
+ * per region (:where([data-adaptive-region="dark"]) -> dark ink; ="light" -> white ink).
+ * In traditional the cards are OPAQUE — they don't reveal the wallpaper — so a stale
+ * "dark" stamp put dark ink rgba(8,13,21) on a #232323 card = invisible text, and the
+ * root said one thing while cards said another (mixed black/white). The stamps also
+ * persist after switch-off-liquid (teardown strips inline --* on <html> only, not the
+ * data-adaptive-region ATTRIBUTES on regions). Force the family ink on every stamped
+ * region so ink follows the opaque surface, not the wallpaper. Literal values (not
+ * var(--dwrt-glass-ink)) to avoid a cycle with :where's --dwrt-glass-ink:var(--adaptive-ink).
+ * Specificity html[..][..] [data-adaptive-region] = (0,3,1) beats :where() (0,0,0). */
+html[data-theme-family="traditional"][data-theme-resolved="dark"] [data-adaptive-region] {
+  --adaptive-ink: #fafafa;
+  --adaptive-text: rgba(250, 250, 250, 0.86);
+  --adaptive-muted: #a3a3a3;
+  --adaptive-faint: rgba(250, 250, 250, 0.6);
+  --adaptive-selected: #fafafa;
+  --adaptive-text-shadow: none;
+}
+html[data-theme-family="traditional"][data-theme-resolved="light"] [data-adaptive-region] {
+  --adaptive-ink: #171717;
+  --adaptive-text: #404040;
+  --adaptive-muted: #737373;
+  --adaptive-faint: rgba(23, 23, 23, 0.55);
+  --adaptive-selected: #171717;
+  --adaptive-text-shadow: none;
+}
+
+/* Reset stale liquid-region stamps to family ink. glass-foreground.js adapts
+ * individual text over the actual frosted backdrop without changing material. */
+html[data-theme-family="frosted-glass"][data-theme-resolved="dark"] [data-adaptive-region] {
+  --adaptive-ink: rgba(248, 251, 255, 0.97);
+  --adaptive-text: rgba(234, 242, 252, 0.90);
+  --adaptive-muted: rgba(215, 226, 240, 0.78);
+  --adaptive-faint: rgba(215, 226, 240, 0.62);
+  --adaptive-selected: rgba(248, 251, 255, 0.99);
+  --adaptive-text-shadow: 0 1px 1px rgba(0, 0, 0, 0.28);
+}
+html[data-theme-family="frosted-glass"][data-theme-resolved="light"] [data-adaptive-region] {
+  --adaptive-ink: rgba(20, 30, 45, 0.96);
+  --adaptive-text: rgba(30, 42, 60, 0.86);
+  --adaptive-muted: rgba(60, 72, 92, 0.70);
+  --adaptive-faint: rgba(60, 72, 92, 0.55);
+  --adaptive-selected: rgba(20, 30, 45, 0.98);
+  --adaptive-text-shadow: none;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Desktop-chrome floating panels (app/desktop.html only): the system-status
+ * widget (.widget-card/.widget-bar) and the launchpad overlay (.desktop-launchpad).
+ * dwrt-desktop.css :root pins the LIQUID default (blur(50px)); redefine per family
+ * so they switch like the topbar/dock/sidebar (which already consume
+ * --dwrt-glass-backdrop directly). Family-only rules — --dwrt-glass-backdrop is
+ * itself resolved-split, so late-binding var() picks up the right light/dark blur.
+ * ══════════════════════════════════════════════════════════════════════════ */
+html[data-theme-family="frosted-glass"] {
+  --dwrt-desktop-widget-backdrop: var(--dwrt-glass-backdrop);
+  --dwrt-desktop-launchpad-backdrop: var(--dwrt-glass-backdrop);
+}
+html[data-theme-family="traditional"] {
+  --dwrt-desktop-widget-backdrop: none;
+  --dwrt-desktop-launchpad-backdrop: none;
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Desktop persistent-chrome exception (topbar / dock / sidebar), 2026-09-20.
+ * ---------------------------------------------------------------------------
+ * The launcher shells have no "solid card" identity — under the traditional
+ * family the plain --dwrt-glass-surface-raised resolves to solid #fff / #2d2d2d,
+ * which the user called out as 纯白太丑. So the chrome (routed through
+ * --dwrt-desktop-chrome-* in dwrt-desktop.css) must stay FROSTED GLASS here, never
+ * solid. Liquid + frosted families inherit the :root default (= family surface), so
+ * only the traditional family needs an override; values MIRROR the frosted-glass
+ * blocks above (light 0.60 translucent white / dark 0.06→0.18 film) so traditional's
+ * dock reads identically to frosted's dock. .desktop-window is untouched — it stays
+ * on --dwrt-glass-* and correctly goes opaque per the tri-mode spec. Specificity
+ * (0,0,2,1) beats the :root indirection (0,0,1,0). Inert on the console /app/ (no
+ * .desktop-* chrome there); active only on app/desktop.html. */
+html[data-theme-family="traditional"][data-theme-resolved="light"] {
+  --dwrt-desktop-chrome-surface:
+    linear-gradient(rgba(255, 255, 255, 0.60), rgba(255, 255, 255, 0.60));
+  --dwrt-desktop-chrome-backdrop: blur(20px) saturate(150%);
+  --dwrt-desktop-chrome-edge: rgba(136, 152, 170, 0.28);
+  --dwrt-desktop-chrome-shadow: 0 0.25rem 1.5rem 0 rgba(136, 152, 170, 0.22);
+}
+html[data-theme-family="traditional"][data-theme-resolved="dark"] {
+  --dwrt-desktop-chrome-surface:
+    linear-gradient(160deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.18));
+  --dwrt-desktop-chrome-backdrop: blur(15px) saturate(120%);
+  --dwrt-desktop-chrome-edge: rgba(255, 255, 255, 0.14);
+  --dwrt-desktop-chrome-shadow: 0 18px 44px rgba(0, 0, 0, 0.42);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * Menu rail (console /app/) — glass slab + active pill.  "菜单还是漏网" (2026-09-19)
+ * ---------------------------------------------------------------------------
+ * The menu column's material is NOT drawn by CSS: #appMenuGlass is the liquid
+ * sampler's render host (menu-shell.js ensureMenuGlassRenderer root:appMenuGlass),
+ * and aside#sidebar / #submenu are background:transparent + backdrop-filter:none,
+ * getting their glass ONLY from that sampled slab. Off-liquid the sampler is torn
+ * down (ensureMenuGlassRenderer/ensurePageGlassScope gate on isLiquidGlassFamily,
+ * teardownLiquidGlassSamplers strips inline stamps) — so with no static surface the
+ * whole rail went transparent and showed raw wallpaper: the escapee the earlier
+ * 58-selector sweep missed (it only saw CSS-glassy elements; the rail is CSS-transparent).
+ *
+ * Repaint the slab as the static family surface. Its clip-path already spans the
+ * full column (measured: slab 0..278 == sidebar 0..128 + submenu 128..278; curw =
+ * --app-menu-glass-width tracks the submenu expand), so painting the slab alone
+ * covers sidebar + submenu flyout with one panel — no double-blur. NO !important:
+ * html[...] .app-menu-glass (0,0,2,1) beats the base .app-menu-glass (0,0,1,0) yet
+ * still yields to the prefers-reduced-transparency accessibility override
+ * (menu-shell.css, !important). Inert on app/desktop.html (that shell sets
+ * .app-menu-glass display:none).
+ * ══════════════════════════════════════════════════════════════════════════ */
+html[data-theme-family="frosted-glass"] .app-menu-glass {
+  background: var(--dwrt-glass-surface);
+  backdrop-filter: var(--dwrt-glass-backdrop);
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop);
+}
+html[data-theme-family="traditional"] .app-menu-glass {
+  background: var(--dwrt-glass-surface);
+  backdrop-filter: none;
+  -webkit-backdrop-filter: none;
+}
+
+/* Active-selection pill (span#primaryActivePill.menu-active-pill): bg/sheen/shadow
+ * are tokenized, but --dwrt-active-pill-backdrop defaults (menu-shell.css :root) to
+ * blur(var(--lg-material-blur-soft)) saturate(128%) brightness(1.03) — a liquid
+ * refractive lens. traditional already nulls it (its resolved-split blocks above);
+ * frosted did NOT, so the pill kept blurring+brightening the wallpaper = the visible
+ * liquid tell floating on the menu. Null it under frosted too: the slab now supplies
+ * the material, and the pill's own faint fill + bevel shadow + sheen carry the
+ * selected-state presence. Family-level (0,0,1,1) beats the :root default (0,0,1,0). */
+html[data-theme-family="frosted-glass"] {
+  --dwrt-active-pill-backdrop: none;
+  --dwrt-active-pill-bg: color-mix(in srgb, var(--dwrt-ink) 8%, transparent);
+  --dwrt-active-pill-shadow: inset 0 0 0 1px var(--dwrt-glass-edge);
+  --dwrt-active-pill-sheen: none;
+  --dwrt-control-backdrop: none;
+  --dwrt-control-surface: color-mix(in srgb, var(--dwrt-ink) 5%, transparent);
+  --dwrt-control-surface-hover: color-mix(in srgb, var(--dwrt-ink) 9%, transparent);
+  --dwrt-control-surface-active: color-mix(in srgb, var(--dwrt-ink) 12%, transparent);
+  --dwrt-control-shadow: inset 0 0 0 1px var(--dwrt-glass-edge);
+  --dwrt-control-shadow-hover: inset 0 0 0 1px var(--dwrt-glass-edge-strong);
+  --dwrt-control-shadow-active: inset 0 0 0 1px var(--dwrt-glass-edge-strong);
+  --dwrt-control-accent-surface: color-mix(in srgb, var(--color-accent) 24%, transparent);
+  --dwrt-control-accent-surface-hover: color-mix(in srgb, var(--color-accent) 32%, transparent);
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+ * COMPREHENSIVE SURFACE SWITCH — theme-family escapee sweep (2026-09-19)
+ * ---------------------------------------------------------------------------
+ * (1) --dwrt-kit-liquid-surface: composite surface token defined only at :root
+ *     -> re-point at the switchable --dwrt-glass-surface per family.
+ * (2) Panels whose bg is built inline from the optical sub-layer (--lg-highlight
+ *     / --lg-effective-opacity / --dwrt-glass-neutral-*), which theme-families
+ *     does NOT redefine -> force surface + backdrop at the switchable tokens.
+ * Scoped to frosted-glass|traditional ONLY -> liquid family stays byte-identical.
+ * Excluded (deliberate): accent/status/semantic tokens, already-opaque surfaces,
+ *   scrims, app-root/wallpaper, ::before/::after sheen, tab-pill active indicator,
+ *   sampler infra, and the control-material system (own hover/accent state ladder).
+ * ══════════════════════════════════════════════════════════════════════════ */
+
+/* ═══ family: frosted-glass ═══ */
+html[data-theme-family="frosted-glass"] { --dwrt-kit-liquid-surface: var(--dwrt-glass-surface); }
+/* ai-assistant.css */
+html[data-theme-family="frosted-glass"] .ai-add-popover,
+html[data-theme-family="frosted-glass"] .ai-drawer-material,
+html[data-theme-family="frosted-glass"] .ai-floating-orb,
+html[data-theme-family="frosted-glass"] .ai-orb-restore,
+html[data-theme-family="frosted-glass"] .ai-runtime-popover {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* client-details.css */
+html[data-theme-family="frosted-glass"] .client-control-editor.client-stable-glass,
+html[data-theme-family="frosted-glass"] .client-empty,
+html[data-theme-family="frosted-glass"] .client-stable-glass {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* dwrt-ui-kit.css */
+html[data-theme-family="frosted-glass"] .dwrt-date-popover,
+html[data-theme-family="frosted-glass"] .dwrt-kit-expand-search[data-dwrt-expand-search="true"],
+html[data-theme-family="frosted-glass"] .dwrt-kit-ikuai-table-wrap,
+html[data-theme-family="frosted-glass"] .dwrt-kit-savebar,
+html[data-theme-family="frosted-glass"] .dwrt-kit-sheet,
+html[data-theme-family="frosted-glass"] .dwrt-kit-sheet-material,
+html[data-theme-family="frosted-glass"] .dwrt-kit-sheet.client-stable-glass,
+html[data-theme-family="frosted-glass"] .dwrt-kit-sheet.client-stable-glass.canvas-ready,
+html[data-theme-family="frosted-glass"] .dwrt-kit-sheet.dwrt-glass-card,
+html[data-theme-family="frosted-glass"] .dwrt-kit-sheet.dwrt-glass-card.canvas-ready,
+html[data-theme-family="frosted-glass"] .dwrt-kit-sheet.policy-stable-glass,
+html[data-theme-family="frosted-glass"] .dwrt-kit-sheet.policy-stable-glass.canvas-ready,
+html[data-theme-family="frosted-glass"] .dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap,
+html[data-theme-family="frosted-glass"] .dwrt-kit-tabs,
+html[data-theme-family="frosted-glass"] .dwrt-kit-tabs.dwrt-kit-page-tabs {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* global-config.css */
+html[data-theme-family="frosted-glass"] .global-overview {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* insights-flows.css */
+html[data-theme-family="frosted-glass"] .insights-audit-table-card,
+html[data-theme-family="frosted-glass"] .route-insights-home .insights-stable-glass,
+html[data-theme-family="frosted-glass"] .route-insights-home .insights-stable-glass.canvas-ready,
+html[data-theme-family="frosted-glass"] .route-insights-host .insights-stable-glass,
+html[data-theme-family="frosted-glass"] .route-insights-host .insights-stable-glass.canvas-ready {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* line-status.css */
+html[data-theme-family="frosted-glass"] .route-line-status .dwrt-kit-table-wrap {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* menu-shell.css */
+html[data-theme-family="frosted-glass"] #dashboardWorkspace .dwrt-glass-card,
+html[data-theme-family="frosted-glass"] .account-card,
+html[data-theme-family="frosted-glass"] .ai-bootstrap-orb,
+html[data-theme-family="frosted-glass"] .command-panel,
+html[data-theme-family="frosted-glass"] .dashboard-active-url-card,
+html[data-theme-family="frosted-glass"] .dashboard-metric-card,
+html[data-theme-family="frosted-glass"] .dashboard-monitor-card,
+html[data-theme-family="frosted-glass"] .dashboard-rank-card,
+html[data-theme-family="frosted-glass"] .dashboard-status-rail,
+html[data-theme-family="frosted-glass"] .dwrt-glass-card.canvas-ready,
+html[data-theme-family="frosted-glass"] .dwrt-kit-load-card.system-health-glass-card,
+html[data-theme-family="frosted-glass"] .dwrt-kit-load-card.system-health-glass-card.canvas-ready,
+html[data-theme-family="frosted-glass"] .menu-search-trigger,
+html[data-theme-family="frosted-glass"] .menu-search-trigger:hover,
+html[data-theme-family="frosted-glass"] .sidebar-actions,
+html[data-theme-family="frosted-glass"] .topology-infra-gateway-card,
+html[data-theme-family="frosted-glass"] .topology-infra-group,
+html[data-theme-family="frosted-glass"] .topology-infra-head,
+html[data-theme-family="frosted-glass"] .topology-infra-metrics,
+html[data-theme-family="frosted-glass"] .topology-infra-note,
+html[data-theme-family="frosted-glass"] .topology-infra-port-chip,
+html[data-theme-family="frosted-glass"] .topology-infra-wan-card,
+html[data-theme-family="frosted-glass"] .topology-property-panel,
+html[data-theme-family="frosted-glass"] .topology-property-panel.dwrt-glass-card,
+html[data-theme-family="frosted-glass"] .topology-time-machine {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* system-settings.css */
+html[data-theme-family="frosted-glass"] .system-mount-card,
+html[data-theme-family="frosted-glass"] .system-mount-empty {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* system-users.css */
+html[data-theme-family="frosted-glass"] .system-users-drawer-material {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+
+/* Frosted panels have one fine edge and a soft external shadow, never the
+   liquid family's bevel/refraction layers. Keep selectors on material hosts. */
+html[data-theme-family="frosted-glass"] :is(
+  #dashboardWorkspace .dwrt-glass-card,
+  .dwrt-glass-card, .dwrt-kit-glass-surface, .dwrt-kit-table-wrap,
+  .dwrt-kit-tabs, .dwrt-kit-sheet, .dwrt-kit-sheet-material,
+  .client-stable-glass, .policy-stable-glass, .insights-stable-glass,
+  .dashboard-metric-card, .dashboard-monitor-card, .dashboard-rank-card,
+  .dashboard-active-url-card, .dashboard-status-rail,
+  .app-menu-glass, .menu-search-trigger, .sidebar-actions,
+  .system-mount-card, .system-mount-empty, .dwrt-rail-item.is-active
+) {
+  border-color: var(--dwrt-glass-edge) !important;
+  box-shadow: var(--dwrt-glass-shadow), inset 0 0 0 1px var(--dwrt-glass-edge) !important;
+}
+html[data-theme-family="frosted-glass"] :is(
+  .dwrt-glass-card, .dwrt-kit-load-card.system-health-glass-card,
+  .client-stable-glass, .policy-stable-glass, .insights-stable-glass,
+  .dwrt-rail-item.is-active
+)::before,
+html[data-theme-family="frosted-glass"] :is(
+  .dwrt-glass-card, .dwrt-kit-load-card.system-health-glass-card,
+  .client-stable-glass, .policy-stable-glass, .insights-stable-glass
+)::after {
+  background: none !important;
+  box-shadow: none !important;
+}
+
+/* The window owns the blur. Cards use a shared subtle fill, edge and relief so
+   grouping remains visible without adding another frosted pane. */
+html[data-desktop-embedded][data-theme-family="frosted-glass"] body,
+html[data-desktop-embedded][data-theme-family="liquid-glass"] body {
+  background: transparent;
+}
+/* Keep the tab track distinct from the window without a second glass pane.
+   Its shared tint also separates neutral labels from mid-tone wallpaper. */
+html[data-desktop-embedded][data-theme-family="liquid-glass"] {
+  --dwrt-desktop-tabs-tint: rgba(255, 255, 255, 0.055);
+}
+html[data-desktop-embedded][data-theme-family="liquid-glass"] .dwrt-kit-tabs {
+  background-color: var(--dwrt-desktop-tabs-tint) !important;
+}
+html[data-desktop-embedded][data-theme-family="frosted-glass"] :is(#appShell, .dwrt-app) :is(
+  .app-menu-glass, .dashboard-status-rail, .dwrt-glass-card,
+  .dwrt-kit-glass-surface, .dwrt-kit-table-wrap, .dwrt-kit-tabs,
+  .client-stable-glass, .policy-stable-glass, .insights-stable-glass,
+  .dashboard-metric-card, .dashboard-monitor-card, .dashboard-rank-card,
+  .dashboard-active-url-card, .system-demo-panel, .system-mount-card, .system-mount-empty
+):not(:where(
+  .dwrt-kit-sheet, .dwrt-kit-sheet *, .dwrt-kit-modal, .dwrt-kit-modal *,
+  [role="dialog"], [role="dialog"] *, .topology-property-panel, .topology-property-panel *,
+  .account-popover, .account-popover *
+)) {
+  background: var(--dwrt-glass-inset-surface) !important;
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+  border-color: var(--dwrt-glass-inset-edge) !important;
+  box-shadow: var(--dwrt-glass-inset-shadow), inset 0 0 0 1px var(--dwrt-glass-inset-edge) !important;
+}
+
+/* ═══ family: traditional ═══ */
+html[data-theme-family="traditional"] { --dwrt-kit-liquid-surface: var(--dwrt-glass-surface); }
+/* ai-assistant.css */
+html[data-theme-family="traditional"] .ai-add-popover,
+html[data-theme-family="traditional"] .ai-drawer-material,
+html[data-theme-family="traditional"] .ai-floating-orb,
+html[data-theme-family="traditional"] .ai-orb-restore,
+html[data-theme-family="traditional"] .ai-runtime-popover {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* client-details.css */
+html[data-theme-family="traditional"] .client-control-editor.client-stable-glass,
+html[data-theme-family="traditional"] .client-empty,
+html[data-theme-family="traditional"] .client-stable-glass {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* dwrt-ui-kit.css */
+html[data-theme-family="traditional"] .dwrt-date-popover,
+html[data-theme-family="traditional"] .dwrt-kit-expand-search[data-dwrt-expand-search="true"],
+html[data-theme-family="traditional"] .dwrt-kit-ikuai-table-wrap,
+html[data-theme-family="traditional"] .dwrt-kit-savebar,
+html[data-theme-family="traditional"] .dwrt-kit-sheet,
+html[data-theme-family="traditional"] .dwrt-kit-sheet-material,
+html[data-theme-family="traditional"] .dwrt-kit-sheet.client-stable-glass,
+html[data-theme-family="traditional"] .dwrt-kit-sheet.client-stable-glass.canvas-ready,
+html[data-theme-family="traditional"] .dwrt-kit-sheet.dwrt-glass-card,
+html[data-theme-family="traditional"] .dwrt-kit-sheet.dwrt-glass-card.canvas-ready,
+html[data-theme-family="traditional"] .dwrt-kit-sheet.policy-stable-glass,
+html[data-theme-family="traditional"] .dwrt-kit-sheet.policy-stable-glass.canvas-ready,
+html[data-theme-family="traditional"] .dwrt-kit-table-wrap.dwrt-kit-glass-surface.dwrt-kit-ikuai-table-wrap,
+html[data-theme-family="traditional"] .dwrt-kit-tabs,
+html[data-theme-family="traditional"] .dwrt-kit-tabs.dwrt-kit-page-tabs {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* global-config.css */
+html[data-theme-family="traditional"] .global-overview {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* insights-flows.css */
+html[data-theme-family="traditional"] .insights-audit-table-card,
+html[data-theme-family="traditional"] .route-insights-home .insights-stable-glass,
+html[data-theme-family="traditional"] .route-insights-home .insights-stable-glass.canvas-ready,
+html[data-theme-family="traditional"] .route-insights-host .insights-stable-glass,
+html[data-theme-family="traditional"] .route-insights-host .insights-stable-glass.canvas-ready {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* line-status.css */
+html[data-theme-family="traditional"] .route-line-status .dwrt-kit-table-wrap {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* menu-shell.css */
+html[data-theme-family="traditional"] #dashboardWorkspace .dwrt-glass-card,
+html[data-theme-family="traditional"] .account-card,
+html[data-theme-family="traditional"] .ai-bootstrap-orb,
+html[data-theme-family="traditional"] .command-panel,
+html[data-theme-family="traditional"] .dashboard-active-url-card,
+html[data-theme-family="traditional"] .dashboard-metric-card,
+html[data-theme-family="traditional"] .dashboard-monitor-card,
+html[data-theme-family="traditional"] .dashboard-rank-card,
+html[data-theme-family="traditional"] .dashboard-status-rail,
+html[data-theme-family="traditional"] .dwrt-glass-card.canvas-ready,
+html[data-theme-family="traditional"] .dwrt-kit-load-card.system-health-glass-card,
+html[data-theme-family="traditional"] .dwrt-kit-load-card.system-health-glass-card.canvas-ready,
+html[data-theme-family="traditional"] .menu-search-trigger,
+html[data-theme-family="traditional"] .menu-search-trigger:hover,
+html[data-theme-family="traditional"] .sidebar-actions,
+html[data-theme-family="traditional"] .topology-infra-gateway-card,
+html[data-theme-family="traditional"] .topology-infra-group,
+html[data-theme-family="traditional"] .topology-infra-head,
+html[data-theme-family="traditional"] .topology-infra-metrics,
+html[data-theme-family="traditional"] .topology-infra-note,
+html[data-theme-family="traditional"] .topology-infra-port-chip,
+html[data-theme-family="traditional"] .topology-infra-wan-card,
+html[data-theme-family="traditional"] .topology-property-panel,
+html[data-theme-family="traditional"] .topology-property-panel.dwrt-glass-card,
+html[data-theme-family="traditional"] .topology-time-machine {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* system-settings.css */
+html[data-theme-family="traditional"] .system-mount-card,
+html[data-theme-family="traditional"] .system-mount-empty {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}
+/* system-users.css */
+html[data-theme-family="traditional"] .system-users-drawer-material {
+  background: var(--dwrt-glass-surface) !important;
+  backdrop-filter: var(--dwrt-glass-backdrop) !important;
+  -webkit-backdrop-filter: var(--dwrt-glass-backdrop) !important;
+}

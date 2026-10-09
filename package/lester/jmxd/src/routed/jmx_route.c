@@ -22,10 +22,18 @@
 #include <uci.h>
 #include <sqlite3.h>
 #include <libubox/list.h>
+#include <libubus.h>
+#include <libubox/blobmsg.h>
+#include <libubox/blobmsg_json.h>
 
 #include "jmx.h"
 #include "jmx_route.h"
+#include "dw_config_event.h"
+#include "jmx_strbuf.h"
 #include "jmx_route_db.h"
+#include "jmx_route_mark_runtime.h"
+#include "jmx_direction_nl.h"
+#include "jmx_direction_snapshot.h"
 #include "jmx_nl_push.h"
 #include "jmx_nl_rule.h"
 #include "jmx_config.h"
@@ -34,18 +42,43 @@
 #include "jmx_db.h"
 #include "jmx_netconfig_db.h"
 #include "proc_path.h"
+#include "jmx_signature_db.h"
 #include "jmx_system_data_path.h"
+#include "wan_sla_route_guard.h"
+#include "../flowd/wan_sla_config.h"
 
 extern struct list_head client_list;
 
 #define JMX_ROUTE_CMD_TIMEOUT_SEC 10
+/*
+ * Poll interval for reaping a forked helper.  This was a flat 100 ms, which put
+ * a 100 ms floor under every `ip` invocation: a real call costs ~1.1 ms, but the
+ * first waitpid() almost always races the exec, so each command slept one whole
+ * tick before its second try.  A policy sync forks ~50 commands, so the floor
+ * alone accounted for ~5 s of a ~5.2 s apply -- long enough that webd's ubus
+ * client gave up first (2 s budget) and reported a validation failure for a
+ * transaction that then committed anyway, seconds after the user was told
+ * nothing had changed.
+ *
+ * Back off geometrically instead: 200 us doubling up to the same 100 ms ceiling.
+ * A fast command now returns after ~600 us of sleeping; a genuinely slow one
+ * still settles at one wakeup per 100 ms, so the worst case is unchanged.  The
+ * ceiling keeps the old name because the two SIGTERM-escalation sleeps below
+ * want a full grace tick, not a backed-off one.
+ */
+#define JMX_ROUTE_CMD_POLL_MIN_US 200
 #define JMX_ROUTE_CMD_POLL_US 100000
 #define JMX_ROUTE_HEALTH_MAX_STATES 32
 #define JMX_ROUTE_HEALTH_IFNAME_LEN 32
 #define JMX_ROUTE_HEALTH_TARGET_LEN 128
-#define JMX_ROUTE_HEALTH_DEFAULT_FAIL_THRESHOLD 2
-#define JMX_ROUTE_HEALTH_DEFAULT_RECOVER_THRESHOLD 6
-#define JMX_ROUTE_HEALTH_MAX_THRESHOLD 60
+#define JMX_ROUTE_HEALTH_STATUS_PATH "/tmp/dreamingwrt-wan-health.status"
+#define JMX_ROUTE_SNAPSHOT_CACHE_SEC 5
+#define JMX_ROUTE_HEALTH_STALE_SEC 20
+#define JMX_ROUTE_HEALTH_RECOVERY_SEC 20
+#define JMX_ROUTE_HEALTH_RECOVERY_SAMPLES 2
+#define JMX_ROUTE_HEALTH_FINANCE_CATEGORY 14
+#define JMX_ROUTE_REBIND_SELECTIVE 2
+#define JMX_ROUTE_REBIND_ALL 3
 #define JMX_ROUTE_STATE_DB_PATH "/var/lib/dreamingwrt/network_state.db"
 #define JMX_ROUTE_ADV_SYNC_STATE "/tmp/jmx_route_advanced_sync.json"
 #define JMX_ROUTE_RUNTIME_STALE_SEC 15
@@ -67,12 +100,59 @@ struct route_health_state {
     uint32_t generation;
     uint32_t fail_count;
     uint32_t ok_count;
+    uint8_t initialized;
+    uint8_t quality_level;
+    uint8_t raw_level;
+    uint8_t penalty_peak_level;
+    uint8_t adaptive_weight;
+    uint8_t recovery_observing;
+    uint8_t recovery_target_level;
+    uint8_t recovery_samples;
+    uint8_t last_rebind_mode;
+    uint32_t transition_count;
     time_t last_probe;
     time_t last_change;
+    time_t recovery_since;
+    int checked;
+    int online;
+    int latency_ms;
+    int probe_loss_pct;
+    int jitter_ms;
+    int jitter_samples;
+    int jitter_over_80_pct;
+    int counters_valid;
+    double up_loss_pct;
+    double down_loss_pct;
     char name[JMX_ROUTE_HEALTH_IFNAME_LEN];
     char ifname[JMX_ROUTE_HEALTH_IFNAME_LEN];
     char target[JMX_ROUTE_HEALTH_TARGET_LEN];
     char reason[64];
+    char health_mode[32];
+};
+
+struct route_health_snapshot {
+    time_t updated_at;
+    int checked;
+    int online;
+    int latency_ms;
+    int probe_loss_pct;
+    int jitter_ms;
+    int jitter_samples;
+    int jitter_over_80_pct;
+    int counters_valid;
+    double up_loss_pct;
+    double down_loss_pct;
+    char name[JMX_ROUTE_HEALTH_IFNAME_LEN];
+    char device[JMX_ROUTE_HEALTH_IFNAME_LEN];
+    char target[JMX_ROUTE_HEALTH_TARGET_LEN];
+    char reason[64];
+    char health_mode[32];
+};
+
+struct route_health_snapshot_set {
+    time_t updated_at;
+    size_t count;
+    struct route_health_snapshot rows[JMX_ROUTE_MAX_WAN_IFACES];
 };
 
 struct route_sync_wan_map {
@@ -113,6 +193,12 @@ static uint32_t g_route_health_generation;
 static uint8_t g_route_auto_carriers[JMX_ROUTE_MAX_WAN_IFACES + 1];
 static struct route_network_wan_snapshot g_route_network_wans;
 static int g_route_network_wans_ready;
+
+static struct {
+    time_t updated_at;
+    int valid;
+    int count;
+} g_route_main_nondefault_cache;
 
 static int jmx_route_nl_send(int fd, const void *data, int len)
 {
@@ -248,6 +334,52 @@ int jmx_route_nl_wan_health(int nl_fd, uint8_t wan_id, uint8_t health)
     return jmx_route_nl_send(nl_fd, &msg, sizeof(msg));
 }
 
+int jmx_route_nl_wan_weight(int nl_fd, uint8_t wan_id, uint32_t weight)
+{
+    struct { int32_t action; uint8_t wan_id; uint32_t weight; } __packed msg = {
+        .action = JMX_NL_ACT_WAN_WEIGHT,
+        .wan_id = wan_id,
+        .weight = weight,
+    };
+
+    if (weight < 1 || weight > 100) {
+        errno = EINVAL;
+        return -1;
+    }
+    return jmx_route_nl_send(nl_fd, &msg, sizeof(msg));
+}
+
+int jmx_route_nl_wan_adaptive_weight(int nl_fd, uint8_t wan_id, uint32_t weight)
+{
+    struct { int32_t action; uint8_t wan_id; uint32_t weight; } __packed msg = {
+        .action = JMX_NL_ACT_WAN_ADAPTIVE_WEIGHT,
+        .wan_id = wan_id,
+        .weight = weight,
+    };
+
+    if (weight < 1 || weight > 100) {
+        errno = EINVAL;
+        return -1;
+    }
+    return jmx_route_nl_send(nl_fd, &msg, sizeof(msg));
+}
+
+int jmx_route_nl_wan_rebind(int nl_fd, uint8_t wan_id, uint8_t mode)
+{
+    struct { int32_t action; uint8_t wan_id; uint8_t mode; } __packed msg = {
+        .action = JMX_NL_ACT_WAN_REBIND,
+        .wan_id = wan_id,
+        .mode = mode,
+    };
+
+    if (!wan_id || (mode != JMX_ROUTE_REBIND_SELECTIVE &&
+                    mode != JMX_ROUTE_REBIND_ALL)) {
+        errno = EINVAL;
+        return -1;
+    }
+    return jmx_route_nl_send(nl_fd, &msg, sizeof(msg));
+}
+
 int jmx_route_nl_rule_add(int nl_fd, const struct jmx_route_rule_wire *rule)
 {
     struct { int32_t action; struct jmx_route_rule_wire rule; } __packed msg;
@@ -256,6 +388,22 @@ int jmx_route_nl_rule_add(int nl_fd, const struct jmx_route_rule_wire *rule)
     memset(&msg, 0, sizeof(msg));
     msg.action = JMX_NL_ACT_ROUTE_ADD;
     msg.rule = *rule;
+    return jmx_route_nl_send(nl_fd, &msg, sizeof(msg));
+}
+
+int jmx_route_nl_rule_add_v2(int nl_fd, const struct jmx_route_rule_wire *rule,
+                             uint32_t enhancements)
+{
+    struct jmx_route_rule_wire_v2 msg;
+
+    if (!rule || (enhancements & ~JMX_ROUTE_ENHANCEMENT_KNOWN)) {
+        errno = EINVAL;
+        return -1;
+    }
+    memset(&msg, 0, sizeof(msg));
+    msg.action = JMX_NL_ACT_ROUTE_ADD_V2;
+    msg.rule = *rule;
+    msg.enhancements = enhancements;
     return jmx_route_nl_send(nl_fd, &msg, sizeof(msg));
 }
 
@@ -299,6 +447,13 @@ static uint32_t json_get_u32(struct json_object *obj, const char *key, uint32_t 
         return number >= 0 && (uint64_t)number <= UINT32_MAX ?
                (uint32_t)number : def;
     }
+    /* webd stores adaptive_penalty_sticky and migration_required as JSON
+     * booleans, while enabled/prio arrive as ints. Without this branch a
+     * boolean falls through to the string test and returns def, so
+     * adaptive_penalty_sticky:true read as 0, the enhancement bit was never
+     * set, and the rule silently went out over the v1 netlink ABI. */
+    if (json_object_is_type(v, json_type_boolean))
+        return json_object_get_boolean(v) ? 1U : 0U;
     if (!json_object_is_type(v, json_type_string))
         return def;
     text = json_object_get_string(v);
@@ -345,13 +500,23 @@ static int route_main_nondefault_rule_install(void);
 static const char *uci_opt(struct uci_section *s, const char *name);
 static uint32_t parse_u32_opt(struct uci_section *s, const char *name, uint32_t def);
 static uint32_t parse_weight_opt(struct uci_section *s, uint32_t def);
+static uint32_t route_ipv4_from_string(const char *s, uint32_t def);
+static struct json_object *route_parse_proc_status(FILE *fp);
 static int jmx_route_apply_system_route(const char *ifname, uint32_t fwmark,
                                         uint32_t table_id, const char *gateway);
 static void jmx_route_cleanup_system_route(uint32_t table_id);
 static int jmx_route_sync_json(struct json_object *config);
 static void route_rule_from_json(struct json_object *rule,
                                  struct jmx_route_rule_wire *out,
-                                 int default_prio);
+                                 int default_prio, uint32_t *enhancements,
+                                 int legacy_adaptive_fallback);
+static int route_kernel_rule_v2_supported(uint32_t *enhancements_out);
+static int route_config_requires_rule_v2(struct json_object *config);
+static int route_policy_kernel_readback_matches(struct json_object *config,
+                                                int carrier_neutral,
+                                                int verify_all_rules,
+                                                int *weights_enforced,
+                                                char *error, size_t error_len);
 
 static const char *json_get_str(struct json_object *obj, const char *key, const char *def)
 {
@@ -443,7 +608,7 @@ struct json_object *jmx_api_route_wan_health(struct json_object *req_obj)
 struct json_object *jmx_api_route_rule_add(struct json_object *req_obj)
 {
     int fd, rc, i;
-    struct json_object *wan_arr = NULL;
+    struct json_object *wan_arr = NULL, *members = NULL;
     struct jmx_route_rule_wire r;
 
     memset(&r, 0, sizeof(r));
@@ -469,12 +634,36 @@ struct json_object *jmx_api_route_rule_add(struct json_object *req_obj)
         else
             r.sticky_mode = (uint8_t)json_get_u32(req_obj, "sticky_mode", JMX_STICKY_SIP);
     }
-    if (r.sticky_mode > JMX_STICKY_CONN_CNT) {
+    if (r.sticky_mode > JMX_STICKY_MAX) {
         errno = EINVAL;
         return route_result(-1);
     }
 
-    if (json_object_object_get_ex(req_obj, "wan_ids", &wan_arr) && json_object_is_type(wan_arr, json_type_array)) {
+    if (json_object_object_get_ex(req_obj, "members", &members) &&
+        json_object_is_type(members, json_type_array)) {
+        int n = json_object_array_length(members);
+
+        if (n > JMX_ROUTE_MAX_WAN_IFACES)
+            n = JMX_ROUTE_MAX_WAN_IFACES;
+        for (i = 0; i < n; i++) {
+            struct json_object *member = json_object_array_get_idx(members, i);
+            uint32_t weight = 0;
+
+            if (!member || !json_object_is_type(member, json_type_object) ||
+                json_get_weight(member, "weight", 1, &weight) != 0) {
+                errno = EINVAL;
+                return route_result(-1);
+            }
+            r.wan_ids[i] = (uint8_t)json_get_u32(member, "wan_id", 0);
+            r.wan_weights[i] = weight;
+            if (!r.wan_ids[i]) {
+                errno = EINVAL;
+                return route_result(-1);
+            }
+        }
+        r.wan_count = (uint8_t)n;
+    } else if (json_object_object_get_ex(req_obj, "wan_ids", &wan_arr) &&
+               json_object_is_type(wan_arr, json_type_array)) {
         int n = json_object_array_length(wan_arr);
         if (n > JMX_ROUTE_MAX_WAN_IFACES)
             n = JMX_ROUTE_MAX_WAN_IFACES;
@@ -529,6 +718,7 @@ static struct json_object *route_json_ok(struct json_object *data)
 static int route_wait_cmd(pid_t pid, int *status)
 {
     time_t deadline = time(NULL) + JMX_ROUTE_CMD_TIMEOUT_SEC;
+    unsigned int poll_us = JMX_ROUTE_CMD_POLL_MIN_US;
 
     for (;;) {
         pid_t r = waitpid(pid, status, WNOHANG);
@@ -560,7 +750,12 @@ static int route_wait_cmd(pid_t pid, int *status)
             }
             return -1;
         }
-        usleep(JMX_ROUTE_CMD_POLL_US);
+        usleep(poll_us);
+        if (poll_us < JMX_ROUTE_CMD_POLL_US) {
+            poll_us *= 2;
+            if (poll_us > JMX_ROUTE_CMD_POLL_US)
+                poll_us = JMX_ROUTE_CMD_POLL_US;
+        }
     }
 }
 
@@ -651,6 +846,7 @@ static int route_read_cmd_output(char *const argv[], char *out, size_t out_len)
     int exited = 0;
     size_t used = 0;
     time_t deadline;
+    unsigned int poll_us = JMX_ROUTE_CMD_POLL_MIN_US;
 
     if (!argv || !argv[0] || !out || out_len == 0)
         return -1;
@@ -725,7 +921,12 @@ static int route_read_cmd_output(char *const argv[], char *out, size_t out_len)
             signal(SIGCHLD, old_sigchld);
             return -1;
         }
-        usleep(JMX_ROUTE_CMD_POLL_US);
+        usleep(poll_us);
+        if (poll_us < JMX_ROUTE_CMD_POLL_US) {
+            poll_us *= 2;
+            if (poll_us > JMX_ROUTE_CMD_POLL_US)
+                poll_us = JMX_ROUTE_CMD_POLL_US;
+        }
     }
     for (;;) {
         char buf[1024];
@@ -755,7 +956,7 @@ static int route_read_cmd_output(char *const argv[], char *out, size_t out_len)
     return 0;
 }
 
-static int route_main_nondefault_rule_count(void)
+static int route_main_nondefault_rule_count_raw(void)
 {
     char output[8192];
     char *line;
@@ -785,6 +986,23 @@ static int route_main_nondefault_rule_count(void)
     return count;
 }
 
+static int route_main_nondefault_rule_count(void)
+{
+    time_t now = time(NULL);
+
+    if (g_route_main_nondefault_cache.valid &&
+        now - g_route_main_nondefault_cache.updated_at < JMX_ROUTE_SNAPSHOT_CACHE_SEC)
+        return g_route_main_nondefault_cache.count;
+    g_route_main_nondefault_cache.count = route_main_nondefault_rule_count_raw();
+    if (g_route_main_nondefault_cache.count >= 0) {
+        g_route_main_nondefault_cache.updated_at = now;
+        g_route_main_nondefault_cache.valid = 1;
+    } else {
+        g_route_main_nondefault_cache.valid = 0;
+    }
+    return g_route_main_nondefault_cache.count;
+}
+
 static int route_main_nondefault_rule_install(void)
 {
     char priority[16];
@@ -792,7 +1010,7 @@ static int route_main_nondefault_rule_install(void)
                      "lookup", "main", "suppress_prefixlength", "0", NULL };
     char *del_argv[] = { "ip", "-4", "rule", "del", "priority", priority,
                          "lookup", "main", "suppress_prefixlength", "0", NULL };
-    int count = route_main_nondefault_rule_count();
+    int count = route_main_nondefault_rule_count_raw();
 
     snprintf(priority, sizeof(priority), "%u", JMX_ROUTE_MAIN_NONDEFAULT_PRIO);
     if (count < 0)
@@ -804,7 +1022,7 @@ static int route_main_nondefault_rule_install(void)
     }
     if (count == 0 && route_run_cmd(argv) != 0)
         return -1;
-    return route_main_nondefault_rule_count() == 1 ? 0 : -1;
+    return route_main_nondefault_rule_count_raw() == 1 ? 0 : -1;
 }
 
 static const char *route_json_string(struct json_object *o, const char *key)
@@ -835,6 +1053,60 @@ static int route_json_int_def(struct json_object *o, const char *key, int def)
     return json_object_get_int(v);
 }
 
+struct route_ubus_json_result {
+    struct json_object *json;
+};
+
+static void route_ubus_json_cb(struct ubus_request *req, int type,
+                               struct blob_attr *msg)
+{
+    struct route_ubus_json_result *result = req ? req->priv : NULL;
+    char *text;
+
+    (void)type;
+    if (!result || !msg)
+        return;
+    text = blobmsg_format_json(msg, true);
+    if (!text)
+        return;
+    if (result->json)
+        json_object_put(result->json);
+    result->json = json_tokener_parse(text);
+    free(text);
+}
+
+static struct json_object *route_ubus_call_json(const char *object,
+                                                const char *method,
+                                                int timeout_ms)
+{
+    struct route_ubus_json_result result = { .json = NULL };
+    struct blob_buf request = {};
+    struct ubus_context *ctx = NULL;
+    uint32_t id = 0;
+    int rc;
+
+    if (!object || !method)
+        return NULL;
+    ctx = ubus_connect(NULL);
+    if (!ctx)
+        return NULL;
+    rc = ubus_lookup_id(ctx, object, &id);
+    if (rc == UBUS_STATUS_OK) {
+        blob_buf_init(&request, 0);
+        rc = ubus_invoke(ctx, id, method, request.head,
+                         route_ubus_json_cb, &result,
+                         timeout_ms > 0 ? timeout_ms : 3000);
+        blob_buf_free(&request);
+    }
+    ubus_free(ctx);
+    if (rc != UBUS_STATUS_OK) {
+        if (result.json)
+            json_object_put(result.json);
+        return NULL;
+    }
+    return result.json;
+}
+
 static int route_ifstatus_runtime(const char *wan_name, char *l3_out, size_t l3_len,
                                   char *gateway_out, size_t gateway_len, int *online_out)
 {
@@ -842,6 +1114,7 @@ static int route_ifstatus_runtime(const char *wan_name, char *l3_out, size_t l3_
     char *const argv[] = { "ifstatus", (char *)wan_name, NULL };
     struct json_object *root;
     struct json_object *routes = NULL;
+    char object[64];
     const char *l3;
     int online;
     size_t i, n;
@@ -856,9 +1129,10 @@ static int route_ifstatus_runtime(const char *wan_name, char *l3_out, size_t l3_
         return -1;
     if (!route_ifname_ok(wan_name))
         return -1;
-    if (route_read_cmd_output(argv, json, sizeof(json)) != 0)
-        return -1;
-    root = json_tokener_parse(json);
+    snprintf(object, sizeof(object), "network.interface.%s", wan_name);
+    root = route_ubus_call_json(object, "status", 3000);
+    if (!root && route_read_cmd_output(argv, json, sizeof(json)) == 0)
+        root = json_tokener_parse(json);
     if (!root)
         return -1;
     l3 = route_json_string(root, "l3_device");
@@ -901,8 +1175,6 @@ static int route_l3_device_from_ifstatus(const char *wan_name, char *out, size_t
 
 static int route_l3_device_from_device(const char *device, char *out, size_t out_len)
 {
-    char json[262144];
-    char *const argv[] = { "ubus", "call", "network.interface", "dump", NULL };
     struct json_object *root;
     struct json_object *interfaces = NULL;
     size_t i, n;
@@ -913,9 +1185,7 @@ static int route_l3_device_from_device(const char *device, char *out, size_t out
     out[0] = '\0';
     if (!route_ifname_ok(device))
         return -1;
-    if (route_read_cmd_output(argv, json, sizeof(json)) != 0)
-        return -1;
-    root = json_tokener_parse(json);
+    root = route_ubus_call_json("network.interface", "dump", 3000);
     if (!root)
         return -1;
     if (!json_object_object_get_ex(root, "interface", &interfaces) ||
@@ -1008,21 +1278,100 @@ static int route_section_disabled(struct uci_section *s)
     return 0;
 }
 
+static int route_network_dump_fill(struct json_object *interfaces,
+                                   const char *name,
+                                   char *l3_out, size_t l3_len,
+                                   char *gateway_out, size_t gateway_len,
+                                   int *online_out)
+{
+    size_t i, n;
+
+    if (!interfaces || !name || !name[0])
+        return -1;
+    n = json_object_array_length(interfaces);
+    for (i = 0; i < n; i++) {
+        struct json_object *iface = json_object_array_get_idx(interfaces, i);
+        struct json_object *routes = NULL;
+        const char *ifname = route_json_string(iface, "interface");
+        const char *l3;
+        int up;
+        int available;
+
+        if (!ifname || strcmp(ifname, name) != 0)
+            continue;
+        l3 = route_json_string(iface, "l3_device");
+        if (l3_out && l3_len > 0 && l3 && route_ifname_ok(l3))
+            snprintf(l3_out, l3_len, "%s", l3);
+        up = route_json_bool_def(iface, "up", 0);
+        available = route_json_bool_def(iface, "available", up);
+        if (online_out)
+            *online_out = up && available;
+        if (gateway_out && gateway_len > 0 &&
+            json_object_object_get_ex(iface, "route", &routes) &&
+            routes && json_object_is_type(routes, json_type_array)) {
+            size_t j, m = json_object_array_length(routes);
+
+            for (j = 0; j < m; j++) {
+                struct json_object *r = json_object_array_get_idx(routes, j);
+                const char *target = route_json_string(r, "target");
+                const char *nexthop = route_json_string(r, "nexthop");
+                int mask = route_json_int_def(r, "mask", -1);
+
+                if ((!target || !strcmp(target, "0.0.0.0")) && mask == 0 &&
+                    nexthop && nexthop[0]) {
+                    snprintf(gateway_out, gateway_len, "%s", nexthop);
+                    break;
+                }
+            }
+        }
+        return 0;
+    }
+    return -1;
+}
+
+static const struct route_network_wan_runtime *
+route_network_wan_snapshot_find_name(const struct route_network_wan_snapshot *snapshot,
+                                     const char *name)
+{
+    size_t i;
+
+    if (!snapshot || !name || !name[0])
+        return NULL;
+    for (i = 0; i < snapshot->count; i++)
+        if (!strcmp(snapshot->wans[i].name, name))
+            return &snapshot->wans[i];
+    return NULL;
+}
+
 static int route_network_wan_snapshot_get(struct route_network_wan_snapshot *snapshot)
 {
     struct uci_context *ctx;
     struct uci_package *pkg = NULL;
     struct uci_element *e;
+    struct json_object *root = NULL;
+    struct json_object *interfaces = NULL;
+    int dump_ok = 0;
     int rc = 0;
 
     if (!snapshot)
         return -1;
     memset(snapshot, 0, sizeof(*snapshot));
+    root = route_ubus_call_json("network.interface", "dump", 3000);
+    if (root &&
+        json_object_object_get_ex(root, "interface", &interfaces) &&
+        interfaces && json_object_is_type(interfaces, json_type_array))
+        dump_ok = 1;
+
     ctx = uci_alloc_context();
-    if (!ctx)
+    if (!ctx) {
+        if (root)
+            json_object_put(root);
         return -1;
+    }
     if (uci_load(ctx, "network", &pkg) != UCI_OK) {
         uci_free_context(ctx);
+        if (root)
+            json_object_put(root);
         return -1;
     }
 
@@ -1045,9 +1394,16 @@ static int route_network_wan_snapshot_get(struct route_network_wan_snapshot *sna
             break;
         }
         wan = &snapshot->wans[snapshot->count];
-        if (route_ifstatus_runtime(name, wan->l3_ifname,
-                                   sizeof(wan->l3_ifname), wan->gateway,
-                                   sizeof(wan->gateway), &online) != 0) {
+        if (dump_ok) {
+            if (route_network_dump_fill(interfaces, name, wan->l3_ifname,
+                                        sizeof(wan->l3_ifname), wan->gateway,
+                                        sizeof(wan->gateway), &online) != 0) {
+                rc = -1;
+                break;
+            }
+        } else if (route_ifstatus_runtime(name, wan->l3_ifname,
+                                          sizeof(wan->l3_ifname), wan->gateway,
+                                          sizeof(wan->gateway), &online) != 0) {
             rc = -1;
             break;
         }
@@ -1063,17 +1419,43 @@ static int route_network_wan_snapshot_get(struct route_network_wan_snapshot *sna
 
     uci_unload(ctx, pkg);
     uci_free_context(ctx);
+    if (root)
+        json_object_put(root);
     return rc;
 }
 
 static int route_network_wan_runtime_changed(
-    struct route_network_wan_snapshot *current)
+    struct route_network_wan_snapshot *current, int loaded)
 {
-    if (route_network_wan_snapshot_get(current) != 0)
+    size_t i;
+
+    if (!current)
+        return -1;
+    if (!loaded && route_network_wan_snapshot_get(current) != 0)
         return -1;
     if (!g_route_network_wans_ready)
         return 1;
-    return memcmp(current, &g_route_network_wans, sizeof(*current)) != 0;
+
+    /*
+     * This predicate decides whether routed tears down and rebuilds the entire
+     * WAN/rule graph.  Liveness is deliberately excluded: a PPP reconnect can
+     * briefly clear online, l3_ifname, or gateway, and treating that as a
+     * topology edit creates a much larger outage by flushing every WAN and
+     * every route rule.  Health changes use JMX_NL_ACT_WAN_HEALTH instead.
+     */
+    if (current->count != g_route_network_wans.count)
+        return 1;
+    for (i = 0; i < current->count; i++) {
+        const struct route_network_wan_runtime *now = &current->wans[i];
+        const struct route_network_wan_runtime *old = &g_route_network_wans.wans[i];
+
+        if (strcmp(now->name, old->name) ||
+            strcmp(now->proto, old->proto) ||
+            strcmp(now->configured_ifname, old->configured_ifname) ||
+            now->weight != old->weight)
+            return 1;
+    }
+    return 0;
 }
 
 static void route_sync_wan_map_add(struct route_sync_wan_map *map, size_t map_len,
@@ -1121,6 +1503,329 @@ static int route_sync_wan_registered_by_name(const struct route_sync_wan_map *ma
         if (map[i].id && !strcmp(map[i].name, name))
             return 1;
     return 0;
+}
+
+static int route_direction_gateway_mode(void)
+{
+    int mode = 0;
+
+    if (jmx_work_mode_config_get(&mode, NULL, 0, NULL, 0) != 0)
+        return 0;
+    return mode == 0;
+}
+
+static void route_direction_store_be16(void *dst, uint16_t value)
+{
+    uint8_t bytes[2] = {
+        (uint8_t)(value >> 8),
+        (uint8_t)value,
+    };
+
+    memcpy(dst, bytes, sizeof(bytes));
+}
+
+static void route_direction_store_be32(void *dst, uint32_t value)
+{
+    uint8_t bytes[4] = {
+        (uint8_t)(value >> 24),
+        (uint8_t)(value >> 16),
+        (uint8_t)(value >> 8),
+        (uint8_t)value,
+    };
+
+    memcpy(dst, bytes, sizeof(bytes));
+}
+
+static void route_direction_store_be64(void *dst, uint64_t value)
+{
+    uint8_t bytes[8] = {
+        (uint8_t)(value >> 56),
+        (uint8_t)(value >> 48),
+        (uint8_t)(value >> 40),
+        (uint8_t)(value >> 32),
+        (uint8_t)(value >> 24),
+        (uint8_t)(value >> 16),
+        (uint8_t)(value >> 8),
+        (uint8_t)value,
+    };
+
+    memcpy(dst, bytes, sizeof(bytes));
+}
+
+static int route_direction_snapshot_wire(
+    const struct jmx_direction_snapshot *snapshot,
+    uint8_t **out_wire, size_t *out_len)
+{
+    struct jmx_direction_nl_header *header;
+    uint8_t *wire, *cursor;
+    size_t wire_len;
+    uint16_t lan_count;
+    uint16_t local_count;
+    uint16_t wan_count;
+    uint16_t i;
+
+    if (!snapshot || !out_wire || !out_len ||
+        snapshot->version != JMX_DIRECTION_SNAPSHOT_VERSION ||
+        !snapshot->generation || snapshot->ready > 1 ||
+        snapshot->gateway_mode > 1 ||
+        snapshot->lan_prefix_count > JMX_DIRECTION_MAX_LAN_PREFIXES ||
+        snapshot->local_address_count > JMX_DIRECTION_MAX_LOCAL_ADDRS ||
+        snapshot->wan_count > JMX_DIRECTION_MAX_WANS ||
+        (snapshot->ready && jmx_direction_snapshot_validate(snapshot) != 0))
+        return -1;
+    /* An unready publication is intentionally header-only.  A partially
+     * built local snapshot must never cross the ABI as if it were usable. */
+    lan_count = snapshot->ready ? snapshot->lan_prefix_count : 0;
+    local_count = snapshot->ready ? snapshot->local_address_count : 0;
+    wan_count = snapshot->ready ? snapshot->wan_count : 0;
+    wire_len = sizeof(*header) +
+               (size_t)lan_count *
+                   sizeof(struct jmx_direction_nl_prefix) +
+               (size_t)local_count *
+                   sizeof(struct jmx_direction_nl_local_address) +
+               (size_t)wan_count * sizeof(struct jmx_direction_nl_wan);
+    wire = calloc(1, wire_len);
+    if (!wire)
+        return -1;
+    header = (struct jmx_direction_nl_header *)wire;
+    route_direction_store_be32(&header->action,
+                               JMX_NL_ACT_DIRECTION_SNAPSHOT);
+    route_direction_store_be16(&header->abi_version,
+                               JMX_DIRECTION_NL_ABI_VERSION);
+    route_direction_store_be16(&header->header_size, sizeof(*header));
+    route_direction_store_be32(&header->message_size, (uint32_t)wire_len);
+    route_direction_store_be64(&header->generation, snapshot->generation);
+    header->ready = snapshot->ready ? 1 : 0;
+    header->gateway_mode = snapshot->gateway_mode ? 1 : 0;
+    route_direction_store_be16(&header->lan_prefix_count,
+                               lan_count);
+    route_direction_store_be16(&header->local_address_count,
+                               local_count);
+    route_direction_store_be16(&header->wan_count, wan_count);
+
+    cursor = wire + sizeof(*header);
+    for (i = 0; i < lan_count; i++) {
+        struct jmx_direction_nl_prefix *entry =
+            (struct jmx_direction_nl_prefix *)cursor;
+        const struct jmx_direction_prefix *source =
+            &snapshot->lan_prefixes[i];
+
+        route_direction_store_be32(&entry->ifindex, source->ifindex);
+        entry->family = source->family;
+        entry->prefix_len = source->prefix_len;
+        memcpy(entry->address, source->address, sizeof(entry->address));
+        cursor += sizeof(*entry);
+    }
+    for (i = 0; i < local_count; i++) {
+        struct jmx_direction_nl_local_address *entry =
+            (struct jmx_direction_nl_local_address *)cursor;
+        const struct jmx_direction_local_address *source =
+            &snapshot->local_addresses[i];
+
+        entry->family = source->family;
+        memcpy(entry->address, source->address, sizeof(entry->address));
+        cursor += sizeof(*entry);
+    }
+    for (i = 0; i < wan_count; i++) {
+        struct jmx_direction_nl_wan *entry =
+            (struct jmx_direction_nl_wan *)cursor;
+        const struct jmx_direction_wan *source = &snapshot->wans[i];
+
+        entry->wan_id = source->wan_id;
+        entry->family_mask = source->family_mask;
+        entry->registered = source->registered ? 1 : 0;
+        route_direction_store_be32(&entry->ifindex, source->ifindex);
+        route_direction_store_be32(&entry->route_identity,
+                                   source->route_identity);
+        route_direction_store_be32(&entry->table_id, source->table_id);
+        route_direction_store_be32(&entry->reserved3, 0);
+        cursor += sizeof(*entry);
+    }
+    *out_wire = wire;
+    *out_len = wire_len;
+    return 0;
+}
+
+static int route_direction_snapshot_send(int fd,
+                                         const struct jmx_direction_snapshot *snapshot)
+{
+    uint8_t *wire = NULL;
+    size_t wire_len = 0;
+    int rc;
+
+    if (route_direction_snapshot_wire(snapshot, &wire, &wire_len) != 0)
+        return -1;
+    rc = jmx_route_nl_send(fd, wire, (int)wire_len);
+    free(wire);
+    return rc;
+}
+
+static int route_direction_snapshot_send_current(int fd)
+{
+    struct jmx_direction_snapshot snapshot;
+
+    if (jmx_direction_snapshot_read_current(&snapshot) != 0)
+        return -1;
+    return route_direction_snapshot_send(fd, &snapshot);
+}
+
+static int route_direction_snapshot_publish(
+    int fd, const struct route_sync_wan_map *map, int map_count)
+{
+    struct json_object *lan_response = NULL;
+    struct json_object *lan_data = NULL;
+    struct json_object *registered_wans = NULL;
+    int gateway_mode = route_direction_gateway_mode();
+    int rc = -1;
+    int i;
+
+    registered_wans = json_object_new_array();
+    if (!registered_wans)
+        return -1;
+    for (i = 0; map && i < map_count; i++) {
+        struct json_object *wan = json_object_new_object();
+
+        if (!wan)
+            goto done;
+        json_object_object_add(wan, "id", json_object_new_int(map[i].id));
+        json_object_object_add(wan, "ifname",
+                               json_object_new_string(map[i].ifname));
+        json_object_object_add(wan, "route_identity",
+                               json_object_new_int64(map[i].fwmark));
+        json_object_object_add(wan, "table",
+                               json_object_new_int64(map[i].table_id));
+        json_object_array_add(registered_wans, wan);
+    }
+
+    lan_response = jmx_netconfig_lan_list();
+    if (!lan_response ||
+        !json_object_object_get_ex(lan_response, "data", &lan_data) ||
+        !lan_data) {
+        goto done;
+    }
+    rc = jmx_direction_snapshot_refresh_json(lan_data, registered_wans,
+                                              gateway_mode);
+    if (rc == 0)
+        rc = route_direction_snapshot_send_current(fd);
+done:
+    if (lan_response)
+        json_object_put(lan_response);
+    json_object_put(registered_wans);
+    return rc;
+}
+
+/* Same question keyed by id: did this WAN get registered in this sync pass,
+ * whether it came from the route_wan ledger or the UCI top-up below. */
+static int route_sync_wan_registered_by_id(const struct route_sync_wan_map *map,
+                                           int map_count, uint8_t id)
+{
+    int i;
+
+    if (!map || !id)
+        return 0;
+    for (i = 0; i < map_count; i++)
+        if (map[i].id == id)
+            return 1;
+    return 0;
+}
+
+/* Guards against listing the same WAN twice when a member appears in both
+ * wan_ids and dangling_wan_ids. */
+static int route_rule_wire_has_wan(const struct jmx_route_rule_wire *rule, uint8_t id)
+{
+    int i;
+
+    if (!rule)
+        return 0;
+    for (i = 0; i < rule->wan_count && i < JMX_ROUTE_MAX_WAN_IFACES; i++)
+        if (rule->wan_ids[i] == id)
+            return 1;
+    return 0;
+}
+
+/*
+ * Reinstate rule members the export classified as dangling but which this sync
+ * pass did register.
+ *
+ * route_wan is a user-facing ledger written only by route_config_set, while the
+ * kernel also learns WANs from the UCI top-up in jmx_route_sync_json(). A line
+ * dialled up in /etc/config/network therefore exists and forwards traffic while
+ * being absent from the ledger, and jmx_route_db export splits any rule member
+ * naming it into dangling_wan_ids because route_wan has no such row. The rule
+ * then reaches the kernel naming only the ledger lines.
+ *
+ * On 30.1 that left the default rule at wans=1,2 while wan3 -- the current
+ * default route carrying the most traffic of the four -- was registered,
+ * healthy, and completely outside policy selection: no active_conn, no
+ * proto_stats, and no rule constraining it. The fix belongs here rather than in
+ * the export, which is right to distrust a member whose line it cannot see: by
+ * the time rules are pushed, wan_map is the authoritative set of live WANs, so
+ * a "dangling" id present there is not dangling at all.
+ *
+ * Members still absent from wan_map stay out, which is the case the export's
+ * split exists for (a deleted line whose id could later be reused).
+ *
+ * Whether to reinstate at all is user configuration, because both answers are
+ * legitimate: a user who wants every dialled line in the policy wants this, while
+ * a user who deliberately left the later lines to the default route does not, and
+ * reinstating would move their traffic without them asking. `policy` carries
+ * route_global.dangling_wan_policy:
+ *
+ *   reinstate_registered  reinstate (default; the behaviour before the switch)
+ *   keep_excluded         never reinstate, log once per skipped member
+ *   per_rule              defer to the rule's own reinstate_dangling flag
+ */
+static void route_restore_dangling_wan_members(struct json_object *rule_json,
+                                               struct jmx_route_rule_wire *rule,
+                                               const struct route_sync_wan_map *map,
+                                               int map_count,
+                                               const char *policy)
+{
+    struct json_object *stale = NULL;
+    int i;
+    int reinstate;
+
+    if (!rule_json || !rule || !map)
+        return;
+    if (!policy || !*policy)
+        policy = "reinstate_registered";
+    if (!strcmp(policy, "keep_excluded"))
+        reinstate = 0;
+    else if (!strcmp(policy, "per_rule"))
+        reinstate = json_get_u32(rule_json, "reinstate_dangling", 1) ? 1 : 0;
+    else
+        reinstate = 1;
+    if (!json_object_object_get_ex(rule_json, "dangling_wan_ids", &stale) ||
+        !json_object_is_type(stale, json_type_array))
+        return;
+    for (i = 0; i < (int)json_object_array_length(stale) &&
+                rule->wan_count < JMX_ROUTE_MAX_WAN_IFACES; i++) {
+        struct json_object *value = json_object_array_get_idx(stale, i);
+        int64_t raw;
+        uint8_t id;
+
+        if (!value || !json_object_is_type(value, json_type_int))
+            continue;
+        raw = json_object_get_int64(value);
+        if (raw <= 0 || raw > JMX_ROUTE_MAX_WAN_IFACES)
+            continue;
+        id = (uint8_t)raw;
+        if (!route_sync_wan_registered_by_id(map, map_count, id))
+            continue;
+        if (route_rule_wire_has_wan(rule, id))
+            continue;
+        if (!reinstate) {
+            /* The member is live and could have been reinstated; the user asked
+             * for it to stay out. Say so, otherwise this looks like the dangling
+             * case the export split exists for. */
+            LOG_WARN("jmx_route: rule '%s' member wan id=%u is registered but dangling_wan_policy=%s keeps it excluded",
+                     json_get_str(rule_json, "name", ""), id, policy);
+            continue;
+        }
+        rule->wan_ids[rule->wan_count++] = id;
+        LOG_WARN("jmx_route: rule '%s' member wan id=%u was reported dangling but is registered; reinstating",
+                 json_get_str(rule_json, "name", ""), id);
+    }
 }
 
 static void route_sync_wan_map_set_carrier(struct route_sync_wan_map *map,
@@ -1380,6 +2085,11 @@ static int route_config_has_auto_carrier_rules(struct json_object *config)
         struct json_object *rule = json_object_array_get_idx(rules, i);
         struct json_object *wan_ids = NULL;
 
+        /* Disabled rules do not participate in runtime carrier mapping.  Do
+         * not let their unresolved auto-selection state force a full route
+         * graph rebuild on every health tick. */
+        if (!json_get_u32(rule, "enabled", 0))
+            continue;
         if (carrier_from_string(json_get_str(rule, "carrier", "any")) ==
             JMX_CARRIER_ANY)
             continue;
@@ -1619,17 +2329,6 @@ static int route_sync_network_wans(int fd, int *errors,
     return count;
 }
 
-static uint32_t route_threshold(struct uci_section *s, const char *name, uint32_t def)
-{
-    uint32_t n = parse_u32_opt(s, name, def);
-
-    if (n < 1)
-        return def;
-    if (n > JMX_ROUTE_HEALTH_MAX_THRESHOLD)
-        return JMX_ROUTE_HEALTH_MAX_THRESHOLD;
-    return n;
-}
-
 static struct route_health_state *route_health_state_get(uint8_t id)
 {
     int free_slot = -1;
@@ -1652,6 +2351,23 @@ static struct route_health_state *route_health_state_get(uint8_t id)
     return &g_route_health[free_slot];
 }
 
+static const struct route_health_state *
+route_health_state_find(uint8_t id, const char *name)
+{
+    int i;
+
+    for (i = 0; i < JMX_ROUTE_HEALTH_MAX_STATES; i++) {
+        const struct route_health_state *st = &g_route_health[i];
+
+        if (!st->known)
+            continue;
+        if ((id && st->id == id) ||
+            (name && name[0] && st->name[0] && !strcmp(st->name, name)))
+            return st;
+    }
+    return NULL;
+}
+
 static void route_health_prune_states(void)
 {
     int i;
@@ -1663,30 +2379,232 @@ static void route_health_prune_states(void)
     }
 }
 
+static int route_health_token(const char *line, const char *key,
+                              char *out, size_t out_len)
+{
+    const char *p = line;
+    size_t key_len;
+    size_t len = 0;
+
+    if (!line || !key || !out || out_len == 0)
+        return -1;
+    key_len = strlen(key);
+    while ((p = strstr(p, key)) != NULL) {
+        if ((p == line || isspace((unsigned char)p[-1])) && p[key_len] == '=')
+            break;
+        p += key_len;
+    }
+    if (!p)
+        return -1;
+    p += key_len + 1;
+    while (p[len] && !isspace((unsigned char)p[len]))
+        len++;
+    if (len >= out_len)
+        len = out_len - 1;
+    memcpy(out, p, len);
+    out[len] = '\0';
+    return 0;
+}
+
+static int route_health_snapshot_load(struct route_health_snapshot_set *set)
+{
+    FILE *fp;
+    char line[1024];
+    time_t now = time(NULL);
+
+    if (!set)
+        return -1;
+    memset(set, 0, sizeof(*set));
+    fp = fopen(JMX_ROUTE_HEALTH_STATUS_PATH, "r");
+    if (!fp)
+        return -1;
+    while (fgets(line, sizeof(line), fp)) {
+        struct route_health_snapshot *row;
+        char value[160];
+
+        if (route_health_token(line, "updated_at", value, sizeof(value)) == 0 &&
+            strncmp(line, "wan=", 4) != 0) {
+            set->updated_at = (time_t)atoll(value);
+            continue;
+        }
+        if (strncmp(line, "wan=", 4) != 0 ||
+            set->count >= JMX_ROUTE_MAX_WAN_IFACES)
+            continue;
+        row = &set->rows[set->count];
+        memset(row, 0, sizeof(*row));
+        row->updated_at = set->updated_at;
+        row->latency_ms = -1;
+        row->probe_loss_pct = -1;
+        row->up_loss_pct = -1;
+        row->down_loss_pct = -1;
+#define ROUTE_HEALTH_TEXT(k, field) \
+        do { if (route_health_token(line, k, value, sizeof(value)) == 0 && \
+                 strcmp(value, "-")) JMX_STRBUF_COPY(row->field, value); } while (0)
+#define ROUTE_HEALTH_INT(k, field) \
+        do { if (route_health_token(line, k, value, sizeof(value)) == 0) row->field = atoi(value); } while (0)
+        ROUTE_HEALTH_TEXT("wan", name);
+        ROUTE_HEALTH_TEXT("device", device);
+        ROUTE_HEALTH_TEXT("target", target);
+        ROUTE_HEALTH_TEXT("reason", reason);
+        ROUTE_HEALTH_TEXT("health_mode", health_mode);
+        ROUTE_HEALTH_INT("checked", checked);
+        ROUTE_HEALTH_INT("online", online);
+        ROUTE_HEALTH_INT("latency", latency_ms);
+        if (route_health_token(line, "probe_loss", value, sizeof(value)) == 0)
+            row->probe_loss_pct = atoi(value);
+        else
+            ROUTE_HEALTH_INT("loss", probe_loss_pct);
+        ROUTE_HEALTH_INT("jitter_ms", jitter_ms);
+        ROUTE_HEALTH_INT("jitter_samples", jitter_samples);
+        ROUTE_HEALTH_INT("jitter_over_80_pct", jitter_over_80_pct);
+        ROUTE_HEALTH_INT("counters_valid", counters_valid);
+        if (route_health_token(line, "up_loss_pct", value, sizeof(value)) == 0 ||
+            route_health_token(line, "up_loss", value, sizeof(value)) == 0)
+            row->up_loss_pct = atof(value);
+        if (route_health_token(line, "down_loss_pct", value, sizeof(value)) == 0 ||
+            route_health_token(line, "down_loss", value, sizeof(value)) == 0)
+            row->down_loss_pct = atof(value);
+#undef ROUTE_HEALTH_INT
+#undef ROUTE_HEALTH_TEXT
+        if (row->name[0])
+            set->count++;
+    }
+    fclose(fp);
+    if (set->updated_at <= 0 || now < set->updated_at ||
+        now - set->updated_at > JMX_ROUTE_HEALTH_STALE_SEC)
+        return -1;
+    return set->count > 0 ? 0 : -1;
+}
+
+static const struct route_health_snapshot *
+route_health_snapshot_find(const struct route_health_snapshot_set *set,
+                           const char *name, const char *ifname)
+{
+    size_t i;
+
+    if (!set)
+        return NULL;
+    for (i = 0; i < set->count; i++)
+        if ((name && name[0] && !strcmp(set->rows[i].name, name)) ||
+            (ifname && ifname[0] && !strcmp(set->rows[i].device, ifname)))
+            return &set->rows[i];
+    return NULL;
+}
+
+static uint8_t route_health_level_for(const struct route_health_snapshot *s)
+{
+    double real_loss = -1;
+
+    if (!s)
+        return 0;
+    if (!s->online || !strcmp(s->reason, "link_down") ||
+        !strcmp(s->reason, "no_device") ||
+        !strcmp(s->reason, "all_probes_failed"))
+        return 3;
+    if (s->counters_valid) {
+        if (s->up_loss_pct >= 0)
+            real_loss = s->up_loss_pct;
+        if (s->down_loss_pct > real_loss)
+            real_loss = s->down_loss_pct;
+    }
+    /*
+     * probe_loss_pct is a three-packet reachability sample (0/33/67/100),
+     * not the WAN's forwarding loss.  Treating one or two missed replies as
+     * 33%/67% line loss escalates a healthy WAN to L1/L2 and can trigger
+     * selective conntrack rebinds.  Reachability still has a hard-down path
+     * above when every configured probe fails; quality levels below that use
+     * only independent forwarding counters, RTT and jitter.
+     */
+    if (real_loss >= 40.0 || s->latency_ms >= 800)
+        return 3;
+    if (real_loss > 15.0 || s->jitter_over_80_pct > 30 ||
+        s->latency_ms >= 400)
+        return 2;
+    /* A disagreement between independent probes is useful telemetry, but it
+     * is not by itself evidence that forwarding quality degraded. One target
+     * may reject HTTP or a PPP peer may not answer ICMP while real traffic,
+     * RTT, jitter and the other probes remain healthy. Penalize only measured
+     * quality thresholds; keep partial_probe_fail visible in status. */
+    if (real_loss > 2.0 || s->latency_ms >= 180 ||
+        s->jitter_over_80_pct > 0)
+        return 1;
+    return 0;
+}
+
+static uint8_t route_health_weight_for(uint8_t level)
+{
+    static const uint8_t weights[] = { 100, 70, 25, 1 };
+
+    return level < sizeof(weights) ? weights[level] : 1;
+}
+
+static void route_health_snapshot_copy(struct route_health_state *st,
+                                       const struct route_health_snapshot *s)
+{
+    st->checked = s->checked;
+    st->online = s->online;
+    st->latency_ms = s->latency_ms;
+    st->probe_loss_pct = s->probe_loss_pct;
+    st->jitter_ms = s->jitter_ms;
+    st->jitter_samples = s->jitter_samples;
+    st->jitter_over_80_pct = s->jitter_over_80_pct;
+    st->counters_valid = s->counters_valid;
+    st->up_loss_pct = s->up_loss_pct;
+    st->down_loss_pct = s->down_loss_pct;
+    snprintf(st->target, sizeof(st->target), "%s", s->target);
+    snprintf(st->reason, sizeof(st->reason), "%s", s->reason);
+    snprintf(st->health_mode, sizeof(st->health_mode), "%s", s->health_mode);
+}
+
 static int route_health_event_emit(const struct route_health_state *st,
                                    const char *level, const char *event,
                                    const char *title, const char *state)
 {
     struct json_object *o;
+    struct json_object *detail;
     struct json_object *resp;
     char id[96];
-    char detail[512];
+    char dedupe[96];
 
     if (!st || !event)
         return -1;
-    snprintf(id, sizeof(id), "route-wan-%u-%s-%lld",
-             st->id, state && state[0] ? state : "state", (long long)st->last_change);
-    snprintf(detail, sizeof(detail),
-             "wan=%s ifname=%s target=%s reason=%s fail_count=%u ok_count=%u",
-             st->name[0] ? st->name : "wan",
-             st->ifname[0] ? st->ifname : "",
-             st->target[0] ? st->target : "",
-             st->reason[0] ? st->reason : "",
-             st->fail_count, st->ok_count);
-
+    snprintf(id, sizeof(id), "route-wan-%u-%u-%lld", st->id,
+             st->transition_count, (long long)st->last_change);
+    snprintf(dedupe, sizeof(dedupe), "wan_quality:%s",
+             st->name[0] ? st->name : "unknown");
     o = json_object_new_object();
-    if (!o)
+    detail = json_object_new_object();
+    if (!o || !detail) {
+        if (o) json_object_put(o);
+        if (detail) json_object_put(detail);
         return -1;
+    }
+    json_object_object_add(detail, "wan_id", json_object_new_string(st->name));
+    json_object_object_add(detail, "wan_numeric_id", json_object_new_int(st->id));
+    json_object_object_add(detail, "ifname", json_object_new_string(st->ifname));
+    json_object_object_add(detail, "quality_level", json_object_new_int(st->quality_level));
+    json_object_object_add(detail, "raw_level", json_object_new_int(st->raw_level));
+    json_object_object_add(detail, "penalty_peak_level",
+                           json_object_new_int(st->penalty_peak_level));
+    json_object_object_add(detail, "adaptive_weight", json_object_new_int(st->adaptive_weight));
+    json_object_object_add(detail, "reason", json_object_new_string(st->reason));
+    json_object_object_add(detail, "latency_ms", json_object_new_int(st->latency_ms));
+    json_object_object_add(detail, "probe_loss_pct", json_object_new_int(st->probe_loss_pct));
+    json_object_object_add(detail, "up_loss_pct", st->counters_valid ?
+                           json_object_new_double(st->up_loss_pct) : json_object_new_null());
+    json_object_object_add(detail, "down_loss_pct", st->counters_valid ?
+                           json_object_new_double(st->down_loss_pct) : json_object_new_null());
+    json_object_object_add(detail, "jitter_ms", json_object_new_int(st->jitter_ms));
+    json_object_object_add(detail, "jitter_over_80_pct",
+                           json_object_new_int(st->jitter_over_80_pct));
+    json_object_object_add(detail, "recovery_observing",
+                           json_object_new_boolean(st->recovery_observing));
+    json_object_object_add(detail, "recovery_target_level",
+                           json_object_new_int(st->recovery_target_level));
+    json_object_object_add(detail, "recovery_since",
+                           json_object_new_int64((int64_t)st->recovery_since));
+    json_object_object_add(detail, "rebind_mode", json_object_new_int(st->last_rebind_mode));
+
     json_object_object_add(o, "id", json_object_new_string(id));
     json_object_object_add(o, "type", json_object_new_string("system"));
     json_object_object_add(o, "level", json_object_new_string(level ? level : "info"));
@@ -1694,13 +2612,14 @@ static int route_health_event_emit(const struct route_health_state *st,
     json_object_object_add(o, "module", json_object_new_string("dreamingwrt-routed"));
     json_object_object_add(o, "source", json_object_new_string("routed.health"));
     json_object_object_add(o, "iface", json_object_new_string(st->ifname));
+    json_object_object_add(o, "wan_id", json_object_new_string(st->name));
     json_object_object_add(o, "title", json_object_new_string(title ? title : event));
     json_object_object_add(o, "event", json_object_new_string(event));
-    json_object_object_add(o, "detail", json_object_new_string(detail));
+    json_object_object_add(o, "detail_json", detail);
+    json_object_object_add(o, "dedupe_key", json_object_new_string(dedupe));
     json_object_object_add(o, "state", json_object_new_string(state ? state : ""));
     json_object_object_add(o, "target", json_object_new_string(st->name));
     json_object_object_add(o, "ts", json_object_new_int64((int64_t)st->last_change));
-
     resp = jmx_log_center_event_add(o);
     if (resp)
         json_object_put(resp);
@@ -1708,176 +2627,150 @@ static int route_health_event_emit(const struct route_health_state *st,
     return 0;
 }
 
-static int route_health_ping(const char *ifname, const char *target)
+static void route_health_emit_transition(const struct route_health_state *st)
 {
-    if (ifname && ifname[0]) {
-        char *argv[] = { "ping", "-I", (char *)ifname, "-c", "1", "-W", "1", (char *)target, NULL };
-        return route_run_cmd(argv);
+    if (st->recovery_observing) {
+        route_health_event_emit(st, "notice", "wan.penalty.recovering",
+                                "WAN quality recovery observation started", "observing");
+    } else if (st->quality_level == 0) {
+        if (st->penalty_peak_level >= 2)
+            route_health_event_emit(st, "notice",
+                                    "wan.quality.critical_recovered",
+                                    "WAN critical quality penalty recovered",
+                                    "completed");
+        route_health_event_emit(st, "notice", "wan.quality.recovered",
+                                "WAN quality recovered", "completed");
+    } else if (st->quality_level == 1) {
+        route_health_event_emit(st, "warning", "wan.quality.degraded",
+                                "WAN quality degraded", "active");
     } else {
-        char *argv[] = { "ping", "-c", "1", "-W", "1", (char *)target, NULL };
-        return route_run_cmd(argv);
+        route_health_event_emit(st, st->quality_level >= 3 ? "critical" : "warning",
+                                "wan.quality.critical",
+                                st->quality_level >= 3 ?
+                                    "WAN removed from route group" :
+                                    "WAN quality critically degraded",
+                                "active");
     }
 }
 
-static int route_health_curl(const char *ifname, const char *url)
+static int route_health_apply_level(int fd, struct route_health_state *st,
+                                    uint8_t level, int emit)
 {
-    if (ifname && ifname[0]) {
-        char *argv[] = { "curl", "-4", "-fsS", "--interface", (char *)ifname,
-                         "--connect-timeout", "1", "--max-time", "3", "--",
-                         (char *)url, NULL };
-        return route_run_cmd(argv);
-    } else {
-        char *argv[] = { "curl", "-4", "-fsS", "--connect-timeout", "1",
-                         "--max-time", "3", "--", (char *)url, NULL };
-        return route_run_cmd(argv);
+    uint8_t old_level = st->quality_level;
+    uint8_t weight = route_health_weight_for(level);
+    uint8_t rebind = 0;
+
+    if (jmx_route_nl_wan_adaptive_weight(fd, st->id, weight) != 0)
+        return -1;
+    if (jmx_route_nl_wan_health(fd, st->id, level < 3 ? 1 : 0) != 0)
+        return -1;
+    if (level > old_level) {
+        if (level > st->penalty_peak_level)
+            st->penalty_peak_level = level;
+        if (level >= 3)
+            rebind = JMX_ROUTE_REBIND_ALL;
+        else if (level >= 2)
+            rebind = JMX_ROUTE_REBIND_SELECTIVE;
+        if (rebind) {
+            if (jmx_route_nl_wan_rebind(fd, st->id, rebind) != 0)
+                return -1;
+            st->last_rebind_mode = rebind;
+        }
     }
+    st->quality_level = level;
+    st->adaptive_weight = weight;
+    st->healthy = level < 3;
+    st->last_change = st->last_probe;
+    st->transition_count++;
+    if (emit)
+        route_health_emit_transition(st);
+    if (level == 0)
+        st->penalty_peak_level = 0;
+    LOG_WARN("jmx_route: WAN %s quality L%u->L%u weight=%u reason=%s",
+             st->name, old_level, level, weight, st->reason);
+    return 0;
 }
 
-static int route_health_probe(struct uci_section *s, const char *ifname,
-                              const char *target, char *reason, size_t reason_len)
-{
-    const char *mode = uci_opt(s, "health_mode");
-    const char *url = uci_opt(s, "check_url");
-    int curl_only = 0;
-    int do_curl = 0;
-    int ping_rc;
-
-    if (!mode || !mode[0])
-        mode = "ping";
-    if (!strcmp(mode, "curl") || !strcmp(mode, "http") || !strcmp(mode, "https")) {
-        curl_only = 1;
-        do_curl = 1;
-    } else if (!strcmp(mode, "ping_curl") || !strcmp(mode, "both")) {
-        do_curl = 1;
-    }
-    if (!url || !url[0])
-        url = "https://ip.sb";
-    if (!route_safe_token(url, JMX_ROUTE_HEALTH_TARGET_LEN) ||
-        (strncmp(url, "http://", 7) && strncmp(url, "https://", 8)))
-        url = "https://ip.sb";
-
-    if (curl_only) {
-        int curl_rc = route_health_curl(ifname, url);
-        snprintf(reason, reason_len, "%s", curl_rc == 0 ? "curl_ok" : "curl_failed");
-        return curl_rc;
-    }
-
-    ping_rc = route_health_ping(ifname, target);
-    if (!do_curl) {
-        snprintf(reason, reason_len, "%s", ping_rc == 0 ? "ping_ok" : "ping_failed");
-        return ping_rc;
-    }
-    if (ping_rc == 0 || route_health_curl(ifname, url) == 0) {
-        snprintf(reason, reason_len, "%s", ping_rc == 0 ? "ping_ok" : "curl_ok");
-        return 0;
-    }
-    snprintf(reason, reason_len, "%s", "ping_curl_failed");
-    return -1;
-}
-
-static int route_health_tick_one(int fd, struct uci_section *s, uint8_t id,
-                                 uint8_t enabled, uint8_t failover,
-                                 uint8_t failback, uint8_t config_health,
-                                 uint32_t fail_threshold,
-                                 uint32_t recover_threshold,
-                                 const char *name, const char *ifname,
-                                 const char *target,
-                                 const char *health_mode,
-                                 const char *check_url)
+static int route_health_tick_one(int fd, uint8_t id, uint8_t enabled,
+                                 uint8_t failover, uint8_t failback,
+                                 uint8_t config_health, const char *name,
+                                 const char *ifname,
+                                 const struct route_health_snapshot *snap)
 {
     struct route_health_state *st;
-    char reason[64] = "";
-    int healthy;
-    int rc;
+    uint8_t raw;
+    int hard_down;
 
+    (void)config_health;
     if (!id || !enabled || !failover)
         return 0;
-    if (!target || !target[0])
-        target = "223.5.5.5";
-    if (!route_safe_token(target, JMX_ROUTE_HEALTH_TARGET_LEN) || target[0] == '-')
-        target = "223.5.5.5";
-
     st = route_health_state_get(id);
     if (!st)
         return -1;
     st->generation = g_route_health_generation;
-    if (st->last_probe == 0 && st->last_change == 0) {
-        st->healthy = config_health ? 1 : 0;
-        st->last_change = time(NULL);
-    }
-
     snprintf(st->name, sizeof(st->name), "%s", name && name[0] ? name : "wan");
     snprintf(st->ifname, sizeof(st->ifname), "%s", ifname && ifname[0] ? ifname : "");
-    snprintf(st->target, sizeof(st->target), "%s", target);
+    if (!snap || snap->updated_at <= st->last_probe)
+        return 0;
 
-    if (s) {
-        rc = route_health_probe(s, ifname, target, reason, sizeof(reason));
-    } else {
-        const char *mode = health_mode && health_mode[0] ? health_mode : "ping";
-        const char *url = check_url && check_url[0] ? check_url : "https://ip.sb";
-
-        if (!route_safe_token(url, JMX_ROUTE_HEALTH_TARGET_LEN) ||
-            (strncmp(url, "http://", 7) && strncmp(url, "https://", 8)))
-            url = "https://ip.sb";
-
-        if (!strcmp(mode, "curl") || !strcmp(mode, "http") ||
-            !strcmp(mode, "https")) {
-            rc = route_health_curl(ifname, url);
-            snprintf(reason, sizeof(reason), "%s", rc == 0 ? "curl_ok" : "curl_failed");
-        } else if (!strcmp(mode, "ping_curl") || !strcmp(mode, "both")) {
-            rc = route_health_ping(ifname, target);
-            if (rc == 0) {
-                snprintf(reason, sizeof(reason), "%s", "ping_ok");
-            } else {
-                rc = route_health_curl(ifname, url);
-                snprintf(reason, sizeof(reason), "%s",
-                         rc == 0 ? "curl_ok" : "ping_curl_failed");
-            }
-        } else {
-            rc = route_health_ping(ifname, target);
-            snprintf(reason, sizeof(reason), "%s", rc == 0 ? "ping_ok" : "ping_failed");
-        }
-    }
-    healthy = rc == 0;
-    st->last_probe = time(NULL);
-    snprintf(st->reason, sizeof(st->reason), "%s", reason);
-
-    if (healthy) {
-        st->ok_count++;
-        st->fail_count = 0;
-        if (!st->healthy && failback && st->ok_count >= recover_threshold) {
-            if (jmx_route_nl_wan_health(fd, id, 1) == 0) {
-                st->healthy = 1;
-                st->last_change = st->last_probe;
-                LOG_WARN("jmx_route: WAN %s recovered after %u successful checks",
-                         st->name, st->ok_count);
-                route_health_event_emit(st, "notice", "wan.failover.recovered",
-                                        "WAN recovered and returned to route group",
-                                        "completed");
-            } else {
-                LOG_WARN("jmx_route: failed to restore WAN %s route health after %u successful checks",
-                         st->name, st->ok_count);
-            }
-        }
-    } else {
+    st->last_probe = snap->updated_at;
+    route_health_snapshot_copy(st, snap);
+    raw = route_health_level_for(snap);
+    hard_down = !strcmp(snap->reason, "link_down") ||
+                !strcmp(snap->reason, "no_device");
+    if (raw == 3) {
         st->fail_count++;
         st->ok_count = 0;
-        if (st->healthy && st->fail_count >= fail_threshold) {
-            if (jmx_route_nl_wan_health(fd, id, 0) == 0) {
-                st->healthy = 0;
-                st->last_change = st->last_probe;
-                LOG_WARN("jmx_route: WAN %s removed from route group after %u failed checks (%s)",
-                         st->name, st->fail_count, st->reason);
-                route_health_event_emit(st, "warning", "wan.failover.down",
-                                        "WAN removed from route group",
-                                        "active");
-            } else {
-                LOG_WARN("jmx_route: failed to remove WAN %s from route group after %u failed checks (%s)",
-                         st->name, st->fail_count, st->reason);
-            }
-        }
+        if (!hard_down && st->fail_count < 2)
+            raw = 2;
+    } else {
+        st->fail_count = 0;
+        st->ok_count++;
     }
-    return 0;
+    st->raw_level = raw;
+
+    if (!st->initialized) {
+        st->initialized = 1;
+        st->last_change = st->last_probe;
+        return route_health_apply_level(fd, st, raw, raw > 0);
+    }
+
+    if (raw > st->quality_level) {
+        st->recovery_observing = 0;
+        st->recovery_samples = 0;
+        return route_health_apply_level(fd, st, raw, 1);
+    }
+    if (raw == st->quality_level) {
+        st->recovery_observing = 0;
+        st->recovery_samples = 0;
+        return 0;
+    }
+    if (!failback && st->quality_level >= 3)
+        return 0;
+
+    if (!st->recovery_observing) {
+        st->recovery_observing = 1;
+        st->recovery_target_level = st->quality_level - 1;
+        st->recovery_since = st->last_probe;
+        st->recovery_samples = 1;
+        st->transition_count++;
+        route_health_emit_transition(st);
+        return 0;
+    }
+    if (raw > st->recovery_target_level) {
+        st->recovery_since = st->last_probe;
+        st->recovery_samples = 0;
+        return 0;
+    }
+    if (st->recovery_samples < UINT8_MAX)
+        st->recovery_samples++;
+    if (st->recovery_samples < JMX_ROUTE_HEALTH_RECOVERY_SAMPLES ||
+        st->last_probe - st->recovery_since < JMX_ROUTE_HEALTH_RECOVERY_SEC)
+        return 0;
+
+    st->recovery_observing = 0;
+    st->recovery_samples = 0;
+    return route_health_apply_level(fd, st, st->recovery_target_level, 1);
 }
 
 static const char *route_app_name(int appid)
@@ -2291,6 +3184,9 @@ static int route_state_persist_rule_counters(struct json_object *data)
     time_t now = time(NULL);
     int persisted = 0;
     size_t i;
+    static time_t g_route_counter_persist_last = 0;
+    static int g_route_counter_persist_last_ok = 0;
+    static int g_route_counter_persist_last_count = 0;
 
 #define ROUTE_COUNTER_STATE_CLEAR() do { \
     for (i = 0; i < json_object_array_length(rules); i++) { \
@@ -2303,10 +3199,26 @@ static int route_state_persist_rule_counters(struct json_object *data)
     if (!data || !json_object_object_get_ex(data, "rules", &rules) ||
         !json_object_is_type(rules, json_type_array))
         return 0;
+    if (g_route_counter_persist_last &&
+        now - g_route_counter_persist_last < 15) {
+        json_object_object_add(data, "route_rule_counter_persisted",
+            json_object_new_int(g_route_counter_persist_last_ok ?
+                                g_route_counter_persist_last_count : 0));
+        json_object_object_add(data, "route_rule_counter_persist_skipped",
+                               json_object_new_boolean(1));
+        json_object_object_add(data, "route_rule_counter_persist_reason",
+                               json_object_new_string("throttled_15s"));
+        json_object_object_add(data, "route_rule_counter_db",
+                               json_object_new_string(JMX_ROUTE_STATE_DB_PATH));
+        return g_route_counter_persist_last_ok ?
+               g_route_counter_persist_last_count : -1;
+    }
     if (route_state_db_init(&db) != 0 || !db)
         return -1;
     if (sqlite3_exec(db, "BEGIN IMMEDIATE", NULL, NULL, NULL) != SQLITE_OK) {
         sqlite3_close(db);
+        g_route_counter_persist_last = now;
+        g_route_counter_persist_last_ok = 0;
         return -1;
     }
     for (i = 0; i < json_object_array_length(rules); i++) {
@@ -2314,6 +3226,8 @@ static int route_state_persist_rule_counters(struct json_object *data)
             sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
             sqlite3_close(db);
             ROUTE_COUNTER_STATE_CLEAR();
+            g_route_counter_persist_last = now;
+            g_route_counter_persist_last_ok = 0;
             json_object_object_add(data, "route_rule_counter_persisted",
                                    json_object_new_int(0));
             json_object_object_add(data, "route_rule_counter_persist_error",
@@ -2326,6 +3240,8 @@ static int route_state_persist_rule_counters(struct json_object *data)
         sqlite3_exec(db, "ROLLBACK", NULL, NULL, NULL);
         sqlite3_close(db);
         ROUTE_COUNTER_STATE_CLEAR();
+        g_route_counter_persist_last = now;
+        g_route_counter_persist_last_ok = 0;
         json_object_object_add(data, "route_rule_counter_persisted",
                                json_object_new_int(0));
         json_object_object_add(data, "route_rule_counter_persist_error",
@@ -2335,9 +3251,31 @@ static int route_state_persist_rule_counters(struct json_object *data)
     sqlite3_close(db);
     json_object_object_add(data, "route_rule_counter_persisted", json_object_new_int(persisted));
     json_object_object_add(data, "route_rule_counter_db", json_object_new_string(JMX_ROUTE_STATE_DB_PATH));
+    g_route_counter_persist_last = now;
+    g_route_counter_persist_last_ok = 1;
+    g_route_counter_persist_last_count = persisted;
 #undef ROUTE_COUNTER_STATE_CLEAR
     return persisted;
 }
+
+/* Route status enrichment is polled by the UI and must never block the uloop
+ * thread for the main DB's 5s busy timeout while webd/healthd hold a write
+ * lock.  A dedicated read-only connection with a short timeout turns a
+ * contended read into a degraded sample instead of a seconds-long stall. */
+static sqlite3 *route_open_readonly_db(void)
+{
+    sqlite3 *db = NULL;
+
+    if (sqlite3_open_v2(JMX_DB_PATH_DEFAULT, &db,
+                        SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
+        if (db)
+            sqlite3_close(db);
+        return NULL;
+    }
+    sqlite3_busy_timeout(db, 100);
+    return db;
+}
+
 
 static int route_read_wan_runtime(const char *name, char *device, size_t device_len,
                                   char *proto, size_t proto_len,
@@ -2348,7 +3286,7 @@ static int route_read_wan_runtime(const char *name, char *device, size_t device_
                                   int64_t *rx_rate, int64_t *tx_rate,
                                   int *latency_ms, int *loss_pct)
 {
-    sqlite3 *db = jmx_db_handle();
+    sqlite3 *db = route_open_readonly_db();
     sqlite3_stmt *st = NULL;
     int rc;
 
@@ -2374,8 +3312,11 @@ static int route_read_wan_runtime(const char *name, char *device, size_t device_
         *latency_ms = -1;
     if (loss_pct)
         *loss_pct = -1;
-    if (!db || !name || !name[0])
+    if (!db || !name || !name[0]) {
+        if (db)
+            sqlite3_close(db);
         return -1;
+    }
 
     rc = sqlite3_prepare_v2(db,
         "SELECT COALESCE(i.device,''),COALESCE(i.proto,''),COALESCE(i.carrier,''),"
@@ -2383,8 +3324,10 @@ static int route_read_wan_runtime(const char *name, char *device, size_t device_
         "FROM net_interfaces i LEFT JOIN net_interface_state s ON s.iface_id=i.iface_id "
         "WHERE i.name=?1 LIMIT 1",
         -1, &st, NULL);
-    if (rc != SQLITE_OK)
+    if (rc != SQLITE_OK) {
+        sqlite3_close(db);
         return -1;
+    }
     sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
     rc = sqlite3_step(st);
     if (rc == SQLITE_ROW) {
@@ -2416,6 +3359,7 @@ static int route_read_wan_runtime(const char *name, char *device, size_t device_
             *loss_pct = sqlite3_column_int(st, 10);
     }
     sqlite3_finalize(st);
+    sqlite3_close(db);
     return rc == SQLITE_ROW ? 0 : -1;
 }
 
@@ -2581,6 +3525,63 @@ static void route_enrich_wan_runtime(struct json_object *w, const char *name)
     json_object_object_add(w, "health_measured", json_object_new_boolean(latency >= 0 || loss >= 0));
 }
 
+static void route_enrich_wan_health(struct json_object *w, uint8_t id,
+                                    const char *name)
+{
+    const struct route_health_state *st = route_health_state_find(id, name);
+    time_t now = time(NULL);
+    int64_t remaining = 0;
+
+    if (!w || !st || !st->initialized)
+        return;
+    if (st->recovery_observing) {
+        remaining = JMX_ROUTE_HEALTH_RECOVERY_SEC - (now - st->recovery_since);
+        if (remaining < 0)
+            remaining = 0;
+    }
+    json_object_object_add(w, "quality_level", json_object_new_int(st->quality_level));
+    json_object_object_add(w, "quality_raw_level", json_object_new_int(st->raw_level));
+    json_object_object_add(w, "penalty_peak_level",
+                           json_object_new_int(st->penalty_peak_level));
+    json_object_object_add(w, "adaptive_weight_runtime",
+                           json_object_new_int(st->adaptive_weight));
+    json_object_object_add(w, "penalty_active",
+                           json_object_new_boolean(st->quality_level > 0));
+    json_object_object_add(w, "recovery_observing",
+                           json_object_new_boolean(st->recovery_observing));
+    json_object_object_add(w, "recovery_target_level",
+                           st->recovery_observing ?
+                               json_object_new_int(st->recovery_target_level) :
+                               json_object_new_null());
+    json_object_object_add(w, "recovery_remaining_sec",
+                           json_object_new_int64(remaining));
+    json_object_object_add(w, "health_sample_at",
+                           json_object_new_int64((int64_t)st->last_probe));
+    json_object_object_add(w, "health_transition_at",
+                           json_object_new_int64((int64_t)st->last_change));
+    json_object_object_add(w, "health_reason", json_object_new_string(st->reason));
+    json_object_object_add(w, "health_mode", json_object_new_string(st->health_mode));
+    json_object_object_add(w, "latency_ms", json_object_new_int(st->latency_ms));
+    json_object_object_add(w, "probe_loss_pct",
+                           st->probe_loss_pct >= 0 ?
+                               json_object_new_int(st->probe_loss_pct) :
+                               json_object_new_null());
+    json_object_object_add(w, "up_loss_pct",
+                           st->counters_valid && st->up_loss_pct >= 0 ?
+                               json_object_new_double(st->up_loss_pct) :
+                               json_object_new_null());
+    json_object_object_add(w, "down_loss_pct",
+                           st->counters_valid && st->down_loss_pct >= 0 ?
+                               json_object_new_double(st->down_loss_pct) :
+                               json_object_new_null());
+    json_object_object_add(w, "jitter_ms", json_object_new_int(st->jitter_ms));
+    json_object_object_add(w, "jitter_samples", json_object_new_int(st->jitter_samples));
+    json_object_object_add(w, "jitter_over_80_pct",
+                           json_object_new_int(st->jitter_over_80_pct));
+    json_object_object_add(w, "last_rebind_mode",
+                           json_object_new_int(st->last_rebind_mode));
+}
+
 static void route_enrich_wans(struct json_object *data)
 {
     struct json_object *wans = NULL;
@@ -2592,7 +3593,9 @@ static void route_enrich_wans(struct json_object *data)
         int64_t down = route_obj_i64(w, "down_rate", route_obj_i64(w, "rate_down", 0));
         int64_t up = route_obj_i64(w, "up_rate", route_obj_i64(w, "rate_up", 0));
         int health = route_obj_int(w, "health", 1);
+        uint8_t id = (uint8_t)route_obj_int(w, "id", 0);
         route_enrich_wan_runtime(w, name);
+        route_enrich_wan_health(w, id, name);
         down = route_obj_i64(w, "down_rate", route_obj_i64(w, "rate_down", down));
         up = route_obj_i64(w, "up_rate", route_obj_i64(w, "rate_up", up));
         if (!json_has_key(w, "ifname")) json_object_object_add(w, "ifname", json_object_new_string(name));
@@ -2902,21 +3905,20 @@ static struct json_object *route_build_decisions(struct json_object *data)
  *
  * A rule with a non-zero carrier_id is an explicit policy (operator steering);
  * carrier_id 0 is the default load-balance rule. Counting them separately is
- * what lets the UI say "policy steered" without lying. */
-struct route_mark_counts {
-    int64_t total;          /* conntrack entries examined */
-    int64_t explicit_steer; /* matched an explicit (carrier) policy rule */
-    int64_t load_balance;   /* matched the default load-balance rule */
-    int64_t unsteered;      /* mark=0, no policy applied */
-    int64_t unknown;        /* marked, but not attributable to a known rule */
-    /* Per-rule live counts, parallel to the enabled-rule table below. */
-    int prio[64];
-    int64_t per_prio[64];
-    int prio_n;
-};
+ * what lets the UI say "policy steered" without lying.
+ *
+ * The fast path is the ctnetlink mark runtime (dedicated thread, no procfs
+ * walk on the uloop thread); procfs remains as the fallback when the runtime
+ * is not yet seeded, unsupported, or recovering from event loss. */
+
+static struct {
+    time_t updated_at;
+    int valid;
+    struct jmx_route_mark_counts counts;
+} g_route_marks_cache;
 
 static int route_count_conntrack_marks(struct json_object *data,
-                                       struct route_mark_counts *out)
+                                       struct jmx_route_mark_counts *out)
 {
     struct json_object *rules = NULL;
     struct json_object *wans = NULL;
@@ -2925,15 +3927,24 @@ static int route_count_conntrack_marks(struct json_object *data,
     int rule_map_n = 0;
     int wan_ids[32];
     int wan_n = 0;
+    int rule_prios[64];
+    int rule_carriers[64];
     FILE *fp;
     char line[2048];
     int i;
+    time_t now = time(NULL);
 
     if (!out)
         return -1;
     memset(out, 0, sizeof(*out));
     if (!data)
         return -1;
+
+    if (g_route_marks_cache.valid &&
+        now - g_route_marks_cache.updated_at < JMX_ROUTE_SNAPSHOT_CACHE_SEC) {
+        *out = g_route_marks_cache.counts;
+        return 0;
+    }
 
     if (json_object_object_get_ex(data, "rules", &rules) &&
         json_object_is_type(rules, json_type_array)) {
@@ -2946,6 +3957,8 @@ static int route_count_conntrack_marks(struct json_object *data,
                 continue;
             rule_map[rule_map_n].prio = route_obj_int(r, "prio", 0);
             rule_map[rule_map_n].carrier = route_obj_int(r, "carrier_id", 0);
+            rule_prios[rule_map_n] = rule_map[rule_map_n].prio;
+            rule_carriers[rule_map_n] = rule_map[rule_map_n].carrier;
             rule_map_n++;
         }
     }
@@ -2962,6 +3975,14 @@ static int route_count_conntrack_marks(struct json_object *data,
     for (i = 0; i < rule_map_n; i++) {
         out->prio[i] = rule_map[i].prio;
         out->per_prio[i] = 0;
+    }
+
+    if (jmx_route_mark_runtime_sample(rule_prios, rule_carriers, rule_map_n,
+                                      wan_ids, wan_n, out) == 0) {
+        g_route_marks_cache.counts = *out;
+        g_route_marks_cache.updated_at = now;
+        g_route_marks_cache.valid = 1;
+        return 0;
     }
 
     fp = fopen("/proc/net/nf_conntrack", "r");
@@ -3019,6 +4040,9 @@ static int route_count_conntrack_marks(struct json_object *data,
             out->load_balance++;
     }
     fclose(fp);
+    g_route_marks_cache.counts = *out;
+    g_route_marks_cache.updated_at = now;
+    g_route_marks_cache.valid = 1;
     return 0;
 }
 
@@ -3034,7 +4058,7 @@ static void route_enrich_status(struct json_object *data)
     int64_t last_hit_at = 0;
     int64_t active_flows = 0;
     int64_t cumulative_conn = 0;
-    struct route_mark_counts marks;
+    struct jmx_route_mark_counts marks;
     int marks_ok;
     const char *counter_reason;
     int main_nondefault_count;
@@ -3246,6 +4270,45 @@ static void route_enrich_status(struct json_object *data)
     json_object_object_add(data, "policy_status", policy);
     json_object_object_add(data, "policy_groups", route_build_policy_groups(data));
     json_object_object_add(data, "route_decisions", route_build_decisions(data));
+    {
+        struct jmx_route_mark_runtime_status mrs;
+
+        if (jmx_route_mark_runtime_status(&mrs) == 0) {
+            struct json_object *mr = json_object_new_object();
+
+            json_object_object_add(mr, "active",
+                                   json_object_new_boolean(mrs.active != 0));
+            json_object_object_add(mr, "supported",
+                                   json_object_new_boolean(mrs.supported != 0));
+            json_object_object_add(mr, "dumping",
+                                   json_object_new_boolean(mrs.dumping != 0));
+            json_object_object_add(mr, "resync_needed",
+                                   json_object_new_boolean(mrs.resync_needed != 0));
+            json_object_object_add(mr, "overflow",
+                                   json_object_new_boolean(mrs.overflow != 0));
+            json_object_object_add(mr, "missing_id",
+                                   json_object_new_int(mrs.missing_id));
+            json_object_object_add(mr, "events_upsert",
+                json_object_new_int64((int64_t)mrs.events_upsert));
+            json_object_object_add(mr, "events_destroy",
+                json_object_new_int64((int64_t)mrs.events_destroy));
+            json_object_object_add(mr, "events_error",
+                json_object_new_int64((int64_t)mrs.events_error));
+            json_object_object_add(mr, "enobufs",
+                json_object_new_int64((int64_t)mrs.enobufs));
+            json_object_object_add(mr, "dumps",
+                json_object_new_int64((int64_t)mrs.dumps));
+            json_object_object_add(mr, "dump_entries",
+                json_object_new_int64((int64_t)mrs.dump_entries));
+            json_object_object_add(mr, "last_full_sync",
+                mrs.last_full_sync > 0 ?
+                json_object_new_int64((int64_t)mrs.last_full_sync) :
+                json_object_new_null());
+            json_object_object_add(mr, "updated_at",
+                json_object_new_int64((int64_t)mrs.updated_at));
+            json_object_object_add(data, "mark_runtime", mr);
+        }
+    }
 }
 
 static struct json_object *route_parse_proc_status(FILE *fp)
@@ -3255,6 +4318,7 @@ static struct json_object *route_parse_proc_status(FILE *fp)
     struct json_object *rules = json_object_new_array();
     char line[512];
     int section = 0;
+    int rule_enhancements_column = 0;
 
     json_object_object_add(data, "available", json_object_new_boolean(1));
     json_object_object_add(data, "wans", wans);
@@ -3263,6 +4327,18 @@ static struct json_object *route_parse_proc_status(FILE *fp)
     while (fgets(line, sizeof(line), fp)) {
         char *p = line;
         p[strcspn(p, "\n")] = 0;
+        if (!strncmp(p, "RouteRuleAbi:", 13)) {
+            unsigned abi = 0, enhancements = 0;
+
+            if (sscanf(p, "RouteRuleAbi: %u enhancements: %x", &abi,
+                       &enhancements) >= 1) {
+                json_object_object_add(data, "route_rule_abi",
+                                       json_object_new_int((int)abi));
+                json_object_object_add(data, "route_rule_enhancements",
+                                       json_object_new_int64((int64_t)enhancements));
+            }
+            continue;
+        }
         if (!strncmp(p, "CarrierPrefixes:", 16)) {
             unsigned carrier_prefix_count = 0;
             if (sscanf(p, "CarrierPrefixes: %u", &carrier_prefix_count) == 1)
@@ -3271,18 +4347,42 @@ static struct json_object *route_parse_proc_status(FILE *fp)
         }
         if (strcmp(p, "WANs:") == 0) { section = 1; continue; }
         if (strcmp(p, "Rules:") == 0) { section = 2; continue; }
-        if (p[0] == '\0' || !strncmp(p, "id ", 3) || !strncmp(p, "prio ", 5))
+        if (!strncmp(p, "prio ", 5)) {
+            rule_enhancements_column = strstr(p, "enhancements") != NULL;
+            continue;
+        }
+        if (p[0] == '\0' || !strncmp(p, "id ", 3))
             continue;
 
         if (section == 1) {
-            unsigned id, table, health, weight = 1, generation = 0;
+            unsigned id, table, health, weight = 1, adaptive_weight = 100;
+            unsigned generation = 0, rebind_mode = 0, rebind_pending = 0;
             unsigned long long active_conn = 0, rx_bytes = 0;
+            unsigned long long rebind_requested = 0, rebind_killed = 0;
+            unsigned long long rebind_sensitive = 0, rebind_at = 0;
             char name[32], fwmark[32], gateway[64];
-            int n = sscanf(p, "%u %31s %31s %u %63s %u %u %llu %llu %u",
+            int n = sscanf(p,
+                           "%u %31s %31s %u %63s %u %u %u %llu %llu %u "
+                           "%llu %llu %llu %u %llu %u",
+                           &id, name, fwmark, &table, gateway, &health, &weight,
+                           &adaptive_weight, &active_conn, &rx_bytes, &generation,
+                           &rebind_requested, &rebind_killed, &rebind_sensitive,
+                           &rebind_mode, &rebind_at, &rebind_pending);
+
+            if (n != 17) {
+                rebind_requested = rebind_killed = rebind_sensitive = rebind_at = 0;
+                rebind_mode = rebind_pending = 0;
+                n = sscanf(p, "%u %31s %31s %u %63s %u %u %u %llu %llu %u",
+                           &id, name, fwmark, &table, gateway, &health, &weight,
+                           &adaptive_weight, &active_conn, &rx_bytes, &generation);
+            }
+            if (n != 17 && n != 11) {
+                adaptive_weight = 100;
+                n = sscanf(p, "%u %31s %31s %u %63s %u %u %llu %llu %u",
                            &id, name, fwmark, &table, gateway, &health, &weight,
                            &active_conn, &rx_bytes, &generation);
-
-            if (n == 10 || n == 6) {
+            }
+            if (n == 17 || n == 11 || n == 10 || n == 6) {
                 struct json_object *o = json_object_new_object();
                 json_object_object_add(o, "id", json_object_new_int((int)id));
                 json_object_object_add(o, "name", json_object_new_string(name));
@@ -3291,19 +4391,41 @@ static struct json_object *route_parse_proc_status(FILE *fp)
                 json_object_object_add(o, "gateway", json_object_new_string(gateway));
                 json_object_object_add(o, "health", json_object_new_boolean(health != 0));
                 json_object_object_add(o, "weight", json_object_new_int64((int64_t)weight));
+                json_object_object_add(o, "adaptive_weight",
+                                       json_object_new_int64((int64_t)adaptive_weight));
                 json_object_object_add(o, "active_conn", json_object_new_int64((int64_t)active_conn));
                 json_object_object_add(o, "rx_bytes", json_object_new_int64((int64_t)rx_bytes));
                 json_object_object_add(o, "generation", json_object_new_int64((int64_t)generation));
+                json_object_object_add(o, "rebind_requested",
+                                       json_object_new_int64((int64_t)rebind_requested));
+                json_object_object_add(o, "rebind_killed",
+                                       json_object_new_int64((int64_t)rebind_killed));
+                json_object_object_add(o, "rebind_sensitive_skipped",
+                                       json_object_new_int64((int64_t)rebind_sensitive));
+                json_object_object_add(o, "rebind_last_mode",
+                                       json_object_new_int((int)rebind_mode));
+                json_object_object_add(o, "rebind_last_at",
+                                       json_object_new_int64((int64_t)rebind_at));
+                json_object_object_add(o, "rebind_pending_mode",
+                                       json_object_new_int((int)rebind_pending));
                 json_object_array_add(wans, o);
             }
         } else if (section == 2) {
             unsigned prio, en, proto, appid, carrier, dport, mode;
             unsigned long long hits = 0;
             unsigned long last_hit_s = 0;
-            char src[64], dst[64], wans_buf[128] = {0};
-            int n = sscanf(p, "%u %u %u %u %u %63s %63s %u %u %llu %lu %127s",
+            unsigned enhancements = 0;
+            char src[64], dst[64], members_buf[192] = {0};
+            int n;
+
+            if (rule_enhancements_column)
+                n = sscanf(p, "%u %u %u %u %u %63s %63s %u %u %llu %lu %x %127s",
                            &prio, &en, &proto, &appid, &carrier, src, dst, &dport, &mode,
-                           &hits, &last_hit_s, wans_buf);
+                           &hits, &last_hit_s, &enhancements, members_buf);
+            else
+                n = sscanf(p, "%u %u %u %u %u %63s %63s %u %u %llu %lu %127s",
+                           &prio, &en, &proto, &appid, &carrier, src, dst, &dport, &mode,
+                           &hits, &last_hit_s, members_buf);
             if (n >= 9) {
                 struct json_object *o = json_object_new_object();
                 json_object_object_add(o, "prio", json_object_new_int((int)prio));
@@ -3315,10 +4437,43 @@ static struct json_object *route_parse_proc_status(FILE *fp)
                 json_object_object_add(o, "dst", json_object_new_string(dst));
                 json_object_object_add(o, "dst_port", json_object_new_int((int)dport));
                 json_object_object_add(o, "sticky_mode", json_object_new_int((int)mode));
+                json_object_object_add(o, "enhancements",
+                                       json_object_new_int64((int64_t)enhancements));
                 json_object_object_add(o, "hit_count", json_object_new_int64((int64_t)hits));
                 json_object_object_add(o, "last_hit_seconds_ago", json_object_new_int64((int64_t)last_hit_s));
-                if (n >= 12)
-                    json_object_object_add(o, "wan_ids", json_object_new_string(wans_buf));
+                if (n >= 12) {
+                    char ids_buf[128] = "";
+                    char weights_buf[128] = "";
+                    char parse_buf[192];
+                    char *save = NULL;
+                    char *token;
+                    size_t ids_off = 0, weights_off = 0;
+                    int first = 1;
+
+                    snprintf(parse_buf, sizeof(parse_buf), "%s", members_buf);
+                    for (token = strtok_r(parse_buf, ",", &save); token;
+                         token = strtok_r(NULL, ",", &save)) {
+                        char *colon = strchr(token, ':');
+                        unsigned id;
+                        unsigned weight = 0;
+
+                        if (colon) {
+                            *colon++ = '\0';
+                            weight = (unsigned)strtoul(colon, NULL, 10);
+                        }
+                        id = (unsigned)strtoul(token, NULL, 10);
+                        ids_off += snprintf(ids_buf + ids_off,
+                                            sizeof(ids_buf) - ids_off,
+                                            "%s%u", first ? "" : ",", id);
+                        weights_off += snprintf(weights_buf + weights_off,
+                                                sizeof(weights_buf) - weights_off,
+                                                "%s%u", first ? "" : ",", weight);
+                        first = 0;
+                    }
+                    json_object_object_add(o, "wan_ids", json_object_new_string(ids_buf));
+                    json_object_object_add(o, "wan_weights",
+                                           json_object_new_string(weights_buf));
+                }
                 json_object_array_add(rules, o);
             }
         }
@@ -3364,6 +4519,62 @@ fail:
     return -1;
 }
 
+/* ROUTE_ADD_V2 has no request/response netlink acknowledgement.  The module
+ * advertises the versioned ABI in procfs, so verify it before a config sync
+ * changes any live route state.  An older module must never receive the 96-byte
+ * payload: it has no action 44 and would silently leave the enhancement absent. */
+static int route_kernel_rule_v2_supported(uint32_t *enhancements_out)
+{
+    struct json_object *data = NULL;
+    struct json_object *value = NULL;
+    FILE *fp;
+    int supported = 0;
+    uint32_t enhancements = 0;
+
+    if (enhancements_out)
+        *enhancements_out = 0;
+    fp = jmx_fopen_af("jmx_route", "r");
+    if (!fp)
+        return 0;
+    data = route_parse_proc_status(fp);
+    fclose(fp);
+    if (!data)
+        return 0;
+    if (json_object_object_get_ex(data, "route_rule_enhancements", &value))
+        enhancements = (uint32_t)json_object_get_int64(value);
+    if (enhancements_out)
+        *enhancements_out = enhancements;
+    if (json_object_object_get_ex(data, "route_rule_abi", &value) &&
+        json_object_get_int(value) >= 2 &&
+        (enhancements & JMX_ROUTE_ENHANCEMENT_ADAPTIVE_PENALTY))
+        supported = 1;
+    json_object_put(data);
+    return supported;
+}
+
+static int route_config_requires_rule_v2(struct json_object *config)
+{
+    struct json_object *rules = NULL;
+    int i;
+
+    if (!config || !json_object_object_get_ex(config, "rules", &rules) ||
+        !json_object_is_type(rules, json_type_array))
+        return 0;
+    for (i = 0; i < (int)json_object_array_length(rules); i++) {
+        struct json_object *rule = json_object_array_get_idx(rules, i);
+
+        if (!json_get_u32(rule, "enabled", 1) ||
+            !json_get_u32(rule, "adaptive_penalty_sticky", 0))
+            continue;
+        /* Legacy mode 9 retains its exact historic dataplane behaviour when the
+         * device has not installed an ABI-v2 kernel yet.  Every canonical
+         * base-mode + enhancement combination requires v2. */
+        if (!json_get_u32(rule, "migration_required", 0))
+            return 1;
+    }
+    return 0;
+}
+
 
 struct json_object *jmx_api_route_rule_clear_hits(struct json_object *req_obj)
 {
@@ -3401,6 +4612,16 @@ struct json_object *jmx_api_route_config_get(struct json_object *req_obj)
         "hash_src_dst_dport,hash_src_dst,weighted_new_flow_rr,least_rx_load_normalized,least_active_conn_normalized,hash_src,hash_src_sport"));
     json_object_object_add(capabilities, "weighted_members", json_object_new_boolean(1));
     json_object_object_add(capabilities, "all_down_actions", json_object_new_string("main_route"));
+    /* The switch is discoverable, so the UI does not have to hardcode the value
+     * set. per_rule reads each rule's reinstate_dangling flag, which is why that
+     * field is exported on every rule regardless of the active policy. */
+    json_object_object_add(capabilities, "dangling_wan_policies",
+                           json_object_new_string(
+                               "reinstate_registered,keep_excluded,per_rule"));
+    json_object_object_add(capabilities, "dangling_wan_policy_default",
+                           json_object_new_string("reinstate_registered"));
+    json_object_object_add(capabilities, "dangling_wan_policy_scope",
+                           json_object_new_string("global+per_rule"));
     json_object_object_add(capabilities, "ipv6_multiwan",
                            json_object_new_boolean(route_ipv6_multiwan_active()));
     json_object_object_add(capabilities, "config_authority",
@@ -3444,6 +4665,10 @@ struct json_object *jmx_api_route_config_set(struct json_object *req_obj)
     struct json_object *readback = NULL;
     struct json_object *data = NULL;
     char error[160] = "";
+    const char *failure_stage = "config_validation";
+    int rollback_attempted = 0;
+    int route_rollback_ok = 1;
+    int weights_enforced = 1;
     int saved_errno;
 
     if (jmx_route_db_replace_begin(req_obj, &tx, &previous, &readback,
@@ -3451,17 +4676,37 @@ struct json_object *jmx_api_route_config_set(struct json_object *req_obj)
         goto fail;
     if (jmx_route_sync_json(readback) != 0) {
         saved_errno = errno ? errno : EIO;
+        failure_stage = "runtime_apply";
         jmx_route_db_replace_rollback(tx);
         tx = NULL;
-        if (previous && jmx_route_sync_json(previous) != 0)
+        rollback_attempted = 1;
+        route_rollback_ok = previous && jmx_route_sync_json(previous) == 0;
+        if (!route_rollback_ok)
             LOG_ERROR("jmx_route: failed to restore runtime after DB apply failure");
         errno = saved_errno;
         snprintf(error, sizeof(error), "%s", "runtime apply/readback failed");
         goto fail;
     }
+    if (route_policy_kernel_readback_matches(readback, 0, 1,
+                                             &weights_enforced,
+                                             error, sizeof(error)) != 0) {
+        saved_errno = errno ? errno : EIO;
+        failure_stage = "kernel_readback";
+        jmx_route_db_replace_rollback(tx);
+        tx = NULL;
+        rollback_attempted = 1;
+        route_rollback_ok = previous && jmx_route_sync_json(previous) == 0;
+        if (!route_rollback_ok)
+            LOG_ERROR("jmx_route: failed to restore runtime after rule readback mismatch");
+        errno = saved_errno;
+        goto fail;
+    }
     if (jmx_route_db_replace_commit(tx) != 0) {
         tx = NULL;
-        if (previous && jmx_route_sync_json(previous) != 0)
+        failure_stage = "persistence_commit";
+        rollback_attempted = 1;
+        route_rollback_ok = previous && jmx_route_sync_json(previous) == 0;
+        if (!route_rollback_ok)
             LOG_ERROR("jmx_route: failed to restore runtime after DB commit failure");
         snprintf(error, sizeof(error), "%s", "config.db commit failed");
         goto fail;
@@ -3473,6 +4718,17 @@ struct json_object *jmx_api_route_config_set(struct json_object *req_obj)
     json_object_object_add(data, "config_authority",
                            json_object_new_string("config.db"));
     json_object_object_add(data, "runtime_applied", json_object_new_boolean(1));
+    /*
+     * The persisted ratio (weight_ratio) is always authoritative; whether the
+     * kernel enforces it per-flow depends on the loaded jmx.ko.  Surface both
+     * so the UI never claims data-plane weighting that the module cannot do.
+     */
+    json_object_object_add(data, "weight_runtime_enforced",
+                           json_object_new_boolean(weights_enforced));
+    json_object_object_add(data, "weight_runtime_reason",
+                           json_object_new_string(weights_enforced ?
+                               "kernel_reports_per_member_weights" :
+                               "kernel_module_ids_only_weight_ratio_configured_not_enforced"));
     if (previous)
         json_object_put(previous);
     return route_json_ok(data);
@@ -3492,6 +4748,20 @@ fail:
         error[0] ? error : strerror(saved_errno)));
     json_object_object_add(data, "config_authority",
                            json_object_new_string("config.db"));
+    json_object_object_add(data, "failure_stage",
+                           json_object_new_string(failure_stage));
+    json_object_object_add(data, "rollback_attempted",
+                           json_object_new_boolean(rollback_attempted));
+    json_object_object_add(data, "route_rollback_ok",
+                           json_object_new_boolean(route_rollback_ok));
+    json_object_object_add(data, "runtime_reason", json_object_new_string(
+        route_rollback_ok ?
+        (rollback_attempted ? "previous_config_restored" :
+                              "request_rejected_before_apply") :
+        "previous_config_restore_failed"));
+    if (rollback_attempted)
+        dw_report_config_commit_failed("route_config", "", failure_stage,
+                                       route_rollback_ok);
     errno = saved_errno;
     return jmx_gen_api_response_data(API_CODE_ERROR, data);
 }
@@ -3555,7 +4825,11 @@ static int route_policy_apply_rule(int fd, struct json_object *rule)
     struct jmx_route_rule_wire wire;
     int i;
 
-    route_rule_from_json(rule, &wire, (int)json_get_u32(rule, "prio", 1000));
+    uint32_t enhancements = 0;
+    int v2_supported = route_kernel_rule_v2_supported(NULL);
+
+    route_rule_from_json(rule, &wire, (int)json_get_u32(rule, "prio", 1000),
+                         &enhancements, !v2_supported);
     if (wire.carrier_id != JMX_CARRIER_ANY && wire.wan_count == 0) {
         for (i = 1; i <= JMX_ROUTE_MAX_WAN_IFACES &&
                     wire.wan_count < JMX_ROUTE_MAX_WAN_IFACES; i++) {
@@ -3564,9 +4838,486 @@ static int route_policy_apply_rule(int fd, struct json_object *rule)
         }
     }
     if (!wire.enabled || wire.wan_count == 0 ||
-        wire.sticky_mode > JMX_STICKY_CONN_CNT)
+        wire.sticky_mode > JMX_STICKY_MAX)
         return -1;
+    if (enhancements) {
+        if (!v2_supported) {
+            errno = EOPNOTSUPP;
+            return -1;
+        }
+        return jmx_route_nl_rule_add_v2(fd, &wire, enhancements);
+    }
     return jmx_route_nl_rule_add(fd, &wire);
+}
+
+static struct json_object *route_policy_find_wan(struct json_object *wans,
+                                                 uint8_t id)
+{
+    int i;
+
+    if (!wans || !json_object_is_type(wans, json_type_array) || !id)
+        return NULL;
+    for (i = 0; i < json_object_array_length(wans); i++) {
+        struct json_object *wan = json_object_array_get_idx(wans, i);
+
+        if ((uint8_t)json_get_u32(wan, "id", 0) == id)
+            return wan;
+    }
+    return NULL;
+}
+
+static struct uci_section *route_policy_find_network_wan(struct uci_package *pkg,
+                                                         const char *name)
+{
+    struct uci_element *e;
+
+    if (!pkg || !name || !name[0])
+        return NULL;
+    uci_foreach_element(&pkg->sections, e) {
+        struct uci_section *s = uci_to_section(e);
+
+        if (s && !strcmp(s->type, "interface") && !strcmp(s->e.name, name))
+            return s;
+    }
+    return NULL;
+}
+
+/*
+ * route_wan is the configuration authority, but older installations can have
+ * live UCI WANs which were registered into the kernel by the runtime top-up and
+ * never written into that ledger.  A policy request naming one of those lines
+ * used to be accepted and then canonicalized back out as dangling.  Admit only
+ * WAN ids the kernel already knows, and materialize the same line into the
+ * transaction so database and runtime membership can converge atomically.
+ */
+static int route_policy_materialize_requested_wans(struct json_object *config,
+                                                   struct json_object *requested_ids,
+                                                   char *error, size_t error_len)
+{
+    struct json_object *configured_wans = NULL;
+    struct json_object *runtime = NULL;
+    struct json_object *runtime_wans = NULL;
+    struct uci_context *ctx = NULL;
+    struct uci_package *pkg = NULL;
+    FILE *fp = NULL;
+    int i;
+    int rc = -1;
+
+    if (!config || !requested_ids ||
+        !json_object_object_get_ex(config, "wans", &configured_wans) ||
+        !json_object_is_type(configured_wans, json_type_array)) {
+        snprintf(error, error_len, "%s", "route WAN authority is unavailable");
+        errno = EIO;
+        return -1;
+    }
+    fp = jmx_fopen_af("jmx_route", "r");
+    if (!fp) {
+        snprintf(error, error_len, "%s", "kernel WAN readback is unavailable");
+        errno = EIO;
+        return -1;
+    }
+    runtime = route_parse_proc_status(fp);
+    fclose(fp);
+    fp = NULL;
+    if (!runtime ||
+        !json_object_object_get_ex(runtime, "wans", &runtime_wans) ||
+        !json_object_is_type(runtime_wans, json_type_array)) {
+        snprintf(error, error_len, "%s", "kernel WAN inventory is unavailable");
+        errno = EIO;
+        goto out;
+    }
+    ctx = uci_alloc_context();
+    if (ctx && uci_load(ctx, "network", &pkg) != UCI_OK)
+        pkg = NULL;
+
+    for (i = 0; i < json_object_array_length(requested_ids); i++) {
+        uint8_t id = (uint8_t)json_object_get_int(
+            json_object_array_get_idx(requested_ids, i));
+        struct json_object *live;
+        struct json_object *wan;
+        struct uci_section *section;
+        const char *name;
+        const char *value;
+        const char *gateway;
+        char ifname[JMX_ROUTE_HEALTH_IFNAME_LEN] = "";
+
+        if (route_policy_find_wan(configured_wans, id))
+            continue;
+        live = route_policy_find_wan(runtime_wans, id);
+        if (!live) {
+            snprintf(error, error_len,
+                     "requested WAN id %u is not registered in the kernel", id);
+            errno = ENODEV;
+            goto out;
+        }
+        name = json_get_str(live, "name", "");
+        if (!name[0]) {
+            snprintf(error, error_len,
+                     "requested WAN id %u has no runtime identity", id);
+            errno = EIO;
+            goto out;
+        }
+        section = route_policy_find_network_wan(pkg, name);
+        if (route_l3_device_from_ifstatus(name, ifname, sizeof(ifname)) != 0 &&
+            section)
+            route_health_probe_ifname(section, ifname, sizeof(ifname));
+
+        wan = json_object_new_object();
+        if (!wan) {
+            errno = ENOMEM;
+            goto out;
+        }
+        json_object_object_add(wan, "id", json_object_new_int(id));
+        json_object_object_add(wan, "name", json_object_new_string(name));
+        if (ifname[0])
+            json_object_object_add(wan, "ifname", json_object_new_string(ifname));
+        json_object_object_add(wan, "fwmark", json_object_new_string(
+            json_get_str(live, "fwmark", "")));
+        json_object_object_add(wan, "table", json_object_new_int(
+            (int)json_get_u32(live, "table", 100U + id)));
+        gateway = json_get_str(live, "gateway", "");
+        if (route_ipv4_from_string(gateway, UINT32_MAX) != UINT32_MAX)
+            json_object_object_add(wan, "gateway", json_object_new_string(gateway));
+        json_object_object_add(wan, "health", json_object_new_int(
+            json_get_u32(live, "health", 1) ? 1 : 0));
+        json_object_object_add(wan, "weight", json_object_new_int64(
+            (int64_t)json_get_u32(live, "weight", 1)));
+        json_object_object_add(wan, "check_enable", json_object_new_int(
+            section ? (int)parse_u32_opt(section, "check_enable", 1) : 1));
+        json_object_object_add(wan, "failover", json_object_new_int(
+            section ? (int)parse_u32_opt(section, "failover", 1) : 1));
+        json_object_object_add(wan, "failback", json_object_new_int(
+            section ? (int)parse_u32_opt(section, "failback", 1) : 1));
+        json_object_object_add(wan, "fail_threshold", json_object_new_int(
+            section ? (int)parse_u32_opt(section, "fail_threshold", 2) : 2));
+        json_object_object_add(wan, "recover_threshold", json_object_new_int(
+            section ? (int)parse_u32_opt(section, "recover_threshold", 6) : 6));
+        value = section ? uci_opt(section, "health_mode") : NULL;
+        if (value && value[0])
+            json_object_object_add(wan, "health_mode", json_object_new_string(value));
+        value = section ? uci_opt(section, "check_host") : NULL;
+        if (value && value[0])
+            json_object_object_add(wan, "check_host", json_object_new_string(value));
+        value = section ? uci_opt(section, "check_url") : NULL;
+        if (value && value[0])
+            json_object_object_add(wan, "check_url", json_object_new_string(value));
+        json_object_array_add(configured_wans, wan);
+    }
+    rc = 0;
+out:
+    if (pkg)
+        uci_unload(ctx, pkg);
+    if (ctx)
+        uci_free_context(ctx);
+    if (runtime)
+        json_object_put(runtime);
+    return rc;
+}
+
+static int route_policy_runtime_members(const char *ids_text,
+                                        const char *weights_text,
+                                        uint8_t seen[256],
+                                        uint32_t weights[256],
+                                        int *count,
+                                        int *weights_reported)
+{
+    char ids_buffer[128];
+    char weights_buffer[128];
+    char *id_token;
+    char *weight_token;
+    char *id_save = NULL;
+    char *weight_save = NULL;
+
+    if (weights_reported)
+        *weights_reported = 0;
+    if (!ids_text || !weights_text || !seen || !weights || !count ||
+        strlen(ids_text) >= sizeof(ids_buffer) ||
+        strlen(weights_text) >= sizeof(weights_buffer))
+        return -1;
+    memset(seen, 0, 256);
+    memset(weights, 0, 256 * sizeof(weights[0]));
+    *count = 0;
+    snprintf(ids_buffer, sizeof(ids_buffer), "%s", ids_text);
+    snprintf(weights_buffer, sizeof(weights_buffer), "%s", weights_text);
+    id_token = strtok_r(ids_buffer, ",", &id_save);
+    weight_token = strtok_r(weights_buffer, ",", &weight_save);
+    while (id_token && weight_token) {
+        char *id_end = NULL;
+        char *weight_end = NULL;
+        unsigned long id;
+        unsigned long weight;
+
+        errno = 0;
+        id = strtoul(id_token, &id_end, 10);
+        if (errno || id_end == id_token || *id_end || id == 0 ||
+            id > UINT8_MAX || seen[id])
+            return -1;
+        errno = 0;
+        weight = strtoul(weight_token, &weight_end, 10);
+        /*
+         * A weight of 0 is how an older kernel that predates per-member
+         * weights reports this line: jmx_route's /proc printed only ids, so
+         * route_parse_proc_status() fills the parallel weights column with 0.
+         * Treat that as "member present, weight not runtime-enforced" instead
+         * of a malformed line, and let the caller decide whether the weight
+         * ratio can be verified.  A weight-aware kernel always prints >= 1.
+         */
+        if (errno || weight_end == weight_token || *weight_end ||
+            weight > UINT32_MAX)
+            return -1;
+        if (weight > 0 && weights_reported)
+            *weights_reported = 1;
+        seen[id] = 1;
+        weights[id] = (uint32_t)weight;
+        (*count)++;
+        id_token = strtok_r(NULL, ",", &id_save);
+        weight_token = strtok_r(NULL, ",", &weight_save);
+    }
+    return *count > 0 && !id_token && !weight_token ? 0 : -1;
+}
+
+static uint32_t route_policy_weight_gcd(const uint8_t seen[256],
+                                        const uint32_t weights[256])
+{
+    uint32_t gcd = 0;
+    int id;
+
+    for (id = 1; id <= UINT8_MAX; id++) {
+        uint32_t a, b;
+
+        if (!seen[id] || !weights[id])
+            continue;
+        a = gcd;
+        b = weights[id];
+        while (b) {
+            uint32_t remainder = a % b;
+            a = b;
+            b = remainder;
+        }
+        gcd = a;
+    }
+    return gcd ? gcd : 1;
+}
+
+static void route_policy_weights_normalize(const uint8_t seen[256],
+                                           uint32_t weights[256])
+{
+    uint32_t gcd = route_policy_weight_gcd(seen, weights);
+    int id;
+
+    for (id = 1; id <= UINT8_MAX; id++)
+        if (seen[id] && weights[id])
+            weights[id] /= gcd;
+}
+
+static int route_policy_kernel_readback_matches(struct json_object *config,
+                                                int carrier_neutral,
+                                                int verify_all_rules,
+                                                int *weights_enforced,
+                                                char *error, size_t error_len)
+{
+    struct json_object *rules = NULL;
+    struct json_object *runtime = NULL;
+    struct json_object *runtime_rules = NULL;
+    FILE *fp;
+    int i;
+    int rc = -1;
+
+    if (weights_enforced)
+        *weights_enforced = 1;
+    fp = jmx_fopen_af("jmx_route", "r");
+    if (!fp) {
+        snprintf(error, error_len, "%s", "kernel policy readback is unavailable");
+        errno = EIO;
+        return -1;
+    }
+    runtime = route_parse_proc_status(fp);
+    fclose(fp);
+    if (!runtime || !json_object_object_get_ex(runtime, "rules", &runtime_rules) ||
+        !json_object_is_type(runtime_rules, json_type_array) ||
+        !json_object_object_get_ex(config, "rules", &rules) ||
+        !json_object_is_type(rules, json_type_array)) {
+        snprintf(error, error_len, "%s", "kernel policy readback is malformed");
+        errno = EIO;
+        goto out;
+    }
+    for (i = 0; i < json_object_array_length(rules); i++) {
+        struct json_object *rule = json_object_array_get_idx(rules, i);
+        struct json_object *actual = NULL;
+        struct json_object *ids = NULL;
+        struct json_object *members = NULL;
+        uint8_t expected_seen[256] = {0};
+        uint8_t actual_seen[256] = {0};
+        uint32_t expected_weights[256] = {0};
+        uint32_t actual_weights[256] = {0};
+        int expected_count = 0;
+        int actual_count = 0;
+        int expected_present;
+        uint16_t prio;
+        int j;
+
+        if (!verify_all_rules && !route_policy_rule_eligible(rule) &&
+            !(carrier_neutral && route_policy_auto_carrier_rule(rule)))
+            continue;
+        prio = (uint16_t)json_get_u32(rule, "prio", 0);
+        expected_present = json_get_u32(rule, "enabled", 1) &&
+                           (verify_all_rules || route_policy_rule_eligible(rule));
+        for (j = 0; j < json_object_array_length(runtime_rules); j++) {
+            struct json_object *candidate = json_object_array_get_idx(runtime_rules, j);
+
+            if ((uint16_t)json_get_u32(candidate, "prio", 0) == prio) {
+                actual = candidate;
+                break;
+            }
+        }
+        if (!expected_present) {
+            if (actual) {
+                snprintf(error, error_len,
+                         "kernel policy readback retained disabled rule prio=%u", prio);
+                errno = EIO;
+                goto out;
+            }
+            continue;
+        }
+        if (!actual) {
+            snprintf(error, error_len,
+                     "kernel policy readback missing rule prio=%u", prio);
+            errno = EIO;
+            goto out;
+        }
+        {
+            uint8_t expected_mode = sticky_mode_from_string(json_get_str(
+                rule, "base_mode", json_get_str(
+                    rule, "algorithm", json_get_str(rule, "sticky_mode", "hash_src"))));
+            int v2_supported = route_kernel_rule_v2_supported(NULL);
+            uint32_t expected_enhancements = json_get_u32(
+                rule, "adaptive_penalty_sticky", 0) && v2_supported ?
+                JMX_ROUTE_ENHANCEMENT_ADAPTIVE_PENALTY : 0;
+
+            if (!v2_supported && json_get_u32(rule, "migration_required", 0) &&
+                json_get_u32(rule, "adaptive_penalty_sticky", 0))
+                expected_mode = JMX_STICKY_ADAPTIVE_PENALTY;
+            if ((uint8_t)json_get_u32(actual, "sticky_mode", UINT8_MAX) !=
+                expected_mode) {
+                snprintf(error, error_len,
+                         "kernel policy mode mismatch at prio=%u", prio);
+                errno = EIO;
+                goto out;
+            }
+            if ((uint32_t)json_get_u32(actual, "enhancements", 0) !=
+                expected_enhancements) {
+                snprintf(error, error_len,
+                         "kernel policy enhancement mismatch at prio=%u", prio);
+                errno = EIO;
+                goto out;
+            }
+        }
+        if ((uint8_t)json_get_u32(actual, "carrier_id", UINT8_MAX) !=
+            carrier_from_string(json_get_str(rule, "carrier", "any"))) {
+            snprintf(error, error_len,
+                     "kernel policy carrier mismatch at prio=%u", prio);
+            errno = EIO;
+            goto out;
+        }
+        if (!json_object_object_get_ex(rule, "wan_ids", &ids) ||
+            !json_object_is_type(ids, json_type_array)) {
+            snprintf(error, error_len,
+                     "configured policy members missing at prio=%u", prio);
+            errno = EIO;
+            goto out;
+        }
+        for (j = 0; j < json_object_array_length(ids); j++) {
+            int id = json_object_get_int(json_object_array_get_idx(ids, j));
+
+            if (id <= 0 || id > UINT8_MAX || expected_seen[id]) {
+                snprintf(error, error_len,
+                         "configured policy members invalid at prio=%u", prio);
+                errno = EIO;
+                goto out;
+            }
+            expected_seen[id] = 1;
+            expected_count++;
+        }
+        if (expected_count == 0 && verify_all_rules &&
+            carrier_from_string(json_get_str(rule, "carrier", "any")) !=
+                JMX_CARRIER_ANY) {
+            if (route_policy_runtime_members(json_get_str(actual, "wan_ids", ""),
+                                             json_get_str(actual, "wan_weights", ""),
+                                             actual_seen, actual_weights,
+                                             &actual_count, NULL) != 0) {
+                snprintf(error, error_len,
+                         "kernel auto-carrier policy resolved no members at prio=%u",
+                         prio);
+                errno = EIO;
+                goto out;
+            }
+            continue;
+        }
+        if (!json_object_object_get_ex(rule, "members", &members) ||
+            !json_object_is_type(members, json_type_array) ||
+            json_object_array_length(members) != expected_count) {
+            snprintf(error, error_len,
+                     "configured policy weights missing at prio=%u", prio);
+            errno = EIO;
+            goto out;
+        }
+        for (j = 0; j < json_object_array_length(members); j++) {
+            struct json_object *member = json_object_array_get_idx(members, j);
+            int id = (int)json_get_u32(member, "wan_id", 0);
+            uint32_t weight = json_get_u32(member, "weight", 0);
+
+            if (id <= 0 || id > UINT8_MAX || !expected_seen[id] || !weight) {
+                snprintf(error, error_len,
+                         "configured policy weights invalid at prio=%u", prio);
+                errno = EIO;
+                goto out;
+            }
+            expected_weights[id] = weight;
+        }
+        {
+            int rule_weights_reported = 0;
+
+            if (route_policy_runtime_members(json_get_str(actual, "wan_ids", ""),
+                                             json_get_str(actual, "wan_weights", ""),
+                                             actual_seen, actual_weights,
+                                             &actual_count,
+                                             &rule_weights_reported) != 0 ||
+                actual_count != expected_count ||
+                memcmp(actual_seen, expected_seen, sizeof(actual_seen)) != 0) {
+                snprintf(error, error_len,
+                         "kernel policy member weight mismatch at prio=%u", prio);
+                errno = EIO;
+                goto out;
+            }
+            /*
+             * The kernel membership (ids) must always agree.  Whether the
+             * *ratio* is enforced in the data plane depends on the loaded
+             * jmx.ko: a weight-aware module prints per-member weights and we
+             * compare the reduced ratio; an older module prints ids only, so
+             * weights read back as 0.  In that case the ids are enforced but
+             * the ratio is not, and we report weights_enforced=0 to the caller
+             * rather than failing an otherwise-correct policy.
+             */
+            if (rule_weights_reported) {
+                route_policy_weights_normalize(expected_seen, expected_weights);
+                route_policy_weights_normalize(actual_seen, actual_weights);
+                if (memcmp(actual_weights, expected_weights, sizeof(actual_weights)) != 0) {
+                    snprintf(error, error_len,
+                             "kernel policy member weight mismatch at prio=%u",
+                             prio);
+                    errno = EIO;
+                    goto out;
+                }
+            } else if (weights_enforced) {
+                *weights_enforced = 0;
+            }
+        }
+    }
+    rc = 0;
+out:
+    if (runtime)
+        json_object_put(runtime);
+    return rc;
 }
 
 struct json_object *jmx_api_route_policy_set(struct json_object *req_obj)
@@ -3577,9 +5328,14 @@ struct json_object *jmx_api_route_policy_set(struct json_object *req_obj)
     struct json_object *readback = NULL;
     struct jmx_route_db_tx *tx = NULL;
     struct json_object *mode_obj = NULL;
+    struct json_object *base_mode_obj = NULL;
+    struct json_object *legacy_mode_obj = NULL;
     struct json_object *requested_ids = NULL;
+    struct json_object *requested_members = NULL;
     const char *mode_name = NULL;
     const char *algorithm;
+    int enable_adaptive = -1;
+    int legacy_adaptive_request = 0;
     char error[160] = "";
     int mode;
     int fd = -1;
@@ -3587,22 +5343,80 @@ struct json_object *jmx_api_route_policy_set(struct json_object *req_obj)
     int changed = 0;
     int disabled_carrier_rules = 0;
     int carrier_neutral = 0;
+    int weights_enforced = 1;
 
     if (!req_obj || !json_object_is_type(req_obj, json_type_object)) {
         snprintf(error, sizeof(error), "%s", "request must be an object");
         errno = EINVAL;
         goto fail;
     }
-    if (json_object_object_get_ex(req_obj, "mode", &mode_obj) &&
-        json_object_is_type(mode_obj, json_type_string))
-        mode_name = json_object_get_string(mode_obj);
-    else if (json_object_object_get_ex(req_obj, "algorithm", &mode_obj) &&
-             json_object_is_type(mode_obj, json_type_string))
-        mode_name = json_object_get_string(mode_obj);
+    if (json_object_object_get_ex(req_obj, "base_mode", &base_mode_obj)) {
+        if (!base_mode_obj || !json_object_is_type(base_mode_obj, json_type_string)) {
+            snprintf(error, sizeof(error), "%s", "base_mode must be a string");
+            errno = EINVAL;
+            goto fail;
+        }
+        mode_name = json_object_get_string(base_mode_obj);
+    }
+    if (json_object_object_get_ex(req_obj, "mode", &mode_obj)) {
+        int base_id;
+        int alias_id;
+
+        legacy_mode_obj = mode_obj;
+        if (!mode_obj || !json_object_is_type(mode_obj, json_type_string)) {
+            snprintf(error, sizeof(error), "%s", "mode and algorithm must be strings");
+            errno = EINVAL;
+            goto fail;
+        }
+        if (!mode_name) {
+            mode_name = json_object_get_string(mode_obj);
+        } else {
+            base_id = sticky_mode_from_string(mode_name);
+            alias_id = sticky_mode_from_string(json_object_get_string(mode_obj));
+            if (base_id != alias_id) {
+                snprintf(error, sizeof(error), "%s",
+                         "base_mode_conflict: base_mode, mode, and algorithm must agree");
+                errno = EINVAL;
+                goto fail;
+            }
+        }
+    }
+    if (json_object_object_get_ex(req_obj, "algorithm", &mode_obj)) {
+        int base_id;
+        int alias_id;
+
+        if (!mode_obj || !json_object_is_type(mode_obj, json_type_string)) {
+            snprintf(error, sizeof(error), "%s", "mode and algorithm must be strings");
+            errno = EINVAL;
+            goto fail;
+        }
+        if (!mode_name) {
+            mode_name = json_object_get_string(mode_obj);
+            legacy_mode_obj = mode_obj;
+        } else {
+            base_id = sticky_mode_from_string(mode_name);
+            alias_id = sticky_mode_from_string(json_object_get_string(mode_obj));
+            if (base_id != alias_id) {
+                snprintf(error, sizeof(error), "%s",
+                         "base_mode_conflict: base_mode, mode, and algorithm must agree");
+                errno = EINVAL;
+                goto fail;
+            }
+        }
+    }
     if (!mode_name || !mode_name[0]) {
-        snprintf(error, sizeof(error), "%s", "mode is required");
+        snprintf(error, sizeof(error), "%s", "base_mode is required");
         errno = EINVAL;
         goto fail;
+    }
+    if (json_object_object_get_ex(req_obj, "enable_adaptive_penalty_sticky", &mode_obj)) {
+        if (!mode_obj || !json_object_is_type(mode_obj, json_type_boolean)) {
+            snprintf(error, sizeof(error), "%s",
+                     "enable_adaptive_penalty_sticky must be boolean");
+            errno = EINVAL;
+            goto fail;
+        }
+        enable_adaptive = json_object_get_boolean(mode_obj) ? 1 : 0;
     }
     if (json_object_object_get_ex(req_obj, "carrier_neutral", &mode_obj) && mode_obj &&
         (json_object_is_type(mode_obj, json_type_boolean) ||
@@ -3610,8 +5424,33 @@ struct json_object *jmx_api_route_policy_set(struct json_object *req_obj)
         carrier_neutral = json_object_get_boolean(mode_obj) ? 1 : 0;
     if (!strcmp(mode_name, "load_balance"))
         mode_name = "new_conn";
+    if (!strcmp(mode_name, "adaptive_penalty_sticky")) {
+        if (json_has_key(req_obj, "base_mode")) {
+            snprintf(error, sizeof(error), "%s",
+                     "base_mode_conflict: adaptive_penalty_sticky is an enhancement");
+            errno = EINVAL;
+            goto fail;
+        }
+        mode_name = "weighted_new_flow_rr";
+        if (enable_adaptive >= 0 && !enable_adaptive) {
+            snprintf(error, sizeof(error), "%s",
+                     "base_mode_conflict: legacy adaptive mode conflicts with disabled enhancement");
+            errno = EINVAL;
+            goto fail;
+        }
+        enable_adaptive = 1;
+        legacy_adaptive_request = 1;
+    }
+    if (base_mode_obj && legacy_mode_obj &&
+        sticky_mode_from_string(json_object_get_string(legacy_mode_obj)) ==
+            JMX_STICKY_ADAPTIVE_PENALTY) {
+        snprintf(error, sizeof(error), "%s",
+                 "base_mode_conflict: legacy adaptive mode cannot accompany base_mode");
+        errno = EINVAL;
+        goto fail;
+    }
     mode = sticky_mode_from_string(mode_name);
-    if (mode < 0 || mode > JMX_STICKY_CONN_CNT || mode == JMX_STICKY_5TUPLE) {
+    if (mode < 0 || mode > JMX_STICKY_MAX || mode == JMX_STICKY_5TUPLE) {
         snprintf(error, sizeof(error), "%s", "unsupported WAN policy mode");
         errno = EOPNOTSUPP;
         goto fail;
@@ -3622,7 +5461,41 @@ struct json_object *jmx_api_route_policy_set(struct json_object *req_obj)
         errno = EOPNOTSUPP;
         goto fail;
     }
-    if (json_object_object_get_ex(req_obj, "wan_ids", &requested_ids)) {
+    if (json_object_object_get_ex(req_obj, "members", &requested_members)) {
+        uint8_t seen[JMX_ROUTE_MAX_WAN_IFACES + 1] = {0};
+        int count;
+
+        if (!json_object_is_type(requested_members, json_type_array) ||
+            (count = json_object_array_length(requested_members)) < 2 ||
+            count > JMX_ROUTE_MAX_WAN_IFACES) {
+            snprintf(error, sizeof(error), "%s",
+                     "members must contain 2 to 8 WAN members");
+            errno = EINVAL;
+            goto fail;
+        }
+        requested_ids = json_object_new_array();
+        if (!requested_ids) {
+            errno = ENOMEM;
+            goto fail;
+        }
+        for (i = 0; i < count; i++) {
+            struct json_object *member = json_object_array_get_idx(requested_members, i);
+            int id;
+            uint32_t weight;
+
+            if (!member || !json_object_is_type(member, json_type_object) ||
+                (id = (int)json_get_u32(member, "wan_id", 0)) <= 0 ||
+                id > JMX_ROUTE_MAX_WAN_IFACES || seen[id] ||
+                json_get_weight(member, "weight", 0, &weight) != 0) {
+                snprintf(error, sizeof(error), "%s",
+                         "members contains an invalid, duplicate, or unweighted WAN");
+                errno = EINVAL;
+                goto fail;
+            }
+            seen[id] = 1;
+            json_object_array_add(requested_ids, json_object_new_int(id));
+        }
+    } else if (json_object_object_get_ex(req_obj, "wan_ids", &requested_ids)) {
         uint8_t seen[JMX_ROUTE_MAX_WAN_IFACES + 1] = {0};
         int count;
 
@@ -3654,6 +5527,10 @@ struct json_object *jmx_api_route_policy_set(struct json_object *req_obj)
         errno = EIO;
         goto fail;
     }
+    if (requested_ids &&
+        route_policy_materialize_requested_wans(config, requested_ids,
+                                                error, sizeof(error)) != 0)
+        goto fail;
     for (i = 0; i < json_object_array_length(rules); i++) {
         struct json_object *rule = json_object_array_get_idx(rules, i);
 
@@ -3670,14 +5547,76 @@ struct json_object *jmx_api_route_policy_set(struct json_object *req_obj)
         if (requested_ids) {
             json_object_object_del(rule, "wan_ids");
             json_object_object_add(rule, "wan_ids", json_object_get(requested_ids));
+            json_object_object_del(rule, "members");
+            if (requested_members) {
+                json_object_object_add(rule, "members",
+                                       json_object_get(requested_members));
+                json_object_object_del(rule, "member_weights_explicit");
+                json_object_object_add(rule, "member_weights_explicit",
+                                       json_object_new_int(1));
+            } else {
+                struct json_object *equal_members = json_object_new_array();
+                int member_index;
+
+                if (!equal_members) {
+                    errno = ENOMEM;
+                    goto fail;
+                }
+                for (member_index = 0;
+                     member_index < json_object_array_length(requested_ids);
+                     member_index++) {
+                    struct json_object *member = json_object_new_object();
+                    int id = json_object_get_int(
+                        json_object_array_get_idx(requested_ids, member_index));
+
+                    if (!member) {
+                        json_object_put(equal_members);
+                        errno = ENOMEM;
+                        goto fail;
+                    }
+                    json_object_object_add(member, "wan_id", json_object_new_int(id));
+                    json_object_object_add(member, "weight", json_object_new_int(1));
+                    json_object_array_add(equal_members, member);
+                }
+                json_object_object_add(rule, "members", equal_members);
+                json_object_object_del(rule, "member_weights_explicit");
+                json_object_object_add(rule, "member_weights_explicit",
+                                       json_object_new_int(0));
+            }
             json_object_object_del(rule, "wan_selection");
             json_object_object_add(rule, "wan_selection",
                                    json_object_new_string("explicit"));
         }
         json_object_object_del(rule, "sticky_mode");
         json_object_object_del(rule, "algorithm");
+        json_object_object_del(rule, "base_mode");
+        json_object_object_del(rule, "updated_at");
         json_object_object_add(rule, "sticky_mode", json_object_new_string(algorithm));
         json_object_object_add(rule, "algorithm", json_object_new_string(algorithm));
+        json_object_object_add(rule, "base_mode", json_object_new_string(algorithm));
+        if (enable_adaptive >= 0) {
+            json_object_object_del(rule, "adaptive_penalty_sticky");
+            json_object_object_add(rule, "adaptive_penalty_sticky",
+                                   json_object_new_boolean(enable_adaptive));
+            json_object_object_del(rule, "legacy_mode");
+            json_object_object_del(rule, "migration_required");
+            if (legacy_adaptive_request) {
+                json_object_object_add(rule, "legacy_mode",
+                                       json_object_new_string("adaptive_penalty_sticky"));
+                json_object_object_add(rule, "migration_required",
+                                       json_object_new_boolean(1));
+            } else {
+                json_object_object_add(rule, "migration_required",
+                                       json_object_new_boolean(0));
+            }
+        } else if (!legacy_adaptive_request) {
+            json_object_object_del(rule, "legacy_mode");
+            json_object_object_del(rule, "migration_required");
+            json_object_object_add(rule, "migration_required",
+                                   json_object_new_boolean(0));
+        }
+        json_object_object_add(rule, "updated_at",
+                               json_object_new_int64((int64_t)time(NULL)));
         changed++;
     }
     if (!changed) {
@@ -3710,6 +5649,10 @@ struct json_object *jmx_api_route_policy_set(struct json_object *req_obj)
     }
     close(fd);
     fd = -1;
+    if (route_policy_kernel_readback_matches(readback, carrier_neutral, 0,
+                                             &weights_enforced,
+                                             error, sizeof(error)) != 0)
+        goto rollback;
     if (jmx_route_db_replace_commit(tx) != 0) {
         tx = NULL;
         snprintf(error, sizeof(error), "%s", "config.db commit failed");
@@ -3743,8 +5686,16 @@ struct json_object *jmx_api_route_policy_set(struct json_object *req_obj)
                            json_object_new_int(disabled_carrier_rules));
     json_object_object_add(readback, "carrier_neutral",
                            json_object_new_boolean(carrier_neutral));
+    json_object_object_add(readback, "weight_runtime_enforced",
+                           json_object_new_boolean(weights_enforced));
+    json_object_object_add(readback, "weight_runtime_reason",
+                           json_object_new_string(weights_enforced ?
+                               "kernel_reports_per_member_weights" :
+                               "kernel_module_ids_only_weight_ratio_configured_not_enforced"));
     if (config) json_object_put(config);
     if (previous) json_object_put(previous);
+    if (requested_members && requested_ids)
+        json_object_put(requested_ids);
     return route_json_ok(readback);
 
 rollback:
@@ -3773,6 +5724,8 @@ fail:
     if (config) json_object_put(config);
     if (previous) json_object_put(previous);
     if (readback) json_object_put(readback);
+    if (requested_members && requested_ids)
+        json_object_put(requested_ids);
     {
         struct json_object *data = json_object_new_object();
         json_object_object_add(data, "ok", json_object_new_boolean(0));
@@ -3805,6 +5758,323 @@ struct json_object *jmx_api_route_status(struct json_object *req_obj)
     return route_json_ok(data);
 }
 
+static struct json_object *route_sla_response(struct json_object *data, int ok)
+{
+    json_object_object_add(data, "ok", json_object_new_boolean(ok));
+    return jmx_gen_api_response_data(ok ? API_CODE_SUCCESS : API_CODE_ERROR, data);
+}
+
+static struct json_object *route_sla_field(struct json_object *obj,
+                                            const char *key)
+{
+    struct json_object *value = NULL;
+
+    if (obj)
+        json_object_object_get_ex(obj, key, &value);
+    return value;
+}
+
+static struct json_object *route_sla_status_snapshot(void)
+{
+    FILE *fp = jmx_fopen_af("jmx_route", "r");
+    struct json_object *status;
+
+    if (!fp)
+        return NULL;
+    status = route_parse_proc_status(fp);
+    fclose(fp);
+    return status;
+}
+
+static struct json_object *route_sla_wan(struct json_object *status,
+                                         const char *name)
+{
+    struct json_object *wans = NULL;
+    int i;
+
+    if (!status || !json_object_object_get_ex(status, "wans", &wans) ||
+        !json_object_is_type(wans, json_type_array))
+        return NULL;
+    for (i = 0; i < (int)json_object_array_length(wans); i++) {
+        struct json_object *wan = json_object_array_get_idx(wans, i);
+
+        if (!strcmp(json_get_str(wan, "name", ""), name))
+            return wan;
+    }
+    return NULL;
+}
+
+static int route_sla_alternatives(struct json_object *status, int target_id)
+{
+    struct json_object *wans = NULL;
+    int i, count = 0;
+
+    if (!status || !json_object_object_get_ex(status, "wans", &wans) ||
+        !json_object_is_type(wans, json_type_array))
+        return 0;
+    for (i = 0; i < (int)json_object_array_length(wans); i++) {
+        struct json_object *wan = json_object_array_get_idx(wans, i);
+
+        if ((int)json_get_u32(wan, "id", 0) != target_id &&
+            json_get_u32(wan, "health", 0))
+            count++;
+    }
+    return count;
+}
+
+static int route_sla_level_for_weight(int weight, int health)
+{
+    if (!health || weight <= 1)
+        return 3;
+    if (weight <= 25)
+        return 2;
+    if (weight <= 70)
+        return 1;
+    return 0;
+}
+
+static int route_sla_rule_has_wan(const char *members, int target_id)
+{
+    const char *p = members;
+
+    while (p && *p) {
+        char *end = NULL;
+        long id = strtol(p, &end, 10);
+
+        if (end == p)
+            return 0;
+        if (id == target_id)
+            return 1;
+        p = *end == ',' ? end + 1 : NULL;
+    }
+    return 0;
+}
+
+static struct json_object *route_sla_affected_groups(struct json_object *status,
+                                                      int target_id)
+{
+    struct json_object *out = json_object_new_array();
+    struct json_object *rules = NULL;
+    int i;
+
+    if (!status || !json_object_object_get_ex(status, "rules", &rules) ||
+        !json_object_is_type(rules, json_type_array))
+        return out;
+    for (i = 0; i < (int)json_object_array_length(rules); i++) {
+        struct json_object *rule = json_object_array_get_idx(rules, i);
+        const char *members = json_get_str(rule, "wan_ids", "");
+
+        if (route_sla_rule_has_wan(members, target_id)) {
+            struct json_object *item = json_object_new_object();
+
+            json_object_object_add(item, "prio",
+                                   json_object_new_int((int)json_get_u32(rule, "prio", 0)));
+            json_object_array_add(out, item);
+        }
+    }
+    return out;
+}
+
+static const char *route_sla_transition_event(struct json_object *request)
+{
+    const char *state = json_get_str(request, "stable_state", "unknown");
+
+    if (!strcmp(json_get_str(request, "state", state), "recovering"))
+        return "wan.sla.recovering";
+    if (!strcmp(state, "healthy"))
+        return "wan.sla.recovered";
+    if (!strcmp(state, "degraded"))
+        return "wan.sla.degraded";
+    if (!strcmp(state, "critical"))
+        return "wan.sla.critical";
+    if (!strcmp(state, "down"))
+        return "wan.sla.down";
+    return NULL;
+}
+
+static void route_sla_event_emit(struct json_object *request,
+                                 struct json_object *action,
+                                 const char *event)
+{
+    struct json_object *body, *detail, *resp;
+    const char *sla_id = json_get_str(request, "sla_id", "unknown");
+    const char *decision = json_get_str(request, "decision_id", "unknown");
+    const char *wan = json_get_str(request, "wan_id", "");
+    char id[256], dedupe[160];
+
+    if (!event)
+        return;
+    body = json_object_new_object();
+    detail = json_object_new_object();
+    if (!body || !detail) {
+        if (body) json_object_put(body);
+        if (detail) json_object_put(detail);
+        return;
+    }
+    snprintf(id, sizeof(id), "%s:%s", event, decision);
+    snprintf(dedupe, sizeof(dedupe), "wan_sla:%s", sla_id);
+    json_object_object_add(detail, "sla_id", json_object_new_string(sla_id));
+    json_object_object_add(detail, "sla_revision",
+                           json_object_new_int64(route_obj_i64(request, "sla_revision", 0)));
+    json_object_object_add(detail, "wan_id", json_object_new_string(wan));
+    json_object_object_add(detail, "decision_id", json_object_new_string(decision));
+    json_object_object_add(detail, "stable_state",
+                           json_object_new_string(json_get_str(request, "stable_state", "unknown")));
+    json_object_object_add(detail, "requested_level",
+                           json_object_new_int((int)json_get_u32(request, "requested_level", 0)));
+    json_object_object_add(detail, "reasons",
+                           json_object_get(route_sla_field(request, "reasons")));
+    json_object_object_add(detail, "evidence_window",
+                           json_object_get(route_sla_field(request, "evidence_window")));
+    json_object_object_add(detail, "route_action", json_object_get(action));
+    json_object_object_add(body, "id", json_object_new_string(id));
+    json_object_object_add(body, "type", json_object_new_string("system"));
+    json_object_object_add(body, "level", json_object_new_string(
+        strstr(event, "failed") || strstr(event, "down") ? "critical" : "warning"));
+    json_object_object_add(body, "category", json_object_new_string("network.wan"));
+    json_object_object_add(body, "module", json_object_new_string("dreamingwrt-routed"));
+    json_object_object_add(body, "source", json_object_new_string("routed.wan_sla"));
+    json_object_object_add(body, "wan_id", json_object_new_string(wan));
+    json_object_object_add(body, "event", json_object_new_string(event));
+    json_object_object_add(body, "title", json_object_new_string(event));
+    json_object_object_add(body, "detail_json", detail);
+    json_object_object_add(body, "dedupe_key", json_object_new_string(dedupe));
+    json_object_object_add(body, "state",
+                           json_object_new_string(json_get_str(request, "stable_state", "unknown")));
+    json_object_object_add(body, "target", json_object_new_string(sla_id));
+    json_object_object_add(body, "ts",
+                           json_object_new_int64(route_obj_i64(request, "evaluated_at", time(NULL))));
+    resp = jmx_log_center_event_add(body);
+    if (resp)
+        json_object_put(resp);
+    json_object_put(body);
+}
+
+struct json_object *jmx_api_route_sla_apply(struct json_object *req_obj)
+{
+    struct json_object *data = json_object_new_object();
+    struct json_object *config = NULL, *before = NULL, *after = NULL;
+    struct json_object *before_wan, *after_wan, *affected;
+    struct route_health_state *state;
+    sqlite3 *db = NULL;
+    const char *sla_id = json_get_str(req_obj, "sla_id", "");
+    const char *wan_name = json_get_str(req_obj, "wan_id", "");
+    const char *decision = json_get_str(req_obj, "decision_id", "");
+    const char *event;
+    char reason[96] = "";
+    int target_id, alternatives, verdict, level, previous_level;
+    int previous_weight, new_weight, health, rebind_mode, expected_rebind;
+    int fd, rc, readback_ok;
+
+    json_object_object_add(data, "decision_id", json_object_new_string(decision));
+    json_object_object_add(data, "sla_id", json_object_new_string(sla_id));
+    json_object_object_add(data, "wan_id", json_object_new_string(wan_name));
+    if (!sla_id[0] || sqlite3_open_v2(JMX_ROUTE_DB_PATH, &db,
+            SQLITE_OPEN_READONLY | SQLITE_OPEN_NOMUTEX, NULL) != SQLITE_OK) {
+        json_object_object_add(data, "error", json_object_new_string("config_unavailable"));
+        if (db) sqlite3_close(db);
+        return route_sla_response(data, 0);
+    }
+    sqlite3_busy_timeout(db, 100);
+    config = wan_sla_config_load(db, sla_id);
+    sqlite3_close(db);
+    if (!config) {
+        json_object_object_add(data, "error", json_object_new_string("sla_not_found"));
+        return route_sla_response(data, 0);
+    }
+    before = route_sla_status_snapshot();
+    before_wan = route_sla_wan(before, wan_name);
+    if (!before_wan) {
+        json_object_put(config);
+        if (before) json_object_put(before);
+        json_object_object_add(data, "error", json_object_new_string("wan_not_registered"));
+        return route_sla_response(data, 0);
+    }
+    target_id = (int)json_get_u32(before_wan, "id", 0);
+    alternatives = route_sla_alternatives(before, target_id);
+    affected = route_sla_affected_groups(before, target_id);
+    verdict = wan_sla_route_guard_validate(req_obj, config, time(NULL), alternatives,
+                                           reason, sizeof(reason));
+    json_object_put(config);
+    previous_weight = (int)json_get_u32(before_wan, "adaptive_weight", 100);
+    health = (int)json_get_u32(before_wan, "health", 1);
+    previous_level = route_sla_level_for_weight(previous_weight, health);
+    json_object_object_add(data, "previous_weight", json_object_new_int(previous_weight));
+    json_object_object_add(data, "eligible_alternatives", json_object_new_int(alternatives));
+    if (verdict == WAN_SLA_ROUTE_REJECT) {
+        json_object_put(before);
+        json_object_object_add(data, "error", json_object_new_string(reason));
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        json_object_object_add(data, "affected_policy_groups", affected);
+        return route_sla_response(data, 0);
+    }
+    if (verdict == WAN_SLA_ROUTE_SUPPRESS) {
+        json_object_put(before);
+        json_object_object_add(data, "applied", json_object_new_boolean(0));
+        json_object_object_add(data, "suppressed_reason", json_object_new_string(reason));
+        json_object_object_add(data, "new_weight", json_object_new_int(previous_weight));
+        json_object_object_add(data, "health", json_object_new_boolean(health));
+        json_object_object_add(data, "applied_level", json_object_new_int(previous_level));
+        json_object_object_add(data, "rebind_mode", json_object_new_int(0));
+        json_object_object_add(data, "readback_ok", json_object_new_boolean(1));
+        json_object_object_add(data, "affected_policy_groups", affected);
+        route_sla_event_emit(req_obj, data, "wan.sla.action_suppressed");
+        return route_sla_response(data, 1);
+    }
+
+    level = (int)json_get_u32(req_obj, "requested_level", 0);
+    expected_rebind = level > previous_level ?
+        (level >= 3 ? JMX_ROUTE_REBIND_ALL : level >= 2 ? JMX_ROUTE_REBIND_SELECTIVE : 0) : 0;
+    state = route_health_state_get((uint8_t)target_id);
+    if (!state) {
+        json_object_put(before);
+        json_object_object_add(data, "error", json_object_new_string("route_state_unavailable"));
+        json_object_object_add(data, "affected_policy_groups", affected);
+        return route_sla_response(data, 0);
+    }
+    snprintf(state->name, sizeof(state->name), "%s", wan_name);
+    snprintf(state->reason, sizeof(state->reason), "wan_sla:%s", sla_id);
+    state->initialized = 1;
+    state->quality_level = (uint8_t)previous_level;
+    state->adaptive_weight = (uint8_t)previous_weight;
+    state->healthy = health != 0;
+    state->last_probe = (time_t)route_obj_i64(req_obj, "evaluated_at", time(NULL));
+    state->last_rebind_mode = 0;
+    fd = route_open_nl();
+    rc = fd < 0 ? -1 : route_health_apply_level(fd, state, (uint8_t)level, 0);
+    if (fd >= 0)
+        close(fd);
+    after = route_sla_status_snapshot();
+    after_wan = route_sla_wan(after, wan_name);
+    new_weight = after_wan ? (int)json_get_u32(after_wan, "adaptive_weight", 0) : 0;
+    health = after_wan ? (int)json_get_u32(after_wan, "health", 0) : 0;
+    rebind_mode = after_wan ? (int)json_get_u32(after_wan, "rebind_last_mode", 0) : 0;
+    readback_ok = rc == 0 && after_wan &&
+        new_weight == route_health_weight_for((uint8_t)level) && health == (level < 3) &&
+        (!expected_rebind || rebind_mode == expected_rebind);
+    json_object_put(before);
+    if (after) json_object_put(after);
+    json_object_object_add(data, "applied", json_object_new_boolean(rc == 0));
+    json_object_object_add(data, "new_weight", json_object_new_int(new_weight));
+    json_object_object_add(data, "health", json_object_new_boolean(health));
+    json_object_object_add(data, "rebind_mode", json_object_new_int(rebind_mode));
+    json_object_object_add(data, "applied_level",
+                           json_object_new_int(route_sla_level_for_weight(new_weight, health)));
+    json_object_object_add(data, "readback_ok", json_object_new_boolean(readback_ok));
+    json_object_object_add(data, "affected_policy_groups", affected);
+    if (!readback_ok) {
+        json_object_object_add(data, "error", json_object_new_string(
+            rc ? "route_action_failed" : "route_readback_mismatch"));
+        route_sla_event_emit(req_obj, data, "wan.sla.route_action_failed");
+        return route_sla_response(data, 0);
+    }
+    if (json_get_u32(req_obj, "transition", 0)) {
+        event = route_sla_transition_event(req_obj);
+        route_sla_event_emit(req_obj, data, event);
+    }
+    return route_sla_response(data, 1);
+}
+
 int jmx_route_counter_tick(void)
 {
     FILE *fp = jmx_fopen_af("jmx_route", "r");
@@ -3818,8 +6088,14 @@ int jmx_route_counter_tick(void)
     data = route_parse_proc_status(fp);
     fclose(fp);
     if (data) {
-        route_enrich_status(data);
-        rc = route_obj_int(data, "route_rule_counter_persisted", 0) >= 0 ? 0 : -1;
+        /* Periodic tick must stay off the shared SQLite read path: the WAN
+         * runtime enrichment below queries the main DB once per WAN and can
+         * block for the whole busy timeout when healthd/webd hold a write
+         * lock.  route_status (the actual API) still does the full enrich;
+         * the 3-second tick only needs the CPU-only rule identity so the
+         * counter state table can be persisted. */
+        route_enrich_rules(data);
+        rc = route_state_persist_rule_counters(data) >= 0 ? 0 : -1;
         json_object_put(data);
     }
     return rc;
@@ -3885,9 +6161,12 @@ static uint8_t sticky_mode_from_string(const char *s)
     if (!strcmp(s, "conn_cnt") || !strcmp(s, "conn-count") ||
         !strcmp(s, "connection_count") || !strcmp(s, "least_active_conn_normalized"))
         return JMX_STICKY_CONN_CNT;
+    if (!strcmp(s, "adaptive_penalty_sticky") ||
+        !strcmp(s, "adaptive-penalty-sticky"))
+        return JMX_STICKY_ADAPTIVE_PENALTY;
     errno = 0;
     n = strtoul(s, &end, 0);
-    if (errno || end == s || *end || n > JMX_STICKY_CONN_CNT)
+    if (errno || end == s || *end || n > JMX_STICKY_MAX)
         return UINT8_MAX;
     return (uint8_t)n;
 }
@@ -3904,6 +6183,7 @@ static const char *sticky_mode_algorithm(uint8_t mode)
     case JMX_STICKY_PRIMARY_BACKUP: return "primary_backup";
     case JMX_STICKY_DOWNLOAD: return "least_rx_load_normalized";
     case JMX_STICKY_CONN_CNT: return "least_active_conn_normalized";
+    case JMX_STICKY_ADAPTIVE_PENALTY: return "adaptive_penalty_sticky";
     default: return "unsupported";
     }
 }
@@ -4574,9 +6854,10 @@ static int jmx_route_load_builtin_carriers(int fd, int *errors)
             (*errors)++;
         return 0;
     }
-    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        LOG_WARN("jmx_route: cannot open signature db for carrier prefixes: %s", path);
-        if (db) sqlite3_close(db);
+    if (jmx_signature_db_acquire_path(path, &db) != SQLITE_OK) {
+        LOG_WARN("jmx_route: cannot open signature db for carrier prefixes: %s (%s)",
+                 path, jmx_signature_db_last_error());
+        if (db) jmx_signature_db_release_path(db);
         return 0;
     }
 
@@ -4584,7 +6865,7 @@ static int jmx_route_load_builtin_carriers(int fd, int *errors)
         "SELECT carrier_id,cidr,prefix_len FROM carrier_prefix WHERE enabled=1 ORDER BY sort_key",
         -1, &st, NULL) != SQLITE_OK) {
         LOG_WARN("jmx_route: carrier_prefix table missing in signature db: %s", path);
-        sqlite3_close(db);
+        jmx_signature_db_release_path(db);
         return 0;
     }
 
@@ -4611,7 +6892,7 @@ static int jmx_route_load_builtin_carriers(int fd, int *errors)
     }
 
     sqlite3_finalize(st);
-    sqlite3_close(db);
+    jmx_signature_db_release_path(db);
     LOG_WARN("jmx_route: loaded %d carrier prefixes from %s", count, path);
     return count;
 }
@@ -4640,12 +6921,18 @@ static int jmx_route_load_app_categories(int fd, int *errors)
             (*errors)++;
         return 0;
     }
-    if (sqlite3_open_v2(path, &db, SQLITE_OPEN_READONLY, NULL) != SQLITE_OK) {
-        LOG_WARN("jmx_route: cannot open signature db for app categories: %s", path);
+    /* The appid -> category map is byte-accounting enrichment, not a routing
+     * input: without it the per-WAN category counters collapse into Unknown,
+     * but WAN registration, marks and rules are unaffected.  A signature DB
+     * that is absent or invalid must therefore NOT fail a full route sync -- otherwise a
+     * WAN-policy write on a device without the signature runtime rolls back at
+     * runtime_apply.  Match jmx_route_load_builtin_carriers(): log and return 0
+     * WITHOUT incrementing *errors so the enrichment is best-effort. */
+    if (jmx_signature_db_acquire_path(path, &db) != SQLITE_OK) {
+        LOG_WARN("jmx_route: cannot open signature db for app categories: %s (%s)",
+                 path, jmx_signature_db_last_error());
         if (db)
-            sqlite3_close(db);
-        if (errors)
-            (*errors)++;
+            jmx_signature_db_release_path(db);
         return 0;
     }
 
@@ -4653,9 +6940,7 @@ static int jmx_route_load_app_categories(int fd, int *errors)
         "SELECT app_id,COALESCE(category_id,0) FROM app WHERE enabled=1",
         -1, &st, NULL) != SQLITE_OK) {
         LOG_WARN("jmx_route: app table missing in signature db: %s", path);
-        sqlite3_close(db);
-        if (errors)
-            (*errors)++;
+        jmx_signature_db_release_path(db);
         return 0;
     }
 
@@ -4693,7 +6978,7 @@ static int jmx_route_load_app_categories(int fd, int *errors)
     }
 
     sqlite3_finalize(st);
-    sqlite3_close(db);
+    jmx_signature_db_release_path(db);
     LOG_WARN("jmx_route: pushed %d app categories from %s", count, path);
     return count;
 }
@@ -4805,19 +7090,31 @@ static int jmx_route_apply_system_route(const char *ifname, uint32_t fwmark,
 }
 
 static void route_health_probe_ifname_json(struct json_object *wan,
-                                           char *out, size_t out_len)
+                                           char *out, size_t out_len,
+                                           const struct route_network_wan_snapshot *runtime)
 {
     const char *name = json_get_str(wan, "name", "");
     const char *ifname = json_get_str(wan, "ifname", "");
     char logical_name[16];
+    const struct route_network_wan_runtime *rt;
 
     if (!out || out_len == 0)
         return;
     out[0] = '\0';
-    if (name[0] && route_l3_device_from_ifstatus(name, out, out_len) == 0)
+    if (name[0] && (rt = route_network_wan_snapshot_find_name(runtime, name)) &&
+        rt->l3_ifname[0] && route_ifname_ok(rt->l3_ifname)) {
+        snprintf(out, out_len, "%s", rt->l3_ifname);
         return;
+    }
     snprintf(logical_name, sizeof(logical_name), "wan%u",
              json_get_u32(wan, "id", 0));
+    if ((rt = route_network_wan_snapshot_find_name(runtime, logical_name)) &&
+        rt->l3_ifname[0] && route_ifname_ok(rt->l3_ifname)) {
+        snprintf(out, out_len, "%s", rt->l3_ifname);
+        return;
+    }
+    if (name[0] && route_l3_device_from_ifstatus(name, out, out_len) == 0)
+        return;
     if (route_l3_device_from_ifstatus(logical_name, out, out_len) == 0)
         return;
     if (ifname[0] && route_l3_device_from_device(ifname, out, out_len) == 0)
@@ -4828,12 +7125,16 @@ static void route_health_probe_ifname_json(struct json_object *wan,
 
 static void route_rule_from_json(struct json_object *rule,
                                  struct jmx_route_rule_wire *out,
-                                 int default_prio)
+                                 int default_prio, uint32_t *enhancements,
+                                 int legacy_adaptive_fallback)
 {
-    struct json_object *wan_ids = NULL;
+    struct json_object *wan_ids = NULL, *members = NULL;
+    const char *base_mode;
     int i;
 
     memset(out, 0, sizeof(*out));
+    if (enhancements)
+        *enhancements = 0;
     out->enabled = (uint8_t)json_get_u32(rule, "enabled", 1);
     out->prio = (uint16_t)json_get_u32(rule, "prio", (uint32_t)default_prio);
     out->src_addr = json_get_ipv4(rule, "src_addr", 0);
@@ -4844,15 +7145,42 @@ static void route_rule_from_json(struct json_object *rule,
     out->proto = proto_from_string(json_get_str(rule, "proto", "any"));
     out->appid = json_get_u32(rule, "appid", 0);
     out->carrier_id = carrier_from_string(json_get_str(rule, "carrier", "any"));
-    out->sticky_mode = sticky_mode_from_string(json_get_str(
+    base_mode = json_get_str(rule, "base_mode", json_get_str(
         rule, "algorithm", json_get_str(rule, "sticky_mode", "hash_src")));
-    if (!json_object_object_get_ex(rule, "wan_ids", &wan_ids) ||
-        !json_object_is_type(wan_ids, json_type_array))
-        return;
-    for (i = 0; i < json_object_array_length(wan_ids) &&
-                out->wan_count < JMX_ROUTE_MAX_WAN_IFACES; i++)
-        out->wan_ids[out->wan_count++] = (uint8_t)json_object_get_int(
-            json_object_array_get_idx(wan_ids, i));
+    out->sticky_mode = sticky_mode_from_string(base_mode);
+    if (json_get_u32(rule, "adaptive_penalty_sticky", 0)) {
+        if (legacy_adaptive_fallback &&
+            json_get_u32(rule, "migration_required", 0))
+            out->sticky_mode = JMX_STICKY_ADAPTIVE_PENALTY;
+        else if (enhancements)
+            *enhancements |= JMX_ROUTE_ENHANCEMENT_ADAPTIVE_PENALTY;
+    }
+    if (json_object_object_get_ex(rule, "members", &members) &&
+        json_object_is_type(members, json_type_array)) {
+        int explicit_weights = json_get_u32(
+            rule, "member_weights_explicit", 1) ? 1 : 0;
+
+        for (i = 0; i < json_object_array_length(members) &&
+                    out->wan_count < JMX_ROUTE_MAX_WAN_IFACES; i++) {
+            struct json_object *member = json_object_array_get_idx(members, i);
+            uint32_t weight = 0;
+
+            if (!member || !json_object_is_type(member, json_type_object) ||
+                json_get_weight(member, "weight", 1, &weight) != 0)
+                continue;
+            out->wan_ids[out->wan_count] =
+                (uint8_t)json_get_u32(member, "wan_id", 0);
+            out->wan_weights[out->wan_count] = explicit_weights ? weight : 0;
+            if (out->wan_ids[out->wan_count])
+                out->wan_count++;
+        }
+    } else if (json_object_object_get_ex(rule, "wan_ids", &wan_ids) &&
+               json_object_is_type(wan_ids, json_type_array)) {
+        for (i = 0; i < json_object_array_length(wan_ids) &&
+                    out->wan_count < JMX_ROUTE_MAX_WAN_IFACES; i++)
+            out->wan_ids[out->wan_count++] = (uint8_t)json_object_get_int(
+                json_object_array_get_idx(wan_ids, i));
+    }
 
     /*
      * Global WAN mode override for the default multi-WAN rule.
@@ -4870,7 +7198,8 @@ static void route_rule_from_json(struct json_object *rule,
      * operator's per-rule steering.
      */
     if (out->carrier_id == 0 && out->wan_count > 1 &&
-        !json_has_key(rule, "algorithm") && !json_has_key(rule, "sticky_mode")) {
+        !json_has_key(rule, "base_mode") && !json_has_key(rule, "algorithm") &&
+        !json_has_key(rule, "sticky_mode")) {
         char wan_mode[32];
 
         if (jmx_netconfig_wan_mode_get(wan_mode, sizeof(wan_mode)) == 0 &&
@@ -4882,6 +7211,7 @@ static void route_rule_from_json(struct json_object *rule,
 static int jmx_route_sync_json(struct json_object *config)
 {
     struct json_object *prefixes = NULL, *wans = NULL, *rules = NULL;
+    const char *dangling_policy;
     int fd;
     int wan_count = 0, rule_count = 0, carrier_count = 0;
     int sync_errors = 0;
@@ -4891,18 +7221,47 @@ static int jmx_route_sync_json(struct json_object *config)
     struct route_network_wan_snapshot runtime_snapshot;
     int wan_map_count = 0;
     int runtime_snapshot_valid;
+    int v2_supported;
     int i;
 
     if (!config || !json_object_is_type(config, json_type_object)) {
         errno = EINVAL;
         return -1;
     }
+    /* Do this before the first flush/unregister. A canonical adaptive overlay
+     * needs action 44; applying it to an old module would otherwise replace a
+     * working policy with one that has silently lost its enhancement. */
+    v2_supported = route_kernel_rule_v2_supported(NULL);
+    if (route_config_requires_rule_v2(config) && !v2_supported) {
+        LOG_ERROR("jmx_route: canonical adaptive policy requires RouteRuleAbi=2 enhancements=0x%x",
+                  JMX_ROUTE_ENHANCEMENT_ADAPTIVE_PENALTY);
+        errno = EOPNOTSUPP;
+        return -1;
+    }
+    /* Invalidate locally before opening the transport as well: if netlink is
+     * unavailable, the userspace consumer must not keep advertising the old
+     * WAN identity as ready. */
+    (void)jmx_direction_snapshot_publish_unready(route_direction_gateway_mode());
+    /* Rule/WAN topology is about to change; drop cached snapshots so status
+     * enrichment cannot attribute marks or rule counts to the old topology. */
+    g_route_marks_cache.valid = 0;
+    g_route_main_nondefault_cache.valid = 0;
     memset(wan_map, 0, sizeof(wan_map));
     runtime_snapshot_valid = route_network_wan_snapshot_get(&runtime_snapshot) == 0;
 
     fd = route_open_nl();
     if (fd < 0)
         return -1;
+
+    /* Publish the unready generation to the kernel before replacing any
+     * route/WAN identity.  A send failure keeps the dataplane fail-open by
+     * treating this sync as failed; the local snapshot is still unready. */
+    if (route_direction_snapshot_send_current(fd) != 0) {
+        LOG_ERROR("jmx_route: failed to send direction snapshot unready state");
+        close(fd);
+        errno = EIO;
+        return -1;
+    }
 
     if (route_main_nondefault_rule_install() != 0) {
         LOG_ERROR("jmx_route: failed to install main non-default lookup priority=%u",
@@ -4976,7 +7335,8 @@ static int jmx_route_sync_json(struct json_object *config)
                                                 &runtime_online) == 0;
         }
         if (!l3_ifname[0])
-            route_health_probe_ifname_json(wan, l3_ifname, sizeof(l3_ifname));
+            route_health_probe_ifname_json(wan, l3_ifname, sizeof(l3_ifname),
+                                           runtime_snapshot_valid ? &runtime_snapshot : NULL);
         if (l3_ifname[0])
             route_ifname = l3_ifname;
         if (runtime_gateway[0])
@@ -5029,16 +7389,26 @@ static int jmx_route_sync_json(struct json_object *config)
     }
 
     json_object_object_get_ex(config, "rules", &rules);
+    /* Read once per sync pass: route_global is a single row, and re-reading it
+     * per rule would only invite the two halves of one push to disagree. */
+    dangling_policy = json_get_str(config, "dangling_wan_policy", "reinstate_registered");
     for (i = 0; rules && i < json_object_array_length(rules); i++) {
         struct jmx_route_rule_wire rule;
         struct json_object *rule_json = json_object_array_get_idx(rules, i);
+        uint32_t enhancements = 0;
 
         route_rule_from_json(rule_json, &rule,
-                             1000 + rule_count);
+                             1000 + rule_count, &enhancements,
+                             !v2_supported);
         if (!rule.enabled)
             continue;
         configured_rules_expected++;
         route_resolve_auto_carrier_wans(&rule, wan_map, wan_map_count);
+        /* Runs after the UCI top-up above, so wan_map already holds every WAN
+         * this pass registered -- including lines absent from the route_wan
+         * ledger, whose members the export had to report as dangling. */
+        route_restore_dangling_wan_members(rule_json, &rule, wan_map, wan_map_count,
+                                           dangling_policy);
         if (rule.wan_count == 0) {
             LOG_ERROR("jmx_route: enabled rule '%s' carrier=%s resolved no WAN targets",
                       json_get_str(rule_json, "name", ""),
@@ -5046,8 +7416,10 @@ static int jmx_route_sync_json(struct json_object *config)
             sync_errors++;
             continue;
         }
-        if (rule.sticky_mode <= JMX_STICKY_CONN_CNT &&
-            jmx_route_nl_rule_add(fd, &rule) == 0) {
+        if (rule.sticky_mode <= JMX_STICKY_MAX &&
+            ((!enhancements && jmx_route_nl_rule_add(fd, &rule) == 0) ||
+             (enhancements && v2_supported &&
+              jmx_route_nl_rule_add_v2(fd, &rule, enhancements) == 0))) {
             rule_count++;
             configured_rules_added++;
         } else {
@@ -5069,7 +7441,7 @@ static int jmx_route_sync_json(struct json_object *config)
 
     {
         int actual_carriers = -1, actual_wans = -1, actual_rules = -1;
-        int main_nondefault_ready = route_main_nondefault_rule_count() == 1;
+        int main_nondefault_ready = route_main_nondefault_rule_count_raw() == 1;
 
         if (route_kernel_state_counts(&actual_carriers, &actual_wans, &actual_rules) != 0 ||
             actual_carriers != carrier_count || actual_wans != wan_count ||
@@ -5088,6 +7460,13 @@ static int jmx_route_sync_json(struct json_object *config)
         for (i = 0; i < wan_map_count; i++) {
             if (wan_map[i].id <= JMX_ROUTE_MAX_WAN_IFACES)
                 g_route_auto_carriers[wan_map[i].id] = wan_map[i].carrier_id;
+        }
+        if (route_direction_snapshot_publish(fd, wan_map, wan_map_count) != 0) {
+            LOG_ERROR("jmx_route: direction snapshot publish failed; leaving gate fail-open");
+            (void)jmx_direction_snapshot_publish_unready(route_direction_gateway_mode());
+            if (route_direction_snapshot_send_current(fd) != 0)
+                LOG_ERROR("jmx_route: failed to send direction unready state");
+            sync_errors++;
         }
     }
     if (runtime_snapshot_valid) {
@@ -5131,7 +7510,9 @@ static int route_health_enabled_opt(struct uci_section *s, int def)
     return 0;
 }
 
-static int route_health_network_wans(int fd)
+static int route_health_network_wans(int fd,
+                                     const struct route_health_snapshot_set *snapshots,
+                                     const struct route_network_wan_snapshot *runtime)
 {
     struct uci_context *ctx;
     struct uci_package *pkg = NULL;
@@ -5150,15 +7531,14 @@ static int route_health_network_wans(int fd)
 
     uci_foreach_element(&pkg->sections, e) {
         struct uci_section *s = uci_to_section(e);
-        const char *name, *proto, *ifname, *target, *health_mode, *check_url;
+        const char *name, *proto, *ifname;
+        const struct route_health_snapshot *snap;
         char l3_ifname[JMX_ROUTE_HEALTH_IFNAME_LEN] = "";
         uint8_t id;
         uint8_t enabled;
         uint8_t failover;
         uint8_t failback;
         uint8_t config_health = 1;
-        uint32_t fail_threshold;
-        uint32_t recover_threshold;
 
         if (!s || strcmp(s->type, "interface") != 0)
             continue;
@@ -5170,29 +7550,33 @@ static int route_health_network_wans(int fd)
         if (!id)
             continue;
         next_id = id + 1;
-        enabled = (uint8_t)route_health_enabled_opt(s, 0);
+        /* UCI is the authoritative runtime WAN inventory.  A line omitted
+         * from route_wan still needs health tracking; otherwise wan3/wan4 are
+         * pruned whenever config.db contains only wan1/wan2. */
+        enabled = (uint8_t)route_health_enabled_opt(s, 1);
         if (!enabled)
+            continue;
+        if (route_health_state_get(id)->generation == g_route_health_generation)
             continue;
         failover = (uint8_t)parse_u32_opt(s, "failover", 1);
         failback = (uint8_t)parse_u32_opt(s, "failback", 1);
-        fail_threshold = route_threshold(s, "fail_threshold", JMX_ROUTE_HEALTH_DEFAULT_FAIL_THRESHOLD);
-        recover_threshold = route_threshold(s, "recover_threshold", JMX_ROUTE_HEALTH_DEFAULT_RECOVER_THRESHOLD);
         ifname = route_wan_ifname_option(s);
-        route_l3_device_from_ifstatus(name, l3_ifname, sizeof(l3_ifname));
+        {
+            const struct route_network_wan_runtime *rt =
+                route_network_wan_snapshot_find_name(runtime, name);
+
+            if (rt && rt->l3_ifname[0] && route_ifname_ok(rt->l3_ifname))
+                snprintf(l3_ifname, sizeof(l3_ifname), "%s", rt->l3_ifname);
+        }
+        if (!l3_ifname[0])
+            route_l3_device_from_ifstatus(name, l3_ifname, sizeof(l3_ifname));
         if (!l3_ifname[0])
             route_health_probe_ifname(s, l3_ifname, sizeof(l3_ifname));
         if (!l3_ifname[0] && ifname && route_ifname_ok(ifname))
             snprintf(l3_ifname, sizeof(l3_ifname), "%s", ifname);
-        target = uci_opt(s, "check_host");
-        if (!target || !target[0])
-            target = uci_opt(s, "gateway");
-        if (!target || !target[0])
-            target = "223.5.5.5";
-        health_mode = uci_opt(s, "health_mode");
-        check_url = uci_opt(s, "check_url");
-        route_health_tick_one(fd, NULL, id, enabled, failover, failback,
-                              config_health, fail_threshold, recover_threshold,
-                              name, l3_ifname, target, health_mode, check_url);
+        snap = route_health_snapshot_find(snapshots, name, l3_ifname);
+        route_health_tick_one(fd, id, enabled, failover, failback,
+                              config_health, name, l3_ifname, snap);
         count++;
     }
 
@@ -5207,19 +7591,30 @@ void jmx_route_health_tick(void)
     struct json_object *config = NULL;
     struct json_object *wans = NULL;
     struct route_network_wan_snapshot runtime_snapshot;
+    struct route_health_snapshot_set health_snapshots;
+    int health_snapshot_ok;
+    int runtime_snapshot_valid;
     int fd;
     int i;
-    int runtime_changed;
+    int runtime_changed = -1;
 
     g_route_health_generation++;
     if (g_route_health_generation == 0)
         g_route_health_generation = 1;
 
+    runtime_snapshot_valid = route_network_wan_snapshot_get(&runtime_snapshot) == 0;
+    if (!runtime_snapshot_valid)
+        memset(&runtime_snapshot, 0, sizeof(runtime_snapshot));
+
     fd = route_open_nl();
     if (fd < 0)
         return;
-    if (jmx_route_db_config_get(&config) != 0 || !config) {
-        route_health_network_wans(fd);
+    health_snapshot_ok = route_health_snapshot_load(&health_snapshots) == 0;
+    if (!health_snapshot_ok)
+        memset(&health_snapshots, 0, sizeof(health_snapshots));
+    if (jmx_route_db_config_get_readonly(&config) != 0 || !config) {
+        route_health_network_wans(fd, &health_snapshots,
+                                  runtime_snapshot_valid ? &runtime_snapshot : NULL);
         route_health_prune_states();
         close(fd);
         return;
@@ -5229,41 +7624,33 @@ void jmx_route_health_tick(void)
     for (i = 0; wans && i < json_object_array_length(wans); i++) {
         struct json_object *wan = json_object_array_get_idx(wans, i);
         uint8_t id = (uint8_t)json_get_u32(wan, "id", 0);
-        uint8_t enabled = (uint8_t)json_get_u32(wan, "check_enable", 0);
+        uint8_t enabled = (uint8_t)json_get_u32(
+            wan, "check_enable", json_get_u32(wan, "health_enabled", 1));
         uint8_t failover = (uint8_t)json_get_u32(wan, "failover", 1);
         uint8_t failback = (uint8_t)json_get_u32(wan, "failback", 1);
         uint8_t config_health = (uint8_t)json_get_u32(wan, "health", 1);
-        uint32_t fail_threshold = json_get_u32(
-            wan, "fail_threshold", JMX_ROUTE_HEALTH_DEFAULT_FAIL_THRESHOLD);
-        uint32_t recover_threshold = json_get_u32(
-            wan, "recover_threshold", JMX_ROUTE_HEALTH_DEFAULT_RECOVER_THRESHOLD);
         const char *name = json_get_str(wan, "name", "wan");
-        const char *target = json_get_str(wan, "check_host",
-                                          json_get_str(wan, "gateway", "223.5.5.5"));
-        const char *health_mode = json_get_str(wan, "health_mode", "ping");
-        const char *check_url = json_get_str(wan, "check_url", "");
+        const struct route_health_snapshot *snap;
         char l3_ifname[JMX_ROUTE_HEALTH_IFNAME_LEN] = "";
 
         if (!id)
             continue;
-        if (fail_threshold < 1 || fail_threshold > JMX_ROUTE_HEALTH_MAX_THRESHOLD)
-            fail_threshold = JMX_ROUTE_HEALTH_DEFAULT_FAIL_THRESHOLD;
-        if (recover_threshold < 1 || recover_threshold > JMX_ROUTE_HEALTH_MAX_THRESHOLD)
-            recover_threshold = JMX_ROUTE_HEALTH_DEFAULT_RECOVER_THRESHOLD;
-        if (!route_safe_token(target, JMX_ROUTE_HEALTH_TARGET_LEN) ||
-            target[0] == '-')
-            target = "223.5.5.5";
-        route_health_probe_ifname_json(wan, l3_ifname, sizeof(l3_ifname));
-        route_health_tick_one(fd, NULL, id, enabled, failover, failback,
-                              config_health, fail_threshold, recover_threshold,
-                              name, l3_ifname, target, health_mode, check_url);
+        route_health_probe_ifname_json(wan, l3_ifname, sizeof(l3_ifname),
+                                       runtime_snapshot_valid ? &runtime_snapshot : NULL);
+        snap = route_health_snapshot_find(&health_snapshots, name, l3_ifname);
+        route_health_tick_one(fd, id, enabled, failover, failback,
+                              config_health, name, l3_ifname, snap);
     }
-    if (!wans || json_object_array_length(wans) == 0)
-        route_health_network_wans(fd);
+    /* Always top up from the live network inventory.  The generation guard in
+     * route_health_network_wans() skips ids already handled from config.db and
+     * admits runtime-only lines such as wan3/wan4. */
+    route_health_network_wans(fd, &health_snapshots,
+                              runtime_snapshot_valid ? &runtime_snapshot : NULL);
 
     route_health_prune_states();
     close(fd);
-    runtime_changed = route_network_wan_runtime_changed(&runtime_snapshot);
+    if (runtime_snapshot_valid)
+        runtime_changed = route_network_wan_runtime_changed(&runtime_snapshot, 1);
     if (runtime_changed > 0)
         LOG_WARN("jmx_route: WAN runtime topology changed; resyncing route configuration");
     if (runtime_changed > 0 || route_auto_carrier_mapping_changed(config))

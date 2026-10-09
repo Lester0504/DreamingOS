@@ -39,12 +39,22 @@ typedef struct json_object *(*dw_async_query_fn)(struct json_object *in);
  */
 typedef void (*dw_async_reply_fn)(struct ubus_context *ctx,
                                   struct ubus_request_data *req,
-                                  struct json_object *result);
+                                  struct json_object *result,
+                                  void *arg);
+
+enum dw_async_submit_result {
+    DW_ASYNC_SUBMIT_OK = 0,
+    DW_ASYNC_SUBMIT_UNAVAILABLE = -1,
+    DW_ASYNC_SUBMIT_SATURATED = -2,
+    DW_ASYNC_SUBMIT_OOM = -3,
+    DW_ASYNC_SUBMIT_INVALID = -4,
+};
 
 /*
  * Initialise the pool. Safe to call more than once; later calls are no-ops.
- * Returns 0 on success. On failure callers must fall back to synchronous
- * execution rather than failing the request.
+ * Returns 0 on success. Slow-read callers must fail fast or serve an existing
+ * snapshot when the pool is unavailable; running the same query inline would
+ * put the expensive work back on the uloop thread.
  */
 int dw_async_query_init(unsigned int workers);
 
@@ -61,20 +71,29 @@ void dw_async_query_stop(void);
  * and eventually a double free. Handing the object over outright means exactly
  * one thread ever owns it.
  *
- * Returns 0 when the request has been deferred and will be completed later, or
- * -1 when it could not be queued, in which case the caller still owns `in`,
- * must answer synchronously, and the ubus request is left untouched.
+ * Returns DW_ASYNC_SUBMIT_OK when the request has been deferred and will be
+ * completed later, or a precise rejection reason otherwise. On rejection the
+ * caller still owns `in` and the ubus request is left untouched. Slow-read
+ * callers must not execute `fn` inline after this failure.
  */
-int dw_async_query_submit(struct ubus_context *ctx,
-                          struct ubus_request_data *req,
-                          struct json_object *in,
-                          dw_async_query_fn fn,
-                          dw_async_reply_fn reply);
+enum dw_async_submit_result dw_async_query_submit(
+    struct ubus_context *ctx,
+    struct ubus_request_data *req,
+    struct json_object *in,
+    dw_async_query_fn fn,
+    dw_async_reply_fn reply,
+    void *arg);
+
+const char *dw_async_query_submit_reason(enum dw_async_submit_result result);
 
 /* Depth of the pending queue, for status reporting. */
 int dw_async_query_pending(void);
+int dw_async_query_capacity(void);
 
-/* Whether the pool is running; false means every query runs inline. */
+/* Pool health and lifetime counters for read_models_status. */
+struct json_object *dw_async_query_status_json(void);
+
+/* Whether the pool is running; false means slow reads must fail fast. */
 int dw_async_query_available(void);
 
 /*

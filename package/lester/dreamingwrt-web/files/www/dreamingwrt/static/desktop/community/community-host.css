@@ -1,0 +1,1 @@
+button[data-app-id=community]{position:relative}.community-app-badge{position:absolute;top:2px;right:2px;min-width:17px;height:17px;padding:0 4px;border-radius:9px;display:grid;place-items:center;background:var(--color-danger,#c83340);color:white;font:600 10px/1 system-ui;pointer-events:none}.community-app-badge[hidden]{display:none}

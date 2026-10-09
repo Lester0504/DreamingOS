@@ -3,6 +3,8 @@
 
 sqlite3 *g_logd_db;
 sqlite3 *g_config_db;
+char g_logd_db_path[512] = LOGD_DB_PATH;
+int g_logd_storage_frozen;
 struct ubus_context *g_logd_ubus;
 struct blob_buf g_logd_blob;
 uint64_t g_event_seq;

@@ -2,6 +2,7 @@
 #define _GNU_SOURCE
 /* DreamingWrt client identity collectors: mDNS, SSDP, DHCP lease evidence. */
 #include "jmx_identity_collector.h"
+#include "jmx_strbuf.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -31,6 +32,7 @@
 
 #include "jmx.h"
 #include "jmx_huginn.h"
+#include "jmx_utils.h"
 
 #define JMX_ID_BUF 2048
 #define SSDP_DISCOVERY_INTERVAL_SEC 120
@@ -496,22 +498,29 @@ static int load_bridge_links(const char *bridge, bridge_link_t *links, int max_l
 
         if (!strcmp(de->d_name, ".") || !strcmp(de->d_name, ".."))
             continue;
+        /* A bridge port is a network interface, so its name is bounded by
+         * IFNAMSIZ. Reject anything longer instead of building a truncated
+         * /sys path that would silently read a different interface's files. */
+        if (strlen(de->d_name) >= IFNAMSIZ)
+            continue;
         l = &links[count];
         memset(l, 0, sizeof(*l));
-        snprintf(l->ifname, sizeof(l->ifname), "%s", de->d_name);
-        snprintf(path, sizeof(path), "/sys/class/net/%s/address", de->d_name);
+        JMX_STRBUF_COPY(l->ifname, de->d_name);
+        snprintf(path, sizeof(path), "/sys/class/net/%s/address", l->ifname);
         if (read_first_line(path, raw, sizeof(raw)) == 0)
             lowercase_copy(l->mac, sizeof(l->mac), raw);
-        snprintf(path, sizeof(path), "/sys/class/net/%s/brif/%s/port_no", bridge, de->d_name);
+        snprintf(path, sizeof(path), "/sys/class/net/%s/brif/%s/port_no",
+                 bridge, l->ifname);
         if (read_first_line(path, raw, sizeof(raw)) != 0) {
-            snprintf(path, sizeof(path), "/sys/class/net/%s/brport/port_no", de->d_name);
+            snprintf(path, sizeof(path), "/sys/class/net/%s/brport/port_no",
+                     l->ifname);
             raw[0] = '\0';
         }
         if (read_first_line(path, raw, sizeof(raw)) == 0)
             normalize_bridge_port_no(raw, l->port_no, sizeof(l->port_no));
-        snprintf(path, sizeof(path), "/sys/class/net/%s/speed", de->d_name);
+        snprintf(path, sizeof(path), "/sys/class/net/%s/speed", l->ifname);
         if (read_first_line(path, raw, sizeof(raw)) == 0 && strcmp(raw, "-1"))
-            snprintf(l->link_speed, sizeof(l->link_speed), "%s Mbps", raw);
+            snprintf(l->link_speed, sizeof(l->link_speed), "%.16s Mbps", raw);
         count++;
     }
     closedir(dir);
@@ -936,14 +945,9 @@ static void observe_lan_service_identity(const char *mac, const char *ip)
 
 static int identity_iface_is_client_lan(const char *ifname)
 {
-    if (!ifname || !ifname[0])
-        return 0;
-    if (!strncmp(ifname, "wan", 3) || !strncmp(ifname, "wwan", 4) ||
-        !strncmp(ifname, "br-wan", 6) || !strncmp(ifname, "docker", 6) ||
-        !strncmp(ifname, "br-docker", 9))
-        return 0;
-    return !strncmp(ifname, "br-", 3) || !strncmp(ifname, "lan", 3) ||
-           !strncmp(ifname, "guest", 5) || !strncmp(ifname, "iot", 3);
+    /* Delegate to topology-based check; br- prefix and WAN/docker exclusions
+     * are handled inside jmx_iface_is_lan(). */
+    return jmx_iface_is_lan(ifname);
 }
 
 static void probe_lan_services(int force)

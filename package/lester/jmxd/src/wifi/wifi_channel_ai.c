@@ -28,6 +28,8 @@
 #define CAI_MAX_ASSIGNMENT_RADIOS 16
 #define CAI_MAX_ASSIGNMENT_COMBINATIONS 1000000ULL
 #define CAI_CHANGE_MIN_IMPROVEMENT 0.05
+#define CAI_CANDIDATE_FORMAT "uci-wireless-candidate.v1"
+#define CAI_CANDIDATE_DIGEST_LEN (7 + SHA256_DIGEST_LENGTH * 2)
 
 struct cai_candidate {
     int channel;
@@ -45,8 +47,10 @@ struct cai_candidate {
 struct cai_radio {
     struct json_object *obj;
     const char *id;
+    const char *local_id;
     const char *ap_id;
     const char *band;
+    const char *htmode;
     int current_channel;
     int current_width;
     int clients;
@@ -205,6 +209,82 @@ static int band_is_24(const char *band)
 {
     return band && (!strcmp(band, "2g") || !strcmp(band, "2.4GHz") ||
                     !strcmp(band, "2.4g") || !strcmp(band, "2GHz"));
+}
+
+static const char *radio_local_id(const struct cai_radio *radio, char *out,
+                                  size_t out_len)
+{
+    const char *id;
+    const char *marker;
+
+    if (!radio || !out || out_len == 0)
+        return "";
+    id = radio->local_id && radio->local_id[0] ? radio->local_id : radio->id;
+    if (!id)
+        return "";
+    if (!strncmp(id, "local:radio:", 12))
+        id += 12;
+    else if ((marker = strstr(id, ":radio:")) != NULL)
+        id = marker + 7;
+    snprintf(out, out_len, "%s", id);
+    return out;
+}
+
+static int htmode_family_supports_width(const char *family, int width)
+{
+    if (!strcmp(family, "HT"))
+        return width == 20 || width == 40;
+    if (!strcmp(family, "VHT") || !strcmp(family, "HE"))
+        return width == 20 || width == 40 || width == 80 || width == 160;
+    if (!strcmp(family, "EHT"))
+        return width == 20 || width == 40 || width == 80 || width == 160 ||
+               width == 240 || width == 320;
+    return 0;
+}
+
+static void radio_htmode_for_width(const char *band, const char *current,
+                                   int current_width, int width,
+                                   char *out, size_t out_len)
+{
+    char family[8] = "";
+    size_t i = 0;
+    const char *fallback;
+
+    if (!out || out_len == 0)
+        return;
+    if (!band)
+        band = "";
+    if (!current)
+        current = "";
+    if (current[0] && current_width == width) {
+        snprintf(out, out_len, "%s", current);
+        return;
+    }
+    while (current[i] >= 'A' && current[i] <= 'Z' &&
+           i + 1 < sizeof(family)) {
+        family[i] = current[i];
+        i++;
+    }
+    family[i] = '\0';
+    if (family[0] && htmode_family_supports_width(family, width)) {
+        snprintf(out, out_len, "%s%d", family, width);
+        return;
+    }
+    if (width == 20)
+        fallback = "HT20";
+    else if (width == 40)
+        fallback = band_is_24(band) ? "HT40" : "VHT40";
+    else if (width == 80)
+        fallback = !strcmp(band, "6g") ? "HE80" : "VHT80";
+    else if (width == 160)
+        fallback = !strcmp(band, "6g") ? "HE160" : "VHT160";
+    else if (width == 240)
+        fallback = "EHT240";
+    else if (width == 320)
+        fallback = "EHT320";
+    else
+        fallback = "";
+    snprintf(out, out_len, "%s", fallback);
 }
 
 static int channel_overlap(int a, int aw, int b, int bw, const char *band)
@@ -866,8 +946,10 @@ struct json_object *wifi_channel_ai_plan_json(struct json_object *wifi_data,
         dst = &radios[count++];
         dst->obj = radio;
         dst->id = strv(radio, "id", "");
+        dst->local_id = strv(radio, "local_id", "");
         dst->ap_id = strv(radio, "ap_id", "local");
         dst->band = strv(radio, "band", "");
+        dst->htmode = strv(radio, "htmode", "");
         dst->current_channel = intv(radio, "channel", 0);
         dst->current_width = intv(radio, "width_mhz",
                                    intv(radio, "width", 20));
@@ -985,6 +1067,8 @@ struct json_object *wifi_channel_ai_plan_json(struct json_object *wifi_data,
         struct json_object *reasons = json_object_new_array();
         struct cai_candidate *best = NULL;
         struct cai_candidate *current_candidate = NULL;
+        char local_id[96];
+        char proposed_htmode[16];
         size_t j;
         const char *action = "keep_current";
         const char *confidence = "unknown";
@@ -1030,15 +1114,26 @@ struct json_object *wifi_channel_ai_plan_json(struct json_object *wifi_data,
         }
         json_object_object_add(current, "channel", json_object_new_int(radios[i].current_channel));
         json_object_object_add(current, "width_mhz", json_object_new_int(radios[i].current_width));
+        json_object_object_add(current, "htmode",
+                               json_object_new_string(radios[i].htmode));
         if (best) {
             json_object_object_add(proposed, "channel", json_object_new_int(best->channel));
             json_object_object_add(proposed, "width_mhz", json_object_new_int(best->width_mhz));
+            radio_htmode_for_width(radios[i].band, radios[i].htmode,
+                                   radios[i].current_width, best->width_mhz,
+                                   proposed_htmode,
+                                   sizeof(proposed_htmode));
+            json_object_object_add(proposed, "htmode",
+                                   json_object_new_string(proposed_htmode));
         } else {
             json_object_object_add(proposed, "channel", json_object_new_null());
             json_object_object_add(proposed, "width_mhz", json_object_new_null());
+            json_object_object_add(proposed, "htmode", json_object_new_null());
         }
         json_object_object_add(row, "ap_id", json_object_new_string(radios[i].ap_id));
         json_object_object_add(row, "radio_id", json_object_new_string(radios[i].id));
+        json_object_object_add(row, "local_radio_id", json_object_new_string(
+            radio_local_id(&radios[i], local_id, sizeof(local_id))));
         json_object_object_add(row, "band", json_object_new_string(radios[i].band));
         json_object_object_add(row, "current", current);
         json_object_object_add(row, "proposed", proposed);
@@ -1186,6 +1281,277 @@ struct json_object *wifi_channel_ai_status_json(struct json_object *wifi_data,
 done:
     if (plan) json_object_put(plan);
     return status;
+}
+
+static int apply_radio_id_valid(const char *value)
+{
+    size_t i;
+    size_t len = value ? strlen(value) : 0;
+
+    if (len == 0 || len > 32)
+        return 0;
+    for (i = 0; i < len; i++)
+        if (!((value[i] >= 'a' && value[i] <= 'z') ||
+              (value[i] >= '0' && value[i] <= '9') || value[i] == '_'))
+            return 0;
+    return 1;
+}
+
+static int candidate_sections_digest(struct json_object *sections,
+                                     char out[CAI_CANDIDATE_DIGEST_LEN + 1])
+{
+    EVP_MD_CTX *context = NULL;
+    unsigned char digest[SHA256_DIGEST_LENGTH];
+    char hex[SHA256_DIGEST_LENGTH * 2 + 1];
+    size_t i;
+
+    if (!sections || !json_object_is_type(sections, json_type_array) ||
+        json_object_array_length(sections) == 0 ||
+        !(context = EVP_MD_CTX_new()) ||
+        EVP_DigestInit_ex(context, EVP_sha256(), NULL) != 1)
+        goto fail;
+    for (i = 0; i < json_object_array_length(sections); i++) {
+        struct json_object *section = json_object_array_get_idx(sections, i);
+        struct json_object *options = child_obj(section, "options");
+        const char *name = strv(section, "section", "");
+
+        if (!name[0] || !options ||
+            EVP_DigestUpdate(context, name, strlen(name)) != 1 ||
+            EVP_DigestUpdate(context, "\n", 1) != 1)
+            goto fail;
+        json_object_object_foreach(options, option, value) {
+            const char *text;
+
+            if (!value || !json_object_is_type(value, json_type_string) ||
+                !(text = json_object_get_string(value)) ||
+                EVP_DigestUpdate(context, option, strlen(option)) != 1 ||
+                EVP_DigestUpdate(context, "=", 1) != 1 ||
+                EVP_DigestUpdate(context, text, strlen(text)) != 1 ||
+                EVP_DigestUpdate(context, "\n", 1) != 1)
+                goto fail;
+        }
+    }
+    if (EVP_DigestFinal_ex(context, digest, NULL) != 1)
+        goto fail;
+    EVP_MD_CTX_free(context);
+    hex_digest(digest, hex);
+    snprintf(out, CAI_CANDIDATE_DIGEST_LEN + 1, "sha256:%s", hex);
+    return 0;
+fail:
+    EVP_MD_CTX_free(context);
+    return -1;
+}
+
+static struct json_object *manifest_target_sections(
+    struct json_object *builders, const char *ap_id)
+{
+    size_t i;
+
+    for (i = 0; i < json_object_array_length(builders); i++) {
+        struct json_object *entry = json_object_array_get_idx(builders, i);
+
+        if (!strcmp(strv(entry, "ap_id", ""), ap_id))
+            return child_array(entry, "sections");
+    }
+    {
+        struct json_object *entry = json_object_new_object();
+        struct json_object *sections = json_object_new_array();
+
+        if (!entry || !sections) {
+            json_object_put(entry);
+            json_object_put(sections);
+            return NULL;
+        }
+        json_object_object_add(entry, "ap_id", json_object_new_string(ap_id));
+        json_object_object_add(entry, "sections", sections);
+        json_object_array_add(builders, entry);
+        return sections;
+    }
+}
+
+static struct json_object *apply_manifest_error(struct json_object *root,
+                                                const char *reason)
+{
+    json_object_object_add(root, "ok", json_object_new_boolean(0));
+    json_object_object_add(root, "error",
+                           json_object_new_string("capability_disabled"));
+    json_object_object_add(root, "reason", json_object_new_string(reason));
+    return root;
+}
+
+struct json_object *wifi_channel_ai_apply_manifest_json(
+    struct json_object *plan)
+{
+    struct json_object *root = json_object_new_object();
+    struct json_object *local_radios = json_object_new_array();
+    struct json_object *builders = json_object_new_array();
+    struct json_object *managed_targets = json_object_new_array();
+    struct json_object *radios = child_array(plan, "radios");
+    const char *status = strv(plan, "status", "");
+    size_t i;
+    int suggested = 0;
+
+    if (!root || !local_radios || !builders || !managed_targets)
+        goto allocation_failed;
+    if (strcmp(status, "ready") && strcmp(status, "partial_support")) {
+        json_object_put(local_radios);
+        json_object_put(builders);
+        json_object_put(managed_targets);
+        return apply_manifest_error(root, "plan_not_ready");
+    }
+    if (!radios || json_object_array_length(radios) == 0) {
+        json_object_put(local_radios);
+        json_object_put(builders);
+        json_object_put(managed_targets);
+        return apply_manifest_error(root, "plan_radios_required");
+    }
+    for (i = 0; i < json_object_array_length(radios); i++) {
+        struct json_object *row = json_object_array_get_idx(radios, i);
+        struct json_object *proposed = child_obj(row, "proposed");
+        const char *action = strv(row, "action", "");
+        const char *ap_id = strv(row, "ap_id", "");
+        const char *radio_id = strv(row, "local_radio_id", "");
+        const char *band = strv(row, "band", "");
+        const char *htmode = strv(proposed, "htmode", "");
+        char derived_id[96];
+        char derived_htmode[16];
+        int channel;
+        int width;
+
+        if (!strcmp(action, "keep_current"))
+            continue;
+        if (strcmp(action, "suggest_change") || !proposed || !ap_id[0])
+            goto invalid_plan;
+        if (!radio_id[0]) {
+            struct cai_radio radio = {
+                .id = strv(row, "radio_id", ""),
+                .local_id = "",
+            };
+
+            radio_id = radio_local_id(&radio, derived_id, sizeof(derived_id));
+        }
+        channel = intv(proposed, "channel", 0);
+        width = intv(proposed, "width_mhz", 0);
+        if (!apply_radio_id_valid(radio_id) || channel <= 0 ||
+            width <= 0 || width > 320)
+            goto invalid_plan;
+        if (!htmode[0]) {
+            struct json_object *current = child_obj(row, "current");
+
+            radio_htmode_for_width(band, strv(current, "htmode", ""),
+                                   intv(current, "width_mhz", 0), width,
+                                   derived_htmode, sizeof(derived_htmode));
+            htmode = derived_htmode;
+        }
+        if (!htmode[0])
+            goto invalid_plan;
+        suggested++;
+        if (!strcmp(ap_id, "local")) {
+            struct json_object *update = json_object_new_object();
+
+            if (!update)
+                goto allocation_failed;
+            json_object_object_add(update, "id",
+                                   json_object_new_string(radio_id));
+            json_object_object_add(update, "band", json_object_new_string(band));
+            json_object_object_add(update, "channel",
+                                   json_object_new_int(channel));
+            json_object_object_add(update, "width", json_object_new_int(width));
+            json_object_object_add(update, "htmode",
+                                   json_object_new_string(htmode));
+            json_object_array_add(local_radios, update);
+        } else {
+            struct json_object *sections = manifest_target_sections(builders,
+                                                                     ap_id);
+            struct json_object *section;
+            struct json_object *options;
+            char number[16];
+
+            if (!sections)
+                goto allocation_failed;
+            section = json_object_new_object();
+            options = json_object_new_object();
+            if (!section || !options) {
+                json_object_put(section);
+                json_object_put(options);
+                goto allocation_failed;
+            }
+            snprintf(number, sizeof(number), "%d", channel);
+            json_object_object_add(options, "channel",
+                                   json_object_new_string(number));
+            json_object_object_add(options, "htmode",
+                                   json_object_new_string(htmode));
+            json_object_object_add(section, "section",
+                                   json_object_new_string(radio_id));
+            json_object_object_add(section, "options", options);
+            json_object_array_add(sections, section);
+        }
+    }
+    for (i = 0; i < json_object_array_length(builders); i++) {
+        struct json_object *builder = json_object_array_get_idx(builders, i);
+        struct json_object *sections = child_array(builder, "sections");
+        struct json_object *candidate = json_object_new_object();
+        struct json_object *target = json_object_new_object();
+        char digest[CAI_CANDIDATE_DIGEST_LEN + 1];
+        const char *candidate_text;
+
+        if (!candidate || !target ||
+            candidate_sections_digest(sections, digest) != 0) {
+            json_object_put(candidate);
+            json_object_put(target);
+            goto allocation_failed;
+        }
+        json_object_object_add(candidate, "format",
+                               json_object_new_string(CAI_CANDIDATE_FORMAT));
+        json_object_object_add(candidate, "candidate_digest",
+                               json_object_new_string(digest));
+        json_object_object_add(candidate, "sections", json_object_get(sections));
+        candidate_text = json_object_to_json_string_ext(
+            candidate, JSON_C_TO_STRING_PLAIN);
+        if (!candidate_text) {
+            json_object_put(candidate);
+            json_object_put(target);
+            goto allocation_failed;
+        }
+        json_object_object_add(target, "ap_id",
+            json_object_new_string(strv(builder, "ap_id", "")));
+        json_object_object_add(target, "candidate",
+                               json_object_new_string(candidate_text));
+        json_object_object_add(target, "candidate_digest",
+                               json_object_new_string(digest));
+        json_object_array_add(managed_targets, target);
+        json_object_put(candidate);
+    }
+    json_object_put(builders);
+    if (json_object_array_length(local_radios) > 0 &&
+        json_object_array_length(managed_targets) > 0) {
+        json_object_put(local_radios);
+        json_object_put(managed_targets);
+        return apply_manifest_error(root,
+            "mixed_scope_atomic_apply_unsupported");
+    }
+    json_object_object_add(root, "ok", json_object_new_boolean(1));
+    json_object_object_add(root, "scope", json_object_new_string(
+        suggested == 0 ? "noop" :
+        json_object_array_length(local_radios) > 0 ? "local" : "managed_ap"));
+    json_object_object_add(root, "suggested_count",
+                           json_object_new_int(suggested));
+    json_object_object_add(root, "local_radios", local_radios);
+    json_object_object_add(root, "managed_targets", managed_targets);
+    return root;
+
+invalid_plan:
+    json_object_put(local_radios);
+    json_object_put(builders);
+    json_object_put(managed_targets);
+    return apply_manifest_error(root, "invalid_plan_radio");
+allocation_failed:
+    json_object_put(local_radios);
+    json_object_put(builders);
+    json_object_put(managed_targets);
+    if (!root)
+        return NULL;
+    return apply_manifest_error(root, "allocation_failed");
 }
 
 struct json_object *wifi_channel_ai_apply_disabled_json(const char *plan_id,

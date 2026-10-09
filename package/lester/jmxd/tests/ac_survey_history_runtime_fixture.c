@@ -57,7 +57,8 @@ static double scalar_double(const char *sql)
 }
 
 static struct json_object *snapshot_new(int64_t observed_at, int frequency,
-                                        int64_t active, int64_t busy)
+                                        int64_t active, int64_t busy,
+                                        const char *source)
 {
     struct json_object *root = json_object_new_object();
     struct json_object *radios = json_object_new_array();
@@ -73,7 +74,8 @@ static struct json_object *snapshot_new(int64_t observed_at, int frequency,
     json_object_object_add(root, "ssids", json_object_new_array());
     json_object_object_add(root, "stations", json_object_new_array());
     json_object_object_add(radio, "id", json_object_new_string("phy0"));
-    json_object_object_add(survey, "source", json_object_new_string("iw_survey"));
+    json_object_object_add(survey, "source",
+                           json_object_new_string(source ? source : "iw_survey"));
     json_object_object_add(survey, "complete", json_object_new_boolean(1));
     json_object_object_add(survey, "interface", json_object_new_string("wlan0"));
     json_object_object_add(survey, "frequency_mhz",
@@ -98,12 +100,13 @@ fail:
     return NULL;
 }
 
-static int store_sample(const struct ac_device_model_report *report,
-                        int64_t sequence, int64_t received_at, int frequency,
-                        int64_t active, int64_t busy)
+static int store_sample_source(const struct ac_device_model_report *report,
+                               int64_t sequence, int64_t received_at,
+                               int frequency, int64_t active, int64_t busy,
+                               const char *source)
 {
     struct json_object *snapshot = snapshot_new(received_at, frequency,
-                                                active, busy);
+                                                active, busy, source);
     char snapshot_id[80];
     int rc;
 
@@ -115,6 +118,75 @@ static int store_sample(const struct ac_device_model_report *report,
                                   received_at, snapshot_id, report, snapshot);
     json_object_put(snapshot);
     return rc;
+}
+
+static int store_sample(const struct ac_device_model_report *report,
+                        int64_t sequence, int64_t received_at, int frequency,
+                        int64_t active, int64_t busy)
+{
+    return store_sample_source(report, sequence, received_at, frequency,
+                               active, busy, "iw_survey");
+}
+
+static char *scalar_text(const char *sql)
+{
+    sqlite3_stmt *st = NULL;
+    char *result = NULL;
+    const unsigned char *text;
+
+    if (sqlite3_prepare_v2(g_ac_db, sql, -1, &st, NULL) == SQLITE_OK &&
+        sqlite3_step(st) == SQLITE_ROW) {
+        text = sqlite3_column_text(st, 0);
+        if (text)
+            result = strdup((const char *)text);
+    }
+    sqlite3_finalize(st);
+    return result;
+}
+
+/* A source switch must drop the pending delta and rebaseline instead of
+   differencing counters produced by two different producers. */
+static int source_contract(const struct ac_device_model_report *report)
+{
+    /* Above the dense retention rows so the row-count prune keeps these
+       buckets instead of trimming them as the oldest. */
+    int64_t base = 30000000;
+    char *stored = NULL;
+    int before;
+    int after;
+    int persisted;
+
+    if (store_sample_source(report, 100, base, 5180, 40000, 4000,
+                            "apstats_radio") != 0)
+        return -1;
+    stored = scalar_text("SELECT source FROM ac_radio_survey_cursor "
+                         "WHERE ap_id='" AP_ID "' AND radio_id='phy0'");
+    persisted = stored && !strcmp(stored, "apstats_radio");
+    free(stored);
+    if (!persisted)
+        return -1;
+    if (store_sample_source(report, 101, base + 300, 5180, 40600, 4100,
+                            "apstats_radio") != 0)
+        return -1;
+    before = scalar("SELECT COUNT(*) FROM ac_radio_survey_bucket "
+                    "WHERE resolution_seconds=300 AND source='apstats_radio'");
+    if (before < 1)
+        return -1;
+    /* Same monotonic counters, different producer: no new bucket may appear. */
+    if (store_sample_source(report, 102, base + 600, 5180, 41200, 4200,
+                            "iw_survey") != 0)
+        return -1;
+    after = scalar("SELECT COUNT(*) FROM ac_radio_survey_bucket "
+                   "WHERE resolution_seconds=300 AND source='apstats_radio'");
+    if (after != before)
+        return -1;
+    stored = scalar_text("SELECT source FROM ac_radio_survey_cursor "
+                         "WHERE ap_id='" AP_ID "' AND radio_id='phy0'");
+    persisted = stored && !strcmp(stored, "iw_survey");
+    free(stored);
+    if (!persisted)
+        return -1;
+    return 0;
 }
 
 static int history_contract(void)
@@ -183,8 +255,11 @@ static int history_contract(void)
         scalar("SELECT COUNT(*) FROM ac_radio_survey_bucket WHERE ap_id='" AP_ID "' AND radio_id='phy0' AND resolution_seconds=300") > 576 ||
         scalar("SELECT COUNT(*) FROM ac_radio_survey_bucket WHERE resolution_seconds=3600 AND last_received_at=1") != 0)
         return -1;
+    if (source_contract(&report) != 0)
+        return -1;
     printf("schema=%d fine_points=5 dense_suppressed=1 reset_safe=1 weighted=1 "
-           "pagination=1 bounded_rows=%d old_rows=%d\n",
+           "pagination=1 source_persisted=1 source_change_rebaselined=1 "
+           "bounded_rows=%d old_rows=%d\n",
            scalar("SELECT version FROM ac_schema_meta WHERE singleton=1"),
            scalar("SELECT COUNT(*) FROM ac_radio_survey_bucket WHERE ap_id='" AP_ID "' AND radio_id='phy0' AND resolution_seconds=300"),
            scalar("SELECT COUNT(*) FROM ac_radio_survey_bucket WHERE resolution_seconds=3600 AND last_received_at=1"));

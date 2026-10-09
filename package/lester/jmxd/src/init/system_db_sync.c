@@ -355,6 +355,21 @@ static int inspect_one(const struct system_db_spec *spec,
     memset(item, 0, sizeof(*item));
     snprintf(item->name, sizeof(item->name), "%s", spec->name);
     snprintf(item->target, sizeof(item->target), "%s", spec->target);
+    /* Online-resource images intentionally contain neither immutable source.
+     * Keep downloaded bytes across upgrades; an absent first-boot cache stays
+     * absent until the authenticated resource downloader succeeds. Malformed
+     * or conflicting bundled files still follow the strict checks below. */
+    struct stat new_stat, legacy_stat;
+    int new_missing = lstat(spec->new_source, &new_stat) != 0 && errno == ENOENT;
+    int legacy_missing = lstat(spec->legacy_source, &legacy_stat) != 0 && errno == ENOENT;
+    if (new_missing && legacy_missing) {
+        item->target_valid = validate_database(spec->target, spec->kind) == 0 &&
+                             sha256_file(spec->target, item->target_sha256) == 0;
+        snprintf(item->source_selection, sizeof(item->source_selection), "%s", "cloud-managed");
+        snprintf(item->action, sizeof(item->action), "%s",
+                 item->target_valid ? "cached" : "missing");
+        return 0;
+    }
     if (jmx_path_select_immutable(spec->new_source, spec->legacy_source,
                                   selected, sizeof(selected), &selection,
                                   selection_error, sizeof(selection_error)) != 0) {
@@ -394,6 +409,8 @@ static int sync_one(const struct system_db_spec *spec,
 
     if (inspect_one(spec, item) != 0)
         return -1;
+    if (!item->source_valid)
+        return 0;
     need_replace = !item->target_valid ||
                    !item->applied_firmware_identity[0] ||
                    strcmp(item->applied_firmware_identity,

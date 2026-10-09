@@ -37,8 +37,9 @@
 /*
  * Queue bound. A deferred ubus request holds kernel-side state, so an unbounded
  * queue would let a burst of slow queries accumulate without limit. When full,
- * submit() refuses and the caller runs the query inline: slower for that one
- * request, but never a leak and never a silent drop.
+ * submit() refuses. Slow-read callers return a retryable source-unavailable
+ * response or an existing stale snapshot; they must not run the query inline
+ * and block the uloop thread that this pool exists to protect.
  */
 #define DW_ASYNC_MAX_PENDING 64
 
@@ -50,6 +51,7 @@ struct dw_async_job {
     struct json_object *out;
     dw_async_query_fn fn;
     dw_async_reply_fn reply;
+    void *reply_arg;
     unsigned int gen;               /* ubus connection generation at submit */
 };
 
@@ -68,6 +70,58 @@ static struct {
     struct uloop_fd ufd;
     int initialised;
 } g_async;
+
+static struct {
+    pthread_mutex_t lock;
+    unsigned long long peak_pending;
+    unsigned long long submitted;
+    unsigned long long completed;
+    unsigned long long rejected_unavailable;
+    unsigned long long rejected_saturated;
+    unsigned long long rejected_oom;
+    unsigned long long rejected_invalid;
+} g_async_stats = {
+    .lock = PTHREAD_MUTEX_INITIALIZER,
+};
+
+static void dw_async_record_rejection(enum dw_async_submit_result result)
+{
+    pthread_mutex_lock(&g_async_stats.lock);
+    switch (result) {
+    case DW_ASYNC_SUBMIT_UNAVAILABLE:
+        g_async_stats.rejected_unavailable++;
+        break;
+    case DW_ASYNC_SUBMIT_SATURATED:
+        g_async_stats.rejected_saturated++;
+        break;
+    case DW_ASYNC_SUBMIT_OOM:
+        g_async_stats.rejected_oom++;
+        break;
+    case DW_ASYNC_SUBMIT_INVALID:
+        g_async_stats.rejected_invalid++;
+        break;
+    case DW_ASYNC_SUBMIT_OK:
+    default:
+        break;
+    }
+    pthread_mutex_unlock(&g_async_stats.lock);
+}
+
+static void dw_async_record_submission(int pending)
+{
+    pthread_mutex_lock(&g_async_stats.lock);
+    g_async_stats.submitted++;
+    if ((unsigned long long)pending > g_async_stats.peak_pending)
+        g_async_stats.peak_pending = (unsigned long long)pending;
+    pthread_mutex_unlock(&g_async_stats.lock);
+}
+
+static void dw_async_record_completion(void)
+{
+    pthread_mutex_lock(&g_async_stats.lock);
+    g_async_stats.completed++;
+    pthread_mutex_unlock(&g_async_stats.lock);
+}
 
 /*
  * Bumped whenever the ubus connection is lost. A job deferred on the old
@@ -172,7 +226,7 @@ static void dw_async_drain_done(void)
          * full timeout, which is exactly the hang this work set out to remove.
          */
         if (job->reply)
-            job->reply(job->ctx, &job->req, job->out);
+            job->reply(job->ctx, &job->req, job->out, job->reply_arg);
         ubus_complete_deferred_request(job->ctx, &job->req, 0);
         dw_async_job_free(job);
     }
@@ -220,6 +274,7 @@ static void *dw_async_worker(void *arg)
         if (g_async.pending > 0)
             g_async.pending--;
         pthread_mutex_unlock(&g_async.lock);
+        dw_async_record_completion();
 
         /*
          * One byte is enough; the callback drains the whole done queue. Errors
@@ -339,45 +394,153 @@ int dw_async_query_pending(void)
     return n;
 }
 
-int dw_async_query_submit(struct ubus_context *ctx,
-                          struct ubus_request_data *req,
-                          struct json_object *in,
-                          dw_async_query_fn fn,
-                          dw_async_reply_fn reply)
+int dw_async_query_capacity(void)
+{
+    return DW_ASYNC_MAX_PENDING;
+}
+
+const char *dw_async_query_submit_reason(enum dw_async_submit_result result)
+{
+    switch (result) {
+    case DW_ASYNC_SUBMIT_UNAVAILABLE:
+        return "async_query_pool_unavailable";
+    case DW_ASYNC_SUBMIT_SATURATED:
+        return "async_query_queue_saturated";
+    case DW_ASYNC_SUBMIT_OOM:
+        return "async_query_out_of_memory";
+    case DW_ASYNC_SUBMIT_INVALID:
+        return "async_query_invalid_request";
+    case DW_ASYNC_SUBMIT_OK:
+    default:
+        return "async_query_available";
+    }
+}
+
+struct json_object *dw_async_query_status_json(void)
+{
+    struct json_object *root = json_object_new_object();
+    unsigned int workers = 0;
+    int running = 0;
+    int pending = 0;
+    unsigned long long peak_pending;
+    unsigned long long submitted;
+    unsigned long long completed;
+    unsigned long long rejected_unavailable;
+    unsigned long long rejected_saturated;
+    unsigned long long rejected_oom;
+    unsigned long long rejected_invalid;
+
+    if (g_async.initialised) {
+        pthread_mutex_lock(&g_async.lock);
+        workers = g_async.thread_count;
+        running = g_async.running;
+        pending = g_async.pending;
+        pthread_mutex_unlock(&g_async.lock);
+    }
+    pthread_mutex_lock(&g_async_stats.lock);
+    peak_pending = g_async_stats.peak_pending;
+    submitted = g_async_stats.submitted;
+    completed = g_async_stats.completed;
+    rejected_unavailable = g_async_stats.rejected_unavailable;
+    rejected_saturated = g_async_stats.rejected_saturated;
+    rejected_oom = g_async_stats.rejected_oom;
+    rejected_invalid = g_async_stats.rejected_invalid;
+    pthread_mutex_unlock(&g_async_stats.lock);
+
+    json_object_object_add(root, "running", json_object_new_boolean(running));
+    json_object_object_add(root, "workers", json_object_new_int((int)workers));
+    json_object_object_add(root, "pending", json_object_new_int(pending));
+    json_object_object_add(root, "capacity",
+                           json_object_new_int(DW_ASYNC_MAX_PENDING));
+    json_object_object_add(root, "peak_pending",
+                           json_object_new_int64((int64_t)peak_pending));
+    json_object_object_add(root, "submitted",
+                           json_object_new_int64((int64_t)submitted));
+    json_object_object_add(root, "completed",
+                           json_object_new_int64((int64_t)completed));
+    json_object_object_add(root, "rejected_unavailable",
+                           json_object_new_int64((int64_t)rejected_unavailable));
+    json_object_object_add(root, "rejected_saturated",
+                           json_object_new_int64((int64_t)rejected_saturated));
+    json_object_object_add(root, "rejected_oom",
+                           json_object_new_int64((int64_t)rejected_oom));
+    json_object_object_add(root, "rejected_invalid",
+                           json_object_new_int64((int64_t)rejected_invalid));
+    return root;
+}
+
+enum dw_async_submit_result dw_async_query_submit(
+    struct ubus_context *ctx,
+    struct ubus_request_data *req,
+    struct json_object *in,
+    dw_async_query_fn fn,
+    dw_async_reply_fn reply,
+    void *arg)
 {
     struct dw_async_job *job;
+    int generated_input = 0;
 
-    if (!dw_async_query_available() || !ctx || !req || !fn)
-        return -1;
-
-    pthread_mutex_lock(&g_async.lock);
-    if (g_async.pending >= DW_ASYNC_MAX_PENDING) {
-        pthread_mutex_unlock(&g_async.lock);
-        return -1;
+    if (!ctx || !req || !fn) {
+        dw_async_record_rejection(DW_ASYNC_SUBMIT_INVALID);
+        return DW_ASYNC_SUBMIT_INVALID;
     }
-    pthread_mutex_unlock(&g_async.lock);
+    if (!dw_async_query_available()) {
+        dw_async_record_rejection(DW_ASYNC_SUBMIT_UNAVAILABLE);
+        return DW_ASYNC_SUBMIT_UNAVAILABLE;
+    }
 
     job = calloc(1, sizeof(*job));
-    if (!job)
-        return -1;
+    if (!job) {
+        dw_async_record_rejection(DW_ASYNC_SUBMIT_OOM);
+        return DW_ASYNC_SUBMIT_OOM;
+    }
     job->ctx = ctx;
     job->fn = fn;
     job->reply = reply;
+    job->reply_arg = arg;
     job->gen = g_async_conn_gen;
     /* Ownership transfer, not a shared reference: see the header. */
-    job->in = in ? in : json_object_new_object();
+    job->in = in;
+    if (!job->in) {
+        job->in = json_object_new_object();
+        generated_input = 1;
+    }
+    if (!job->in) {
+        free(job);
+        dw_async_record_rejection(DW_ASYNC_SUBMIT_OOM);
+        return DW_ASYNC_SUBMIT_OOM;
+    }
 
     /*
      * Defer before queueing. Once ubus_defer_request() has copied the request,
      * libubus will not answer it on return, and our copy is the only thing that
      * can complete it.
      */
-    ubus_defer_request(ctx, req, &job->req);
-
     pthread_mutex_lock(&g_async.lock);
+    if (!g_async.running) {
+        pthread_mutex_unlock(&g_async.lock);
+        if (generated_input)
+            json_object_put(job->in);
+        job->in = NULL;
+        free(job);
+        dw_async_record_rejection(DW_ASYNC_SUBMIT_UNAVAILABLE);
+        return DW_ASYNC_SUBMIT_UNAVAILABLE;
+    }
+    if (g_async.pending >= DW_ASYNC_MAX_PENDING) {
+        pthread_mutex_unlock(&g_async.lock);
+        if (generated_input)
+            json_object_put(job->in);
+        job->in = NULL;
+        free(job);
+        dw_async_record_rejection(DW_ASYNC_SUBMIT_SATURATED);
+        return DW_ASYNC_SUBMIT_SATURATED;
+    }
+    ubus_defer_request(ctx, req, &job->req);
     dw_async_queue_push(&g_async.queue_head, &g_async.queue_tail, job);
     g_async.pending++;
+    generated_input = g_async.pending;
+    dw_async_record_submission(generated_input);
     pthread_cond_signal(&g_async.cond);
     pthread_mutex_unlock(&g_async.lock);
-    return 0;
+    return DW_ASYNC_SUBMIT_OK;
 }

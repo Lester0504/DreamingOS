@@ -1040,17 +1040,34 @@ struct json_object *jmx_gateway_shadow_pairing_identity(void)
 static struct json_object *gs_start_new(struct json_object *payload)
 {
     struct gs_identity identity;
-    struct gs_session session;
+    struct gs_session session, old_session;
     struct json_object *offer = NULL, *result = NULL;
     char code[GS_PAIR_CODE_LEN + 1];
     char transcript[GS_PAIR_TRANSCRIPT_MAX], signature[129], code_path[1024];
     uint32_t random_code;
     memset(&session, 0, sizeof(session)); memset(code, 0, sizeof(code));
+    memset(&old_session, 0, sizeof(old_session));
     if (gs_binding_read(gs_config_object(payload), "", &session.local_binding) != 0)
         return gs_result(0, "pairing_binding_invalid");
+
+    /* Cleanup expired pending session before creating new one */
+    if (gs_load_session(&old_session) == 0 &&
+        old_session.expires_at < gs_now()) {
+        char old_code_path[1024];
+        if (gs_code_path(old_session.session_id, old_code_path, sizeof(old_code_path)) == 0)
+            unlink(old_code_path);
+        /* Clear session but keep trust records intact */
+        memset(&old_session, 0, sizeof(old_session));
+        gs_save_session(&old_session);
+    }
     if (gs_load_identity(&identity) != 0 || RAND_bytes((unsigned char *)&random_code,
                                                        sizeof(random_code)) != 1)
         return gs_result(0, "identity_or_rng_unavailable");
+    /* Rejection sampling to avoid modulo bias */
+    while (random_code >= 4200000000U) {
+        if (RAND_bytes((unsigned char *)&random_code, sizeof(random_code)) != 1)
+            return gs_result(0, "identity_or_rng_unavailable");
+    }
     snprintf(code, sizeof(code), "%08u", (unsigned int)(random_code % 100000000U));
     snprintf(session.role, sizeof(session.role), "initiator");
     snprintf(session.state, sizeof(session.state), "offer_created");

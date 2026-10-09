@@ -28,6 +28,8 @@ static const char apd_config_job_schema[] =
     "outcome TEXT NOT NULL DEFAULT '' "
     "CHECK(outcome IN ('','applied','failed','rolled_back')),"
     "error_code TEXT NOT NULL DEFAULT '',"
+    "operation TEXT NOT NULL DEFAULT 'apply',"
+    "rollback_of_job_id TEXT NOT NULL DEFAULT '',"
     "observed_at INTEGER NOT NULL DEFAULT 0,"
     "finish_acked INTEGER NOT NULL DEFAULT 0 CHECK(finish_acked IN (0,1)),"
     "finish_acked_at INTEGER NOT NULL DEFAULT 0,"
@@ -109,13 +111,26 @@ static int config_digest_valid(const char *value)
 static int config_assignment_valid(
     const struct apd_config_job_assignment *assignment)
 {
+    const char *operation = assignment && assignment->operation[0] ?
+        assignment->operation : "apply";
+
     return assignment && config_uuid_valid(assignment->job_id) &&
            config_uuid_valid(assignment->attempt_id) &&
            assignment->dispatch_generation > 0 &&
            config_digest_valid(assignment->request_digest) &&
            config_digest_valid(assignment->candidate_digest) &&
            config_uuid_valid(assignment->ap_id) &&
-           config_epoch_valid(assignment->session_epoch);
+           config_epoch_valid(assignment->session_epoch) &&
+           (!strcmp(operation, "apply") ||
+            (!strcmp(operation, "rollback") &&
+             config_uuid_valid(assignment->rollback_of_job_id)));
+}
+
+static const char *config_assignment_operation(
+    const struct apd_config_job_assignment *assignment)
+{
+    return assignment && assignment->operation[0] ?
+           assignment->operation : "apply";
 }
 
 static void config_copy(char *out, size_t size, const char *value)
@@ -127,7 +142,8 @@ static void config_copy(char *out, size_t size, const char *value)
 #define APD_CONFIG_JOB_COLUMNS \
     "job_id,attempt_id,dispatch_generation,request_digest," \
     "candidate_digest,ap_id,session_epoch,state,finish_id,outcome," \
-    "error_code,observed_at,finish_acked,created_at,updated_at"
+    "error_code,observed_at,finish_acked,created_at,updated_at," \
+    "operation,rollback_of_job_id"
 
 static void config_entry_from_statement(
     sqlite3_stmt *statement, struct apd_config_job_journal_entry *out)
@@ -162,6 +178,12 @@ static void config_entry_from_statement(
     out->finish_acked = sqlite3_column_int(statement, 12);
     out->created_at = sqlite3_column_int64(statement, 13);
     out->updated_at = sqlite3_column_int64(statement, 14);
+    config_copy(out->assignment.operation,
+                sizeof(out->assignment.operation),
+                (const char *)sqlite3_column_text(statement, 15));
+    config_copy(out->assignment.rollback_of_job_id,
+                sizeof(out->assignment.rollback_of_job_id),
+                (const char *)sqlite3_column_text(statement, 16));
 }
 
 static int config_entry_load(const char *job_id,
@@ -203,14 +225,43 @@ static int config_assignment_matches(
                    assignment->request_digest) &&
            !strcmp(entry->assignment.candidate_digest,
                    assignment->candidate_digest) &&
-           !strcmp(entry->assignment.ap_id, assignment->ap_id);
+           !strcmp(entry->assignment.ap_id, assignment->ap_id) &&
+           !strcmp(config_assignment_operation(&entry->assignment),
+                   config_assignment_operation(assignment)) &&
+           !strcmp(entry->assignment.rollback_of_job_id,
+                   assignment->rollback_of_job_id);
 }
 
 int apd_config_job_journal_init(void)
 {
-    return g_apd_db && sqlite3_exec(g_apd_db, apd_config_job_schema, NULL,
-                                    NULL, NULL) == SQLITE_OK ?
-           APD_CONFIG_JOB_JOURNAL_OK : APD_CONFIG_JOB_JOURNAL_ERROR;
+    sqlite3_stmt *statement = NULL;
+    int has_operation = 0;
+    int has_rollback_of = 0;
+
+    if (!g_apd_db || sqlite3_exec(g_apd_db, apd_config_job_schema, NULL,
+                                  NULL, NULL) != SQLITE_OK)
+        return APD_CONFIG_JOB_JOURNAL_ERROR;
+    if (sqlite3_prepare_v2(g_apd_db,
+            "PRAGMA table_info(apd_config_job_journal)", -1, &statement,
+            NULL) != SQLITE_OK)
+        return APD_CONFIG_JOB_JOURNAL_ERROR;
+    while (sqlite3_step(statement) == SQLITE_ROW) {
+        const char *name = (const char *)sqlite3_column_text(statement, 1);
+
+        has_operation |= name && !strcmp(name, "operation");
+        has_rollback_of |= name && !strcmp(name, "rollback_of_job_id");
+    }
+    sqlite3_finalize(statement);
+    if (!has_operation && sqlite3_exec(g_apd_db,
+            "ALTER TABLE apd_config_job_journal ADD COLUMN operation TEXT "
+            "NOT NULL DEFAULT 'apply'", NULL, NULL, NULL) != SQLITE_OK)
+        return APD_CONFIG_JOB_JOURNAL_ERROR;
+    if (!has_rollback_of && sqlite3_exec(g_apd_db,
+            "ALTER TABLE apd_config_job_journal ADD COLUMN "
+            "rollback_of_job_id TEXT NOT NULL DEFAULT ''", NULL, NULL,
+            NULL) != SQLITE_OK)
+        return APD_CONFIG_JOB_JOURNAL_ERROR;
+    return APD_CONFIG_JOB_JOURNAL_OK;
 }
 
 int apd_config_job_offer_store(
@@ -245,8 +296,9 @@ int apd_config_job_offer_store(
     if (sqlite3_prepare_v2(g_apd_db,
             "INSERT INTO apd_config_job_journal(job_id,attempt_id,"
             "dispatch_generation,request_digest,candidate_digest,ap_id,"
-            "session_epoch,state,candidate_json,created_at,updated_at) "
-            "VALUES(?1,?2,?3,?4,?5,?6,?7,'offered',?8,?9,?9)",
+            "session_epoch,state,candidate_json,created_at,updated_at,"
+            "operation,rollback_of_job_id) "
+            "VALUES(?1,?2,?3,?4,?5,?6,?7,'offered',?8,?9,?9,?10,?11)",
             -1, &statement, NULL) != SQLITE_OK)
         goto fail;
     sqlite3_bind_text(statement, 1, assignment->job_id, -1,
@@ -264,6 +316,10 @@ int apd_config_job_offer_store(
                       SQLITE_TRANSIENT);
     sqlite3_bind_text(statement, 8, candidate_json, -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(statement, 9, now);
+    sqlite3_bind_text(statement, 10, config_assignment_operation(assignment), -1,
+                      SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 11, assignment->rollback_of_job_id, -1,
+                      SQLITE_TRANSIENT);
     if (sqlite3_step(statement) != SQLITE_DONE)
         goto fail;
     sqlite3_finalize(statement);
@@ -544,8 +600,8 @@ int apd_config_job_recovery_next(struct apd_config_job_recovery *out)
     switch (sqlite3_step(statement)) {
     case SQLITE_ROW:
         config_entry_from_statement(statement, &out->entry);
-        out->candidate_json = config_column_dup(statement, 15);
-        out->previous_json = config_column_dup(statement, 16);
+        out->candidate_json = config_column_dup(statement, 17);
+        out->previous_json = config_column_dup(statement, 18);
         rc = out->candidate_json && out->previous_json ?
              APD_CONFIG_JOB_JOURNAL_OK : APD_CONFIG_JOB_JOURNAL_ERROR;
         break;
@@ -591,7 +647,7 @@ int apd_config_job_pending_reconcile_get(
     switch (sqlite3_step(statement)) {
     case SQLITE_ROW:
         config_entry_from_statement(statement, &out->entry);
-        out->readback_json = config_column_dup(statement, 15);
+        out->readback_json = config_column_dup(statement, 17);
         rc = out->readback_json ? APD_CONFIG_JOB_JOURNAL_OK :
              APD_CONFIG_JOB_JOURNAL_ERROR;
         break;
@@ -680,6 +736,45 @@ int apd_config_job_journal_get(const char *job_id,
     if (!g_apd_db || !config_uuid_valid(job_id))
         return APD_CONFIG_JOB_JOURNAL_INVALID;
     return config_entry_load(job_id, out);
+}
+
+int apd_config_job_previous_get(
+    const struct apd_config_job_assignment *assignment,
+    char **previous_json_out)
+{
+    sqlite3_stmt *statement = NULL;
+    const char *source_job_id;
+    int rc = APD_CONFIG_JOB_JOURNAL_ERROR;
+
+    if (!g_apd_db || !config_assignment_valid(assignment) ||
+        strcmp(config_assignment_operation(assignment), "rollback") ||
+        !previous_json_out)
+        return APD_CONFIG_JOB_JOURNAL_INVALID;
+    *previous_json_out = NULL;
+    source_job_id = assignment->rollback_of_job_id;
+    if (sqlite3_prepare_v2(g_apd_db,
+            "SELECT previous_json FROM apd_config_job_journal "
+            "WHERE job_id=?1 AND ap_id=?2 AND operation='apply' "
+            "AND state='completed' AND outcome='applied' "
+            "AND previous_json<>''", -1, &statement, NULL) != SQLITE_OK)
+        return APD_CONFIG_JOB_JOURNAL_ERROR;
+    sqlite3_bind_text(statement, 1, source_job_id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(statement, 2, assignment->ap_id, -1,
+                      SQLITE_TRANSIENT);
+    switch (sqlite3_step(statement)) {
+    case SQLITE_ROW:
+        *previous_json_out = config_column_dup(statement, 0);
+        rc = *previous_json_out ? APD_CONFIG_JOB_JOURNAL_OK :
+             APD_CONFIG_JOB_JOURNAL_ERROR;
+        break;
+    case SQLITE_DONE:
+        rc = APD_CONFIG_JOB_JOURNAL_NOT_FOUND;
+        break;
+    default:
+        break;
+    }
+    sqlite3_finalize(statement);
+    return rc;
 }
 
 int apd_config_job_journal_prune(int64_t now)

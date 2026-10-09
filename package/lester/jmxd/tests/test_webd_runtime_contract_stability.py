@@ -2,10 +2,19 @@
 """Regression checks for stable system, clients, and audit contracts."""
 
 from pathlib import Path
+import re
 
 
 ROOT = Path(__file__).resolve().parents[1]
-WEB = (ROOT / "src" / "webd" / "jmx_app_api.c").read_text(encoding="utf-8")
+import sys
+sys.path.insert(0, str(ROOT.parent))
+from jmxd.tests.webd_sources import (
+    webd_dispatch_text,
+    webd_function_text,
+    webd_module_text,
+)
+WEB = webd_dispatch_text()
+CLIENTS = webd_module_text("api_clients_list.c")
 CORE_UBUS = (ROOT / "src" / "jmx_ubus.c").read_text(encoding="utf-8")
 
 
@@ -39,8 +48,7 @@ def test_interrupt_projection_uses_kernel_runtime_sources() -> None:
 
 
 def test_clients_never_falls_back_to_plain_text() -> None:
-    body = function("static struct json_object *webd_clients_response",
-                    "static void webd_system_settings_scrub_sensitive")
+    body = webd_function_text("api_clients_list.c", "webd_clients_response")
     # The params argument is NULL for the filtered inventory and carries
     # include_stale for the full history, so the call is not a fixed literal.
     # What matters is that this is the ubus source and the 2500 ms bound.
@@ -57,7 +65,12 @@ def test_clients_never_falls_back_to_plain_text() -> None:
     assert '"client inventory source is not available"' in body
     # The route may pass extra options (with_apps), but it must still be this
     # JSON builder that answers, never a plain-text fallback.
-    assert 'resp = webd_clients_response(&status' in WEB
+    handler = webd_function_text("api_clients_list.c", "clients_list_any")
+    assert 'return webd_clients_response(&ctx->status' in handler
+    assert re.search(
+        r'JMX_API_ROUTE\(\d+,\s*"/api/v1/clients",\s*"",\s*JMX_API_EXACT,',
+        CLIENTS,
+    )
     assert 'http_send(fd, 500, "Internal Server Error", "text/plain"' not in WEB
     assert 'http_send_json(fd, 500, resp)' in WEB
 

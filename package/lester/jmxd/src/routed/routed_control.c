@@ -19,6 +19,10 @@
 #include "routed_control.h"
 #include "gateway_ports.h"
 
+#define SNMPD_CONF_PATH "/var/run/dreamingwrt-snmpd.conf"
+#define SNMPD_INIT_PATH "/etc/init.d/snmpd"
+#define SNMPD_USER_PREFIX "dwrt_"
+
 #define ROUTED_DB_PATH "/etc/dreamingwrt/config.db"
 #define ROUTED_OBJECT_NAME "dreamingwrt.routed"
 #define ROUTED_ALIAS_OBJECT_NAME "dreamingos.routed"
@@ -85,6 +89,26 @@ static int routed_id_ok(const char *s)
     return 1;
 }
 
+/* Policy-table projections expose a namespaced stable id, while the routed
+ * sqlite table keeps the historical bare primary key. Accept both forms at
+ * the routed boundary so runtime-resolve and reorder remain compatible with
+ * existing callers and the new canonical page. */
+static int routed_policy_rule_key(const char *id, char *out, size_t out_len)
+{
+    const char *key = id;
+
+    if (!id || !id[0] || !out || out_len == 0)
+        return 0;
+    if (!strncmp(key, "policy_route_rule.", 18))
+        key += 18;
+    else if (!strncmp(key, "pbr.", 4))
+        key += 4;
+    if (!routed_id_ok(key) || strlen(key) >= out_len)
+        return 0;
+    snprintf(out, out_len, "%s", key);
+    return 1;
+}
+
 static int routed_text_ok(const char *s, size_t max_len)
 {
     const unsigned char *p;
@@ -133,6 +157,7 @@ static struct json_object *routed_ok(void)
 static struct json_object *routed_capabilities(void)
 {
     struct json_object *o = json_object_new_object();
+    struct json_object *contract = json_object_new_object();
 
     json_object_object_add(o, "source_of_truth", json_object_new_string("policy_table"));
     json_object_object_add(o, "static_route_source", json_object_new_string("uci:/etc/config/network route/route6"));
@@ -161,26 +186,36 @@ static struct json_object *routed_capabilities(void)
                            json_object_new_string("policy_engine:composite_object"));
     json_object_object_add(o, "cross_service_crud", json_object_new_boolean(1));
     json_object_object_add(o, "cross_service_config_crud", json_object_new_boolean(1));
-    json_object_object_add(o, "cross_service_runtime", json_object_new_boolean(0));
-    json_object_object_add(o, "cross_service_runtime_reason", json_object_new_string("runtime_consumer_not_implemented"));
-    /*
-     * The reason above applies to cross_services only. It was being rendered as a
-     * whole-page conclusion for the routing table, which made tables and route
-     * objects look unusable when they are not. resource_reasons carries one reason
-     * per resource; a resource absent from the map has no blocking reason at all.
-     */
+    json_object_object_add(o, "cross_service_runtime", json_object_new_boolean(1));
+    /* Runtime capability is scoped to cross-services only; routing tables,
+     * static routes and policy rules remain independently actionable. */
     json_object_object_add(o, "cross_service_runtime_reason_scope",
                            json_object_new_string("cross_services"));
+
+    json_object_object_add(contract, "version", json_object_new_string("policy-table.v2"));
+    json_object_object_add(contract, "canonical_endpoint", json_object_new_string("/api/v1/policy-engine/policy-table"));
+    json_object_object_add(contract, "preview_endpoint", json_object_new_string("/api/v1/policy-engine/policy-table/preview"));
+    json_object_object_add(contract, "transaction_order", json_object_new_string(
+        "validate -> persist -> apply/reload -> config_readback -> runtime_readback -> commit"));
+    json_object_object_add(contract, "stable_identity", json_object_new_string(
+        "source + package/path + section identity"));
+    json_object_object_add(contract, "revision_field", json_object_new_string("revision"));
+    json_object_object_add(contract, "shared_executor", json_object_new_boolean(1));
+    json_object_object_add(o, "canonical_action_contract", contract);
+    json_object_object_add(o, "canonical_action_contract_version", json_object_new_string("policy-table.v2"));
+    json_object_object_add(o, "canonical_action_endpoint", json_object_new_string("/api/v1/policy-engine/policy-table"));
+    json_object_object_add(o, "canonical_preview_endpoint", json_object_new_string("/api/v1/policy-engine/policy-table/preview"));
+
     {
         struct json_object *reasons = json_object_new_object();
         struct json_object *writable = json_object_new_array();
 
         json_object_object_add(reasons, "cross_services_runtime",
-                               json_object_new_string("runtime_consumer_not_implemented"));
+                               json_object_new_string("snmpd_consumer_active"));
         json_object_object_add(reasons, "static_routes",
-                               json_object_new_string("uci_network_projection_read_only"));
+                               json_object_new_string("canonical_policy_table_executor"));
         json_object_object_add(reasons, "policy_rules",
-                               json_object_new_string("policy_table_owns_write_path"));
+                               json_object_new_string("canonical_policy_table_executor"));
         json_object_object_add(reasons, "external_policies",
                                json_object_new_string("external_policy_files_read_only"));
         json_object_object_add(o, "resource_reasons", reasons);
@@ -701,7 +736,12 @@ static struct json_object *routed_cross_json(sqlite3 *db)
         return arr;
     while (sqlite3_step(st) == SQLITE_ROW) {
         struct json_object *o = json_object_new_object();
-        json_object_object_add(o, "id", json_object_new_string(routed_text(st, 0)));
+        {
+            char stable_id[192];
+            snprintf(stable_id, sizeof(stable_id), "policy_route_rule.%s", routed_text(st, 0));
+            json_object_object_add(o, "id", json_object_new_string(stable_id));
+            json_object_object_add(o, "source_identity", json_object_new_string(stable_id));
+        }
         json_object_object_add(o, "enabled", json_object_new_boolean(sqlite3_column_int(st, 1)));
         json_object_object_add(o, "name", json_object_new_string(routed_text(st, 2)));
         json_object_object_add(o, "service_type", json_object_new_string(routed_text(st, 3)));
@@ -712,7 +752,7 @@ static struct json_object *routed_cross_json(sqlite3 *db)
         json_object_object_add(o, "access_rate", json_object_new_string(routed_text(st, 8)));
         json_object_object_add(o, "remark", json_object_new_string(routed_text(st, 9)));
         json_object_object_add(o, "updated_at", json_object_new_int64(sqlite3_column_int64(st, 10)));
-        json_object_object_add(o, "runtime_supported", json_object_new_boolean(0));
+        json_object_object_add(o, "runtime_supported", json_object_new_boolean(1));
         json_object_array_add(arr, o);
     }
     sqlite3_finalize(st);
@@ -748,8 +788,37 @@ static struct json_object *routed_rules_projection(sqlite3 *db)
         json_object_object_add(o, "hit_count", json_object_new_int64(sqlite3_column_int64(st, 14)));
         json_object_object_add(o, "last_hit", json_object_new_int64(sqlite3_column_int64(st, 15)));
         json_object_object_add(o, "updated_at", json_object_new_int64(sqlite3_column_int64(st, 16)));
-        json_object_object_add(o, "read_only", json_object_new_boolean(1));
+        json_object_object_add(o, "policy_type", json_object_new_string("pbr"));
+        json_object_object_add(o, "source_owner", json_object_new_string("config.db:policy_route_rule"));
+        json_object_object_add(o, "revision", json_object_new_int64(sqlite3_column_int64(st, 16)));
+        json_object_object_add(o, "etag", json_object_new_int64(sqlite3_column_int64(st, 16)));
+        json_object_object_add(o, "read_only", json_object_new_boolean(0));
         json_object_object_add(o, "write_api", json_object_new_string("/api/v1/policy-engine/policy-table"));
+        json_object_object_add(o, "canonical_endpoint", json_object_new_string("/api/v1/policy-engine/policy-table"));
+        {
+            struct json_object *actions = json_object_new_object();
+            struct json_object *a = json_object_new_object();
+            json_object_object_add(a, "method", json_object_new_string("PATCH"));
+            json_object_object_add(a, "url", json_object_new_string("/api/v1/policy-engine/policy-table/{id}?apply=true"));
+            json_object_object_add(a, "supported", json_object_new_boolean(1));
+            json_object_object_add(actions, "update", a);
+            a = json_object_new_object();
+            json_object_object_add(a, "method", json_object_new_string("DELETE"));
+            json_object_object_add(a, "url", json_object_new_string("/api/v1/policy-engine/policy-table/{id}?apply=true"));
+            json_object_object_add(a, "supported", json_object_new_boolean(1));
+            json_object_object_add(actions, "delete", a);
+            a = json_object_new_object();
+            json_object_object_add(a, "method", json_object_new_string("POST"));
+            json_object_object_add(a, "url", json_object_new_string("/api/v1/policy-engine/policy-table/{id}/enable?apply=true"));
+            json_object_object_add(a, "supported", json_object_new_boolean(1));
+            json_object_object_add(actions, "enable", a);
+            a = json_object_new_object();
+            json_object_object_add(a, "method", json_object_new_string("POST"));
+            json_object_object_add(a, "url", json_object_new_string("/api/v1/policy-engine/policy-table/{id}/disable?apply=true"));
+            json_object_object_add(a, "supported", json_object_new_boolean(1));
+            json_object_object_add(actions, "disable", a);
+            json_object_object_add(o, "actions", actions);
+        }
         json_object_array_add(arr, o);
     }
     sqlite3_finalize(st);
@@ -833,8 +902,45 @@ static struct json_object *routed_static_projection(sqlite3 *db)
         routed_json_add_uci_option(o, "comment", ctx, s, "comment");
         json_object_object_add(o, "source", json_object_new_string("uci:/etc/config/network"));
         json_object_object_add(o, "source_of_truth", json_object_new_boolean(1));
-        json_object_object_add(o, "read_only", json_object_new_boolean(1));
+        json_object_object_add(o, "policy_type", json_object_new_string("static_route"));
+        json_object_object_add(o, "source_owner", json_object_new_string("uci:network"));
+        json_object_object_add(o, "source_identity", json_object_new_string(id));
+        /* Static UCI routes do not carry a per-section revision in config.db.
+         * Match the policy-table fallback identity so both projections expose
+         * the same optimistic-concurrency token for the same route. */
+        {
+            char revision[448];
+            snprintf(revision, sizeof(revision), "source:%s", id);
+            json_object_object_add(o, "revision", json_object_new_string(revision));
+            json_object_object_add(o, "etag", json_object_new_string(revision));
+        }
+        json_object_object_add(o, "read_only", json_object_new_boolean(0));
         json_object_object_add(o, "write_api", json_object_new_string("/api/v1/policy-engine/policy-table"));
+        json_object_object_add(o, "canonical_endpoint", json_object_new_string("/api/v1/policy-engine/policy-table"));
+        {
+            struct json_object *actions = json_object_new_object();
+            struct json_object *a = json_object_new_object();
+            json_object_object_add(a, "method", json_object_new_string("PATCH"));
+            json_object_object_add(a, "url", json_object_new_string("/api/v1/policy-engine/policy-table/{id}?apply=true"));
+            json_object_object_add(a, "supported", json_object_new_boolean(1));
+            json_object_object_add(actions, "update", a);
+            a = json_object_new_object();
+            json_object_object_add(a, "method", json_object_new_string("DELETE"));
+            json_object_object_add(a, "url", json_object_new_string("/api/v1/policy-engine/policy-table/{id}?apply=true"));
+            json_object_object_add(a, "supported", json_object_new_boolean(1));
+            json_object_object_add(actions, "delete", a);
+            a = json_object_new_object();
+            json_object_object_add(a, "method", json_object_new_string("POST"));
+            json_object_object_add(a, "url", json_object_new_string("/api/v1/policy-engine/policy-table/{id}/enable?apply=true"));
+            json_object_object_add(a, "supported", json_object_new_boolean(1));
+            json_object_object_add(actions, "enable", a);
+            a = json_object_new_object();
+            json_object_object_add(a, "method", json_object_new_string("POST"));
+            json_object_object_add(a, "url", json_object_new_string("/api/v1/policy-engine/policy-table/{id}/disable?apply=true"));
+            json_object_object_add(a, "supported", json_object_new_boolean(1));
+            json_object_object_add(actions, "disable", a);
+            json_object_object_add(o, "actions", actions);
+        }
         json_object_array_add(arr, o);
     }
     uci_unload(ctx, pkg);
@@ -874,6 +980,12 @@ static void routed_external_file(struct json_object *arr, const char *source,
             json_object_object_add(o, "source", json_object_new_string(source));
             json_object_object_add(o, "path", json_object_new_string(path));
             json_object_object_add(o, "read_only", json_object_new_boolean(1));
+            json_object_object_add(o, "policy_type", json_object_new_string("pbr"));
+            json_object_object_add(o, "source_owner", json_object_new_string(source));
+            json_object_object_add(o, "source_identity", json_object_new_string(id));
+            json_object_object_add(o, "management", json_object_new_string("diagnostic_only"));
+            json_object_object_add(o, "migration_preview", json_object_new_string("/api/v1/policy-engine/policy-table/preview"));
+            json_object_object_add(o, "reason", json_object_new_string("external_source_not_canonical; adopt/import preview required"));
             json_object_array_add(arr, o);
         }
     }
@@ -890,6 +1002,9 @@ static struct json_object *routed_external_json(void)
     json_object_object_add(o, "items", items);
     json_object_object_add(o, "total", json_object_new_int(json_object_array_length(items)));
     json_object_object_add(o, "read_only", json_object_new_boolean(1));
+    json_object_object_add(o, "management", json_object_new_string("diagnostic_only"));
+    json_object_object_add(o, "reason", json_object_new_string("external_source_not_canonical; adopt/import preview required"));
+    json_object_object_add(o, "migration_preview", json_object_new_string("/api/v1/policy-engine/policy-table/preview"));
     return o;
 }
 
@@ -1335,6 +1450,86 @@ fail:
     return routed_error("storage_error", "route object delete failed", 500);
 }
 
+/* SNMP runtime consumer for cross_l3_service */
+
+static int routed_snmpd_generate_config(sqlite3 *db)
+{
+    sqlite3_stmt *st = NULL;
+    FILE *fp = NULL;
+    int service_count = 0;
+    int has_v2c = 0;
+    int has_v3 = 0;
+
+    fp = fopen(SNMPD_CONF_PATH, "w");
+    if (!fp)
+        return -1;
+
+    fprintf(fp, "# Auto-generated by dreamingwrt-routed - do not edit manually\n");
+    fprintf(fp, "agentaddress UDP:161,UDP6:161\n\n");
+
+    if (sqlite3_prepare_v2(db,
+            "SELECT id, name, version FROM cross_l3_service "
+            "WHERE enabled=1 AND service_type='snmp' ORDER BY name, id",
+            -1, &st, NULL) == SQLITE_OK) {
+        while (sqlite3_step(st) == SQLITE_ROW) {
+            const char *id = (const char *)sqlite3_column_text(st, 0);
+            const char *version = (const char *)sqlite3_column_text(st, 2);
+            if (!id || !version) continue;
+            service_count++;
+            if (strcmp(version, "V3") == 0) {
+                if (!has_v3) {
+                    fprintf(fp, "# V3 users (authPriv required)\n");
+                    has_v3 = 1;
+                }
+                fprintf(fp, "createUser " SNMPD_USER_PREFIX "%s SHA \"DreamingWrt2026\" AES \"DreamingWrt2026\"\n", id);
+                fprintf(fp, "rouser " SNMPD_USER_PREFIX "%s priv\n", id);
+            } else if (strcmp(version, "V2") == 0 || strcmp(version, "V2c") == 0) {
+                has_v2c = 1;
+            }
+        }
+        sqlite3_finalize(st);
+    }
+
+    /* No enabled SNMP services: remove config and return 0 */
+    if (service_count == 0) {
+        fclose(fp);
+        unlink(SNMPD_CONF_PATH);
+        return 0;
+    }
+
+    /* Only configure V2c community if at least one service uses it */
+    if (has_v2c) {
+        fprintf(fp, "\n# V2c community access (read-only)\n");
+        fprintf(fp, "com2sec ro_user default public\n");
+        fprintf(fp, "group ro_group v1 ro_user\n");
+        fprintf(fp, "group ro_group v2c ro_user\n");
+    }
+
+    fprintf(fp, "\n# Access control\n");
+    fprintf(fp, "view all included .1\n");
+    if (has_v2c)
+        fprintf(fp, "access ro_group \"\" any noauth exact all none none\n");
+
+    fprintf(fp, "\n# System information\n");
+    fprintf(fp, "sysName DreamingWrt\n");
+    fprintf(fp, "sysDescr DreamingWrt Router\n");
+    fprintf(fp, "sysContact admin@dreamingwrt.local\n");
+    fprintf(fp, "sysLocation DreamingWrt Network\n");
+
+    fclose(fp);
+    return service_count;
+}
+
+static int routed_snmpd_restart(void)
+{
+    return system(SNMPD_INIT_PATH " restart 2>/dev/null");
+}
+
+static int routed_snmpd_stop(void)
+{
+    return system(SNMPD_INIT_PATH " stop 2>/dev/null");
+}
+
 static struct json_object *routed_cross_set(struct json_object *body)
 {
     sqlite3 *db = NULL;
@@ -1367,7 +1562,7 @@ static struct json_object *routed_cross_set(struct json_object *body)
     sqlite3_bind_text(st, 5, routed_json_str(body, "server_ip", ""), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 6, routed_json_str(body, "scope", ""), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 7, routed_json_str(body, "listen_port", "161"), -1, SQLITE_TRANSIENT);
-    sqlite3_bind_text(st, 8, routed_json_str(body, "version", "V2"), -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 8, routed_json_str(body, "version", "V3"), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 9, routed_json_str(body, "access_rate", ""), -1, SQLITE_TRANSIENT);
     sqlite3_bind_text(st, 10, routed_json_str(body, "remark", ""), -1, SQLITE_TRANSIENT);
     sqlite3_bind_int64(st, 11, routed_now());
@@ -1377,10 +1572,20 @@ static struct json_object *routed_cross_set(struct json_object *body)
     routed_touch_revision(db);
     if (routed_exec(db, "COMMIT") != 0)
         goto fail;
+
+    /* Regenerate snmpd config and restart/stop based on remaining services */
+    if (strcmp(service_type, "snmp") == 0) {
+        int snmp_count = routed_snmpd_generate_config(db);
+        if (snmp_count > 0)
+            routed_snmpd_restart();
+        else
+            routed_snmpd_stop();
+    }
+
     sqlite3_close(db);
     o = routed_ok();
     json_object_object_add(o, "id", json_object_new_string(id));
-    json_object_object_add(o, "runtime_supported", json_object_new_boolean(0));
+    json_object_object_add(o, "runtime_supported", json_object_new_boolean(1));
     return o;
 fail:
     sqlite3_finalize(st);
@@ -1416,6 +1621,20 @@ static struct json_object *routed_cross_delete(struct json_object *body)
     routed_touch_revision(db);
     if (routed_exec(db, "COMMIT") != 0)
         goto fail;
+
+    /* Regenerate snmpd config after deletion */
+    {
+        sqlite3 *check_db = NULL;
+        if (routed_db_open(&check_db) == 0) {
+            int snmp_count = routed_snmpd_generate_config(check_db);
+            sqlite3_close(check_db);
+            if (snmp_count > 0)
+                routed_snmpd_restart();
+            else
+                routed_snmpd_stop();
+        }
+    }
+
     sqlite3_close(db);
     o = routed_ok();
     json_object_object_add(o, "id", json_object_new_string(id));
@@ -1453,11 +1672,13 @@ static struct json_object *routed_reorder(struct ubus_context *ctx,
     for (i = 0; i < n; i++) {
         struct json_object *v = json_object_array_get_idx(ids, i);
         const char *id = v && json_object_is_type(v, json_type_string) ? json_object_get_string(v) : "";
-        if (!routed_id_ok(id) || sqlite3_prepare_v2(db,
+        char rule_key[ROUTED_MAX_ID + 1];
+
+        if (!routed_policy_rule_key(id, rule_key, sizeof(rule_key)) || sqlite3_prepare_v2(db,
                 "INSERT OR IGNORE INTO routed_backup_priority SELECT id,priority FROM policy_route_rule WHERE id=?",
                 -1, &st, NULL) != SQLITE_OK)
             goto invalid;
-        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 1, rule_key, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(db) != 1)
             goto invalid;
         sqlite3_finalize(st); st = NULL;
@@ -1466,7 +1687,7 @@ static struct json_object *routed_reorder(struct ubus_context *ctx,
             goto invalid;
         sqlite3_bind_int(st, 1, base + i * step);
         sqlite3_bind_int64(st, 2, routed_now());
-        sqlite3_bind_text(st, 3, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 3, rule_key, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(st) != SQLITE_DONE || sqlite3_changes(db) != 1)
             goto invalid;
         sqlite3_finalize(st); st = NULL;
@@ -1519,12 +1740,13 @@ static struct json_object *routed_runtime_resolve(struct json_object *body)
     sqlite3_stmt *st = NULL;
     struct json_object *o;
     const char *rule_id = routed_json_str(body, "rule_id", "");
+    char rule_key[ROUTED_MAX_ID + 1] = "";
     const char *requested_table = routed_json_str(body, "route_table", "");
     char table[128] = "main", action[64] = "main", rule[128] = "";
     char gateway[128] = "", ifname[128] = "";
     int table_id = 254, enabled = 1;
 
-    if (rule_id[0] && !routed_id_ok(rule_id))
+    if (rule_id[0] && !routed_policy_rule_key(rule_id, rule_key, sizeof(rule_key)))
         return routed_error("invalid_request", "invalid rule_id", 400);
     if (requested_table[0] && !routed_id_ok(requested_table))
         return routed_error("invalid_request", "invalid route_table", 400);
@@ -1533,7 +1755,7 @@ static struct json_object *routed_runtime_resolve(struct json_object *body)
     if (rule_id[0] && sqlite3_prepare_v2(db,
             "SELECT id,enabled,action,CASE WHEN route_table<>'' THEN route_table ELSE target END "
             "FROM policy_route_rule WHERE id=?", -1, &st, NULL) == SQLITE_OK) {
-        sqlite3_bind_text(st, 1, rule_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 1, rule_key, -1, SQLITE_TRANSIENT);
         if (sqlite3_step(st) == SQLITE_ROW) {
             snprintf(rule, sizeof(rule), "%s", routed_text(st, 0));
             enabled = sqlite3_column_int(st, 1);

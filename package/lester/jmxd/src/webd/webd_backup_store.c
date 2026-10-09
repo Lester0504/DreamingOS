@@ -12,7 +12,7 @@
  *   <root>/<backup_id>/meta.txt       metadata, version=1
  *
  * Caller-supplied paths are never accepted as identity: ids are generated here
- * and validated on every lookup. Nothing in this module expires anything by age.
+ * and validated on every lookup. Age-based expiry is handled by webd_backup_purge_expired().
  */
 #define _GNU_SOURCE 1
 #include "webd_backup_store.h"
@@ -58,6 +58,8 @@
 #define BACKUP_LOCK_NAME "lock"
 #define BACKUP_RETENTION_NAME "retention.txt"
 #define BACKUP_RETENTION_TMP "retention.tmp"
+#define BACKUP_RETENTION_DAYS_NAME "retention-days.txt"
+#define BACKUP_RETENTION_DAYS_TMP "retention-days.tmp"
 #define BACKUP_SCHEDULE_NAME "schedule.txt"
 #define BACKUP_SCHEDULE_TMP "schedule.tmp"
 #define BACKUP_LASTRUN_NAME "last-run.txt"
@@ -97,7 +99,9 @@ int webd_backup_source_valid(const char *source)
 int webd_backup_frequency_valid(const char *frequency)
 {
     return frequency && (!strcmp(frequency, WEBD_BACKUP_FREQ_DAILY) ||
-                         !strcmp(frequency, WEBD_BACKUP_FREQ_WEEKLY));
+                         !strcmp(frequency, WEBD_BACKUP_FREQ_WEEKLY) ||
+                         !strcmp(frequency, WEBD_BACKUP_FREQ_MONTHLY) ||
+                         !strcmp(frequency, WEBD_BACKUP_FREQ_ONCE));
 }
 
 static int backup_id_ok(const char *id)
@@ -655,6 +659,95 @@ out:
     return rc;
 }
 
+
+/* ── retention days ──────────────────────────────────────────────────── */
+
+static unsigned retention_days_read_at(int rootfd, int *configured)
+{
+    char buf[64];
+    ssize_t n;
+    uint64_t v;
+    int fd;
+
+    if (configured) *configured = 0;
+    fd = openat(rootfd, BACKUP_RETENTION_DAYS_NAME, O_RDONLY | O_CLOEXEC | O_NOFOLLOW);
+    if (fd < 0)
+        return WEBD_BACKUP_RETENTION_DAYS_FALLBACK;
+    n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n <= 0)
+        return WEBD_BACKUP_RETENTION_DAYS_FALLBACK;
+    buf[n] = '\0';
+    while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r' || buf[n - 1] == ' '))
+        buf[--n] = '\0';
+    if (parse_u64_strict(buf, &v) != 0 ||
+        v > WEBD_BACKUP_RETENTION_DAYS_MAX)
+        return WEBD_BACKUP_RETENTION_DAYS_FALLBACK;
+    if (configured) *configured = 1;
+    return (unsigned)v;
+}
+
+unsigned webd_backup_retention_days_get(int *configured)
+{
+    unsigned value;
+    int rootfd;
+
+    if (configured) *configured = 0;
+    rootfd = open_root(NULL, 0);
+    if (rootfd < 0)
+        return WEBD_BACKUP_RETENTION_DAYS_FALLBACK;
+    value = retention_days_read_at(rootfd, configured);
+    close(rootfd);
+    return value;
+}
+
+int webd_backup_retention_days_set(unsigned days, char *err, size_t err_len)
+{
+    char buf[32];
+    int rootfd = -1;
+    int lockfd = -1;
+    int fd = -1;
+    int rc = -1;
+    ssize_t need;
+
+    if (days > WEBD_BACKUP_RETENTION_DAYS_MAX) {
+        backup_err(err, err_len, "retention_days_out_of_range");
+        return -1;
+    }
+    rootfd = open_root(err, err_len);
+    if (rootfd < 0)
+        return -1;
+    lockfd = lock_store(rootfd, err, err_len);
+    if (lockfd < 0)
+        goto out;
+    need = snprintf(buf, sizeof(buf), "%u\n", days);
+    if (need < 0 || (size_t)need >= sizeof(buf)) {
+        backup_err(err, err_len, "retention_days_write_failed");
+        goto out;
+    }
+    fd = openat(rootfd, BACKUP_RETENTION_DAYS_TMP,
+                O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC | O_NOFOLLOW, 0600);
+    if (fd < 0 || write_all_fd(fd, buf, (size_t)need) != 0 || fsync(fd) != 0) {
+        if (fd >= 0) { close(fd); fd = -1; unlinkat(rootfd, BACKUP_RETENTION_DAYS_TMP, 0); }
+        backup_err(err, err_len, "retention_days_write_failed");
+        goto out;
+    }
+    close(fd);
+    fd = -1;
+    if (renameat(rootfd, BACKUP_RETENTION_DAYS_TMP, rootfd, BACKUP_RETENTION_DAYS_NAME) != 0) {
+        unlinkat(rootfd, BACKUP_RETENTION_DAYS_TMP, 0);
+        backup_err(err, err_len, "retention_days_commit_failed");
+        goto out;
+    }
+    (void)fsync(rootfd);
+    rc = 0;
+out:
+    if (fd >= 0) close(fd);
+    if (lockfd >= 0) close(lockfd);
+    if (rootfd >= 0) close(rootfd);
+    return rc;
+}
+
 /* ── listing ─────────────────────────────────────────────────────── */
 
 /* Small helper: atomically replace a root-level state file. */
@@ -708,6 +801,7 @@ static void schedule_defaults(struct webd_backup_schedule *out)
     out->hour = 3;
     out->minute = 30;
     out->weekday = 0;
+    out->day_of_month = 1;
 }
 
 static int schedule_valid(const struct webd_backup_schedule *s)
@@ -715,7 +809,8 @@ static int schedule_valid(const struct webd_backup_schedule *s)
     return s && webd_backup_frequency_valid(s->frequency) &&
            s->hour >= 0 && s->hour <= 23 &&
            s->minute >= 0 && s->minute <= 59 &&
-           s->weekday >= 0 && s->weekday <= 6;
+           s->weekday >= 0 && s->weekday <= 6 &&
+           s->day_of_month >= 1 && s->day_of_month <= 31;
 }
 
 static void schedule_read_at(int rootfd, struct webd_backup_schedule *out)
@@ -751,6 +846,9 @@ static void schedule_read_at(int rootfd, struct webd_backup_schedule *out)
         } else if (!strcmp(line, "weekday")) {
             if (parse_u64_strict(eq, &v) != 0 || v > 6) return;
             s.weekday = (int)v;
+        } else if (!strcmp(line, "day_of_month")) {
+            if (parse_u64_strict(eq, &v) != 0 || v < 1 || v > 31) return;
+            s.day_of_month = (int)v;
         } else if (!strcmp(line, "configured_at")) {
             if (parse_time_strict(eq, &s.configured_at) != 0) return;
         } else if (!strcmp(line, "owner_hex"))
@@ -801,10 +899,11 @@ int webd_backup_schedule_set(const struct webd_backup_schedule *in,
                     "hour=%d\n"
                     "minute=%d\n"
                     "weekday=%d\n"
+                    "day_of_month=%d\n"
                     "configured_at=%lld\n"
                     "owner_hex=%s\n",
                     in->enabled ? 1 : 0, in->frequency, in->hour, in->minute,
-                    in->weekday, (long long)time(NULL), owner_hex);
+                    in->weekday, in->day_of_month, (long long)time(NULL), owner_hex);
     if (need < 0 || (size_t)need >= sizeof(buf)) {
         backup_err(err, err_len, "schedule_too_large");
         return -1;
@@ -931,9 +1030,19 @@ int webd_backup_last_run_record(const char *result, const char *error,
 static time_t schedule_prev_fire(const struct webd_backup_schedule *s, time_t now)
 {
     int weekly = !strcmp(s->frequency, WEBD_BACKUP_FREQ_WEEKLY);
+    int monthly = !strcmp(s->frequency, WEBD_BACKUP_FREQ_MONTHLY);
+    int once = !strcmp(s->frequency, WEBD_BACKUP_FREQ_ONCE);
 
-    /* Walk back day by day; 8 days covers both daily and weekly. */
-    for (int back = 0; back <= 8; back++) {
+    /*
+     * A "once" schedule is always due: the configured_at guard in
+     * webd_backup_schedule_due() prevents firing before the schedule was saved,
+     * and the executor auto-disables after the first successful run.
+     */
+    if (once)
+        return now;
+
+    /* Walk back day by day; 31 days covers daily, weekly, and monthly. */
+    for (int back = 0; back <= 31; back++) {
         time_t probe = now - (time_t)back * 86400;
         struct tm tmv;
         time_t fire;
@@ -953,6 +1062,14 @@ static time_t schedule_prev_fire(const struct webd_backup_schedule *s, time_t no
             if (!localtime_r(&fire, &check))
                 return 0;
             if (check.tm_wday != s->weekday)
+                continue;
+        }
+        if (monthly) {
+            struct tm check;
+
+            if (!localtime_r(&fire, &check))
+                return 0;
+            if (check.tm_mday != s->day_of_month)
                 continue;
         }
         return fire;
@@ -1143,6 +1260,74 @@ int webd_backup_retention_admit(unsigned *count_out, unsigned *limit_out,
     rc = retention_admit_at(rootfd, count_out, limit_out, err, err_len);
     close(rootfd);
     return rc;
+}
+
+/* ── age-based purge ─────────────────────────────────────────────────────────────────── */
+
+/*
+ * Delete backups older than retention_days.  Returns the number removed, or 0
+ * when retention_days is 0 (permanent) or on store-list failure.  Errors on
+ * individual deletions are logged to stderr but do not abort the sweep: a
+ * partial purge is better than no purge.
+ *
+ * Must NOT be called while the store lock is already held (the internal list +
+ * delete loop acquires it once).
+ */
+static int rmdir_backup_at(int rootfd, const char *id);
+
+unsigned webd_backup_purge_expired(void)
+{
+    struct webd_backup_list list;
+    unsigned days;
+    int days_configured;
+    int rootfd;
+    int lockfd;
+    time_t cutoff;
+    time_t now = time(NULL);
+    unsigned purged = 0;
+    char err[128] = "";
+
+    days = webd_backup_retention_days_get(&days_configured);
+    /* Retention at fallback (0) means permanent: nothing to purge. */
+    if (!days_configured || days == 0)
+        return 0;
+
+    rootfd = open_root(NULL, 0);
+    if (rootfd < 0)
+        return 0;
+
+    lockfd = lock_store(rootfd, NULL, 0);
+    if (lockfd < 0) {
+        close(rootfd);
+        return 0;
+    }
+
+    cutoff = now - (time_t)days * 86400;
+
+    if (list_at(rootfd, &list, err, sizeof(err)) != 0) {
+        close(lockfd);
+        close(rootfd);
+        return 0;
+    }
+
+    for (size_t i = 0; i < list.count; i++) {
+        if (list.items[i].created_at >= cutoff)
+            continue;
+        if (rmdir_backup_at(rootfd, list.items[i].backup_id) == 0) {
+            purged++;
+        } else {
+            fprintf(stderr, "[dreamingwrt-webd] purge: could not delete %s: %s\n",
+                    list.items[i].backup_id, strerror(errno));
+        }
+    }
+
+    if (purged > 0)
+        (void)fsync(rootfd);
+
+    webd_backup_list_free(&list);
+    close(lockfd);
+    close(rootfd);
+    return purged;
 }
 
 /* ── publish ─────────────────────────────────────────────────────── */

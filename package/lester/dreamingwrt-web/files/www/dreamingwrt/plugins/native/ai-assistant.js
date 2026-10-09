@@ -2,7 +2,16 @@ let oauthCallbackClaimed = false;
 
 export function mount(context = {}) {
   const root = context.root || document.getElementById('routePreview');
-  const mode = context.mode === 'global-drawer' ? 'global-drawer' : 'settings-route';
+  const mode = ['global-drawer', 'desktop', 'terminal'].includes(context.mode) ? context.mode : 'settings-route';
+  const isDesktop = mode === 'desktop';
+  const isTerminal = mode === 'terminal';
+  const terminalTargets = new Map();
+  let pendingTerminalTarget = null;
+  function bindTerminalMessage(message) {
+    if (isTerminal && pendingTerminalTarget) terminalTargets.set(message.id, pendingTerminalTarget);
+    return message;
+  }
+  const hasChat = mode !== 'settings-route';
   const isGlobal = mode === 'global-drawer';
   const api = context.api || {};
   const ui = context.ui || {};
@@ -12,17 +21,19 @@ export function mount(context = {}) {
   const fetchApi = api.fetch || (async (name, url) => {
     const response = await sessionFetch(url, { credentials: 'same-origin', cache: 'no-store' });
     const json = await response.json().catch(() => ({}));
-    const ok = response.ok && json?.ok !== false;
+    const ok = response.ok && json?.ok !== false && json?.data?.ok !== false;
     return { name, ok, data: json?.data ?? json, raw: json, error: ok ? null : new Error(apiErrorText(json, response.statusText)) };
   });
 
-  const VERSION = '20260822-ai-settings-savebar-02';
+  const VERSION = '20261003-ai-local-01';
   const INSTANCE_ID = `ai-${Math.random().toString(36).slice(2)}-${Date.now().toString(36)}`;
   const MODULE_CLASS = 'ai-assistant-route-host';
-  const ACTIVE_CONVERSATION_KEY = 'dreamingwrt.ai.activeConversation';
+  const ACTIVE_CONVERSATION_KEY = isTerminal ? 'dreamingwrt.ai.terminalConversation' : 'dreamingwrt.ai.activeConversation';
   const ACTIVE_CONVERSATION_TTL = 60 * 60 * 1000;
   const wallpaper = isGlobal ? document.getElementById('appWallpaper') : null;
   const ENDPOINTS = {
+    status: '/api/v1/ai/status',
+    localStatus: '/api/v1/ai/local/status',
     config: '/api/v1/ai/config',
     models: '/api/v1/ai/models',
     modelsSync: '/api/v1/ai/models/sync',
@@ -109,7 +120,7 @@ export function mount(context = {}) {
   }
 
   function loadActiveConversation() {
-    if (!isGlobal) return { id: '', at: 0 };
+    if (!hasChat) return { id: '', at: 0 };
     try {
       const value = JSON.parse(sessionStorage.getItem(ACTIVE_CONVERSATION_KEY) || 'null');
       const at = Number(value?.at) || 0;
@@ -123,11 +134,14 @@ export function mount(context = {}) {
     }
   }
 
-  const initialRequest = isGlobal ? consumeInitialRequest() : { prompt: '', autoSend: false };
+  const initialRequest = hasChat ? consumeInitialRequest() : { prompt: '', autoSend: false };
   const activeConversation = loadActiveConversation();
   const state = {
     mounted: true,
-    tab: isGlobal ? 'chat' : 'settings',
+    tab: hasChat ? 'chat' : 'settings',
+    runtimeStatus: null, runtimeError: '', localStatus: null, localError: '',
+    localModels: [], localVolumes: [], localCanonical: {}, localDraft: {}, localDirty: false, localLoading: false, localPending: false,
+    historyTotal: 0, historySeq: 0, saveConflict: false, historyDirty: false, savingHistory: null, contextSources: null,
     settingsTab: 'overview',
     drawerOpen: Boolean(initialRequest.prompt),
     historyPage: 1,
@@ -230,14 +244,15 @@ export function mount(context = {}) {
   }
 
   async function receiveConfigUpdated(event) {
-    if (event.detail?.source === INSTANCE_ID || !state.mounted) return;
+    if (event.detail?.source === INSTANCE_ID || !state.mounted || settingsDirty()) return;
     const result = await fetchApi('ai-config-update', ENDPOINTS.config);
-    if (!state.mounted || !result?.ok) return;
+    if (!state.mounted || !result?.ok || settingsDirty()) return;
     state.config = normalizeConfig(result.data);
     state.oauth.available = state.config.oauth.available;
     state.oauth.catalog = state.config.oauth.catalog;
     if (state.oauth.available) await loadOAuthStatus(state.config.provider, { quiet: true });
     markBaseline();
+    await loadRuntimeStatus();
     render();
   }
 
@@ -250,13 +265,23 @@ export function mount(context = {}) {
   }
 
   function notifyConfigUpdated() {
+    loadRuntimeStatus().then(render);
     window.dispatchEvent(new CustomEvent('dwrt:ai-config-updated', { detail: { source: INSTANCE_ID } }));
+    configChannel?.postMessage({ type: 'config', source: INSTANCE_ID });
   }
 
   function notifyOAuthUpdated(provider) {
     window.dispatchEvent(new CustomEvent('dwrt:ai-oauth-updated', { detail: { source: INSTANCE_ID, provider } }));
   }
 
+  // Cross-host messages invalidate canonical data only; credentials never leave the API response.
+  const configChannel = typeof BroadcastChannel === 'function' ? new BroadcastChannel('dwrt-ai-canonical') : null;
+  if (configChannel) configChannel.onmessage = event => {
+    if (event.data?.type === 'config') receiveConfigUpdated({ detail: event.data });
+    if (event.data?.type === 'history' && hasChat) refreshHistory();
+  };
+  function refreshOnFocus() { if (state.loading) return; loadRuntimeStatus(); if (hasChat) refreshHistory(false); }
+  window.addEventListener('focus', refreshOnFocus);
   window.addEventListener('message', receiveOAuthCompletion);
   window.addEventListener('dwrt:ai-config-updated', receiveConfigUpdated);
   window.addEventListener('dwrt:ai-oauth-updated', receiveOAuthUpdated);
@@ -349,7 +374,7 @@ export function mount(context = {}) {
   if (isGlobal) window.addEventListener('resize', handleViewportResize, { passive: true });
 
   function setTab(value) {
-    state.tab = value === 'history' && isGlobal ? 'history' : isGlobal ? 'chat' : 'settings';
+    state.tab = isDesktop && ['chat', 'history', 'settings', 'local'].includes(value) ? value : value === 'history' && isGlobal ? 'history' : isGlobal ? 'chat' : 'settings';
   }
 
   function firstText(...values) {
@@ -359,6 +384,12 @@ export function mount(context = {}) {
       if (text) return text;
     }
     return '';
+  }
+
+  function messageText(...values) {
+    if (!isTerminal) return firstText(...values);
+    // Terminal actions must preserve indentation and the final newline verbatim.
+    return values.find(value => typeof value === 'string' && value.trim()) || '';
   }
 
   function firstNumber(...values) {
@@ -422,6 +453,7 @@ export function mount(context = {}) {
       reasoning_effort: firstText(data.reasoning_effort, 'auto'),
       reasoning_api_shape: firstText(data.reasoning_api_shape, caps.reasoning_api_shape, 'chat_completions'),
       capabilities: {
+        terminal_text_only: caps.terminal_text_only === true,
         reasoning_effort_supported: caps.reasoning_effort_supported !== false,
         reasoning_effort_values: asArray(caps.reasoning_effort_values).map(String),
         attachment_ids: caps.attachment_ids === true,
@@ -594,10 +626,30 @@ export function mount(context = {}) {
   }
 
   function credentialReady() {
-    if (!state.config.enabled) return false;
-    if (state.config.auth_mode !== 'oauth') return state.config.api_key_set;
-    const status = oauthStatus();
-    return Boolean(status?.connected) && !status?.expired;
+    if (state.current.execution_backend === 'local') return state.localStatus?.ready === true;
+    return state.runtimeStatus?.ready === true && !state.runtimeError;
+  }
+
+  async function loadRuntimeStatus() {
+    const result = await fetchApi('ai-status', ENDPOINTS.status);
+    if (!state.mounted) return;
+    state.runtimeStatus = result?.ok ? unwrap(result.data) : null;
+    state.runtimeError = result?.ok ? '' : result?.error?.message || '无法读取 AI 状态';
+    state.localStatus = state.runtimeStatus?.execution_backends?.local || null;
+    if (isDesktop && !state.localStatus) {
+      const local = await fetchApi('ai-local-status', ENDPOINTS.localStatus);
+      state.localStatus = local?.ok ? unwrap(local.data) : null;
+      state.localError = local?.ok ? '' : local?.error?.message || '无法确认本机推理能力';
+    }
+  }
+
+  function runtimeStatusText() {
+    if (state.current.execution_backend === 'local') return state.localStatus?.ready ? '本机模型已加载' : '本机模型未就绪';
+    if (state.runtimeError) return state.runtimeError;
+    if (!state.runtimeStatus) return '正在读取状态';
+    const v = state.runtimeStatus;
+    if (v.state === 'ready') return v.credentials_verified ? 'API 已通过连接测试' : 'API 配置就绪 · 尚未测试';
+    return ({ not_configured: '请先配置 API 接入', credentials_invalid: '凭据验证失败', endpoint_unreachable: 'API 地址无法连接' })[v.state] || 'API 状态待确认';
   }
 
   function oauthReason(value, fallback = '') {
@@ -618,7 +670,7 @@ export function mount(context = {}) {
 
   function newConversation() {
     return {
-      id: '',
+      id: '', revision: 0, execution_backend: 'api', provider: '',
       title: '',
       model: '',
       reasoning_effort: '',
@@ -635,13 +687,13 @@ export function mount(context = {}) {
   function clearActiveConversation() {
     state.activeConversation = { id: '', at: 0 };
     state.currentTouchedAt = 0;
-    if (!isGlobal) return;
+    if (!hasChat) return;
     try { sessionStorage.removeItem(ACTIVE_CONVERSATION_KEY); } catch (_) {}
   }
 
   function touchActiveConversation(id = state.current.id) {
     const conversation = firstText(id);
-    if (!isGlobal || !conversation) return;
+    if (!hasChat || !conversation) return;
     const at = Date.now();
     state.activeConversation = { id: conversation, at };
     state.currentTouchedAt = at;
@@ -652,6 +704,7 @@ export function mount(context = {}) {
     if (!state.current.id || !state.currentTouchedAt || Date.now() - state.currentTouchedAt < ACTIVE_CONVERSATION_TTL) return false;
     clearActiveConversation();
     state.current = newConversation();
+    state.saveConflict = false; state.historyDirty = false;
     state.current.model = state.config.model;
     state.current.reasoning_effort = state.config.reasoning_effort;
     state.current.tool_policy = state.config.tool_policy;
@@ -671,7 +724,9 @@ export function mount(context = {}) {
     return {
       id: firstText(value.message_id, value.id, `${role}-${firstNumber(value.created_at, value.ts, Date.now())}-${index}`),
       role: role === 'user' ? 'user' : 'assistant',
-      content: firstText(value.content, value.text, value.message),
+      status: firstText(value.status), response_id: firstText(value.response_id),
+      execution_backend: firstText(value.execution_backend, 'api'), provider: firstText(value.provider), model: firstText(value.model), usage: value.usage ?? null,
+      content: messageText(value.content, value.text, value.message),
       created_at: normalizeTimestamp(firstNumber(value.created_at, value.ts, Date.now())),
       attachments: asArray(value.attachments).map((item) => ({
         attachment_id: firstText(item.attachment_id),
@@ -686,20 +741,20 @@ export function mount(context = {}) {
     const data = unwrap(value);
     const item = data.item && typeof data.item === 'object' ? data.item : data;
     return {
-      id: firstText(item.id),
+      id: firstText(item.id), revision: Number(item.revision) || 0, execution_backend: firstText(item.execution_backend, 'api'), provider: firstText(item.provider),
       title: firstText(item.title, '新对话'),
       model: firstText(item.model, state.config.model),
       reasoning_effort: firstText(item.reasoning_effort, state.config.reasoning_effort),
       tool_policy: firstText(item.tool_policy, state.config.tool_policy),
       usage: item.usage && typeof item.usage === 'object' ? item.usage : {},
-      messages: asArray(item.messages).map(normalizeMessage).filter((message) => message.content)
+      messages: asArray(item.messages).map(normalizeMessage).filter((message) => message.content || message.status)
     };
   }
 
   function normalizeHistory(value = {}) {
     const data = unwrap(value);
     return asArray(data.items || data.conversations || data).map((item) => ({
-      id: firstText(item.id),
+      id: firstText(item.id), revision: Number(item.revision) || 0, execution_backend: firstText(item.execution_backend, 'api'), provider: firstText(item.provider),
       title: firstText(item.title, '新对话'),
       model: firstText(item.model),
       reasoning_effort: firstText(item.reasoning_effort, 'auto'),
@@ -724,7 +779,8 @@ export function mount(context = {}) {
   }
 
   function currentModel() {
-    return firstText(state.current.model, state.config.model, state.models[0], 'gpt-4o');
+    if (state.current.execution_backend === 'local') return firstText(state.current.model, state.localStatus?.model?.loaded_id);
+    return firstText(state.current.model, state.config.model, state.models[0]);
   }
 
   function currentEffort() {
@@ -732,7 +788,7 @@ export function mount(context = {}) {
   }
 
   function currentToolPolicy() {
-    return firstText(state.current.tool_policy, state.config.tool_policy, 'confirm_medium');
+    return isTerminal ? 'disabled' : firstText(state.current.tool_policy, state.config.tool_policy, 'confirm_medium');
   }
 
   function streamingReady() {
@@ -846,7 +902,7 @@ export function mount(context = {}) {
     if (message) return message;
     message = { id: `assistant-${Date.now()}`, role: 'assistant', content: '', created_at: Date.now(), attachments: [], streaming: true };
     state.stream.messageId = message.id;
-    state.current.messages.push(message);
+    state.current.messages.push(bindTerminalMessage(message));
     render();
     return message;
   }
@@ -902,12 +958,10 @@ export function mount(context = {}) {
       const error = new Error(apiErrorText(json, `流式接口返回 ${response.status}`));
       error.status = response.status;
       error.payload = json;
-      error.notStream = !contentType.includes('text/event-stream');
       throw error;
     }
     if (!response.body?.getReader) {
       const error = new Error('当前浏览器不支持流式读取');
-      error.notStream = true;
       throw error;
     }
     const reader = response.body.getReader();
@@ -955,10 +1009,13 @@ export function mount(context = {}) {
       state.current.id = conversation;
       touchActiveConversation();
     }
+    if (Number.isInteger(payload.history_revision)) state.current.revision = payload.history_revision;
     if (firstText(payload.response_id)) state.stream.responseId = firstText(payload.response_id);
     switch (name) {
       case 'response.started':
-        ensureStreamingMessage();
+        state.stream.terminal = '';
+        state.current.execution_backend = firstText(payload.execution_backend, 'api'); state.current.provider = firstText(payload.provider); state.current.model = firstText(payload.model, state.current.model);
+        Object.assign(ensureStreamingMessage(), { status: 'generating', response_id: state.stream.responseId, execution_backend: state.current.execution_backend, provider: state.current.provider, model: state.current.model, usage: null });
         break;
       case 'response.delta':
         appendStreamDelta(payload.delta);
@@ -974,6 +1031,7 @@ export function mount(context = {}) {
         render();
         break;
       case 'response.requires_action':
+        state.stream.terminal = 'requires_action';
         state.pendingAuthorizations = asArray(payload.pending_authorizations).map(normalizeToolExecution).filter((item) => item.auth_id > 0);
         asArray(payload.tool_executions).forEach(recordToolActivity);
         state.resume = {
@@ -982,6 +1040,7 @@ export function mount(context = {}) {
           endpoint: firstText(payload.resume_endpoint, ENDPOINTS.toolResume),
           stream_endpoint: firstText(payload.resume_stream_endpoint, ENDPOINTS.toolResumeStream)
         };
+        if (streamingMessage()) streamingMessage().status = 'requires_action';
         finishStreamingMessage();
         render();
         break;
@@ -992,6 +1051,8 @@ export function mount(context = {}) {
         applyCancellation(payload);
         break;
       case 'response.failed':
+        state.stream.terminal = 'failed';
+        if (streamingMessage()) streamingMessage().status = 'failed';
         throw new Error(apiErrorText(payload, '模型响应失败'));
       default:
         break;
@@ -999,6 +1060,9 @@ export function mount(context = {}) {
   }
 
   function applyCompletion(payload = {}) {
+    state.stream.terminal = 'completed';
+    if (payload.history_saved && Number.isInteger(payload.history_revision)) { state.current.revision = payload.history_revision; state.historyDirty = false; }
+    if (streamingMessage()) Object.assign(streamingMessage(), { status: 'completed', response_id: state.stream.responseId, execution_backend: firstText(payload.execution_backend, 'api'), provider: firstText(payload.provider, state.current.provider), model: firstText(payload.model, state.current.model), usage: payload.usage ?? null });
     const reply = extractAssistantReply(payload);
     const message = streamingMessage();
     if (message) {
@@ -1006,7 +1070,7 @@ export function mount(context = {}) {
       message.streaming = false;
       state.stream.messageId = '';
     } else if (reply) {
-      state.current.messages.push({ id: `assistant-${Date.now()}`, role: 'assistant', content: reply, created_at: Date.now(), attachments: [] });
+      state.current.messages.push(bindTerminalMessage({ id: `assistant-${Date.now()}`, role: 'assistant', content: reply, created_at: Date.now(), attachments: [] }));
     }
     state.current.title = firstText(payload.conversation_title, state.current.title);
     if (payload.usage && typeof payload.usage === 'object') state.current.usage = payload.usage;
@@ -1016,7 +1080,9 @@ export function mount(context = {}) {
   }
 
   function applyCancellation(payload = {}) {
-    const partial = firstText(payload.partial_reply);
+    state.stream.terminal = 'cancelled';
+    if (streamingMessage()) Object.assign(streamingMessage(), { status: 'cancelled', response_id: state.stream.responseId });
+    const partial = messageText(payload.partial_reply);
     const message = streamingMessage();
     if (message) {
       if (partial && partial.length > message.content.length) message.content = partial;
@@ -1093,7 +1159,7 @@ export function mount(context = {}) {
       }
       state.authorizing = 0;
       finishStreamingMessage();
-      await persistCurrentConversation().catch(() => {});
+      if (state.historyDirty && !state.resume) await persistCurrentConversation().catch(() => {});
       render();
     } catch (error) {
       if (!state.mounted) return;
@@ -1107,6 +1173,9 @@ export function mount(context = {}) {
     const resumeToken = firstText(token, state.resume?.token);
     if (!resumeToken || state.resuming) return;
     state.resuming = true;
+    state.historyDirty = true;
+    state.stream.terminal = '';
+    state.stream.responseId = '';
     state.stream.active = true;
     state.chatError = '';
     render();
@@ -1116,6 +1185,7 @@ export function mount(context = {}) {
         await streamRequest(resumeEndpoint(true), { resume_token: resumeToken }, {
           onEvent: (name, payload) => handleStreamEvent(name, payload)
         });
+        if (!state.stream.terminal) { if (streamingMessage()) streamingMessage().status = 'interrupted'; throw new Error('工具续跑连接已中断，已保留收到的内容。请勿重复批准工具。'); }
       } else {
         const result = await postJson(resumeEndpoint(false), { resume_token: resumeToken });
         if (!state.mounted) return;
@@ -1124,7 +1194,8 @@ export function mount(context = {}) {
       if (!state.mounted) return;
       finishStreamingMessage();
       if (!state.pendingAuthorizations.length) {
-        await persistCurrentConversation();
+        if (state.historyDirty) await persistCurrentConversation();
+        else await refreshHistory(false);
         state.notice = '对话已保存';
       }
     } catch (error) {
@@ -1142,6 +1213,8 @@ export function mount(context = {}) {
   }
 
   function consumeResumeResult(data = {}) {
+    if (Number.isInteger(data.history_revision)) state.current.revision = data.history_revision;
+    if (data.history_saved) state.historyDirty = false;
     state.current.id = firstText(data.conversation_id, state.current.id);
     state.current.title = firstText(data.conversation_title, data.title, state.current.title);
     asArray(data.tool_executions).forEach(recordToolActivity);
@@ -1165,7 +1238,7 @@ export function mount(context = {}) {
         message.streaming = false;
         state.stream.messageId = '';
       } else {
-        state.current.messages.push({ id: `assistant-${Date.now()}`, role: 'assistant', content: reply, created_at: Date.now(), attachments: [] });
+        state.current.messages.push(bindTerminalMessage({ id: `assistant-${Date.now()}`, role: 'assistant', content: reply, created_at: Date.now(), attachments: [] }));
       }
     }
     if (data.usage && typeof data.usage === 'object') state.current.usage = data.usage;
@@ -1247,7 +1320,8 @@ export function mount(context = {}) {
     const [configResult, modelsResult, historyResult] = await Promise.all([
       fetchApi('ai-config', ENDPOINTS.config),
       fetchApi('ai-models', ENDPOINTS.models),
-      isGlobal ? fetchApi('ai-history', `${ENDPOINTS.history}?limit=100&offset=0`) : Promise.resolve({ ok: true, data: [] })
+      hasChat ? fetchApi('ai-history', historyUrl()) : Promise.resolve({ ok: true, data: [] }),
+      loadRuntimeStatus()
     ]);
     if (!state.mounted || seq !== state.seq) return;
     if (configResult?.ok) {
@@ -1276,6 +1350,7 @@ export function mount(context = {}) {
     if (!state.mounted || seq !== state.seq) return;
     if (historyResult?.ok) {
       state.history = normalizeHistory(historyResult.data);
+      state.historyTotal = Number(unwrap(historyResult.data).total) || 0;
       state.historyError = '';
     } else {
       state.history = [];
@@ -1287,7 +1362,7 @@ export function mount(context = {}) {
     if (state.oauth.available && state.config.provider) await loadOAuthStatus(state.config.provider, { quiet: true });
     await consumeOAuthCallback();
     const resumeId = firstText(state.activeConversation.id);
-    if (isGlobal && resumeId && state.history.some((item) => item.id === resumeId)) {
+    if (hasChat && resumeId) {
       await openHistory(resumeId, { quiet: true });
     } else if (resumeId) {
       clearActiveConversation();
@@ -1524,8 +1599,9 @@ export function mount(context = {}) {
     root.className = `${root.className.split(/\s+/).filter((item) => item && item !== MODULE_CLASS).join(' ')} ${MODULE_CLASS}`.trim();
     root.hidden = false;
     root.classList.toggle('ai-global-host', isGlobal);
-    root.classList.toggle('ai-settings-route-host', !isGlobal);
-    root.innerHTML = isGlobal ? globalMarkup() : `<main class="ai-assistant-shell ai-settings-route-shell"><header class="ai-settings-route-header">${settingsTabsMarkup()}</header><div class="ai-view-host">${settingsView()}</div>${settingsSavebarMarkup()}</main>`;
+    root.classList.toggle('ai-settings-route-host', !hasChat);
+    root.classList.toggle('ai-desktop-host', isDesktop);
+    root.innerHTML = isTerminal ? `<main class="ai-terminal-shell"><header><button type="button" class="ai-secondary-button" data-ai-new>新对话</button><a href="/app/ai-assistant.html" target="_blank" rel="noopener">AI 设置</a></header>${chatView()}</main>` : isDesktop ? desktopMarkup() : isGlobal ? globalMarkup() : `<main class="ai-assistant-shell ai-settings-route-shell"><header class="ai-settings-route-header">${settingsTabsMarkup()}</header><div class="ai-view-host">${settingsView()}</div>${settingsSavebarMarkup()}</main>`;
     ui.mountAll?.(root);
     bindEvents();
     if (isGlobal) bindGlobalEvents();
@@ -1539,6 +1615,114 @@ export function mount(context = {}) {
       ui.scheduleGlassCardsRender?.(120);
     }
   }
+
+  function desktopMarkup() {
+    const tabs = [['chat', '对话', 'spark'], ['history', '历史记录', 'search'], ['settings', 'API 接入', 'key'], ['local', '本地推理', 'shield']];
+    return `<main class="ai-desktop-shell"><aside class="ai-desktop-rail dwrt-rail" aria-label="AI 助手导航">
+      <div class="dwrt-rail-brand"><img src="/static/images/logo-wide.png" alt="DreamingOS"></div>
+      <nav class="dwrt-rail-list">${tabs.map(([id, title, glyph]) => `<button type="button" class="dwrt-rail-item ${state.tab === id ? 'is-active' : ''}" data-ai-view="${id}" title="${title}" aria-label="${title}" aria-current="${state.tab === id ? 'page' : 'false'}"><span class="dwrt-rail-item-icon">${icon(glyph)}</span><span class="dwrt-rail-item-text"><span class="dwrt-rail-item-title">${title}</span></span></button>`).join('')}</nav>
+      <div class="dwrt-rail-foot"><span>AI 助手</span></div></aside>
+      <div class="ai-desktop-main"><header class="ai-desktop-header"><div><h1>${state.tab === 'chat' ? escapeHtml(conversationTitle()) : tabs.find(t => t[0] === state.tab)[1]}</h1><p>${state.tab === 'chat' ? escapeHtml(`${state.current.execution_backend === 'local' ? '本机推理' : 'API'}${state.current.provider ? ' · ' + state.current.provider : ''}${currentModel() ? ' · ' + currentModel() : ''}`) : state.tab === 'history' ? '本人对话 · 标题与消息全文搜索' : state.tab === 'settings' ? '供应商、模型与生成设置' : '此设备的模型与推理服务'}</p></div>${state.tab === 'chat' ? `<div class="ai-desktop-actions">${connectionBadge()}<button type="button" class="ai-secondary-button" data-ai-new ${state.sending || state.resuming ? 'disabled' : ''}>新建对话</button></div>` : ''}</header>
+      <div class="ai-desktop-content">${state.tab === 'chat' ? chatView() : state.tab === 'history' ? historyView() : state.tab === 'local' ? localView() : `<div class="ai-desktop-settings"><header>${settingsTabsMarkup()}</header><div class="ai-view-host">${settingsView()}</div>${settingsSavebarMarkup()}</div>`}</div></div></main>`;
+  }
+
+  const localPollTimer = setInterval(() => { if (state.mounted && !document.hidden && state.tab === 'local' && !state.localPending) refreshLocal(); }, 2500);
+
+  async function refreshLocal() {
+    if (!state.mounted || state.localLoading) return;
+    state.localLoading = true;
+    try {
+      const data = unwrap(await requestJson('/api/v1/ai/local/models'));
+      if (!state.mounted) return;
+      state.localStatus = data;
+      state.localModels = asArray(data.items);
+      state.localVolumes = asArray(data.volumes);
+      state.localCanonical = data.config || {};
+      if (!state.localDirty) state.localDraft = { ...state.localCanonical };
+      state.localError = '';
+    } catch (error) { state.localError = error.message || '无法读取本机推理状态'; }
+    finally { state.localLoading = false; if (state.mounted && state.tab === 'local' && !state.localDirty) render(); }
+  }
+
+  async function localAction(action) {
+    if (state.localPending) return;
+    const draft = state.localDraft || {}, model = state.localModels.find(v => v.id === draft.model_id);
+    const titles = { download: '下载所选模型？', start: '启动本机推理？', stop: '停止本机推理服务？', switch: '切换本机模型？', cancel: '取消模型下载？' };
+    const messages = {
+      download: `将下载 ${model?.name || draft.model_id} 到 ${draft.volume_id}，占用 ${model?.size_bytes ? (model.size_bytes / 1024 ** 3).toFixed(2) + ' GiB' : '模型所需的磁盘空间'}。关闭窗口后下载继续。`,
+      start: '加载模型会占用设备内存。启动完成后才能对话。',
+      stop: '停止后本机模型不可对话；API 接入保持可用。',
+      switch: '新模型校验和资源检查通过后，停止旧模型并加载所选模型。加载失败时会显示实际服务状态。',
+      cancel: '取消会清理这次下载的临时文件；再次下载将从头开始。'
+    };
+    if (action !== 'save' && !await confirmAction(titles[action], messages[action], '确认')) return;
+    state.localPending = true; state.localError = ''; render();
+    try {
+      if (action === 'save') {
+        const saved = unwrap(await requestJson('/api/v1/ai/local/config', { method: 'PUT', body: JSON.stringify(draft) }));
+        state.localCanonical = saved; state.localDraft = { ...saved }; state.localDirty = false;
+      } else if (action === 'cancel') {
+        await requestJson(`/api/v1/ai/local/tasks/${encodeURIComponent(state.localStatus.task.task_id)}/cancel`, { method: 'POST' });
+      } else {
+        const url = action === 'download' ? `/api/v1/ai/local/models/${encodeURIComponent(draft.model_id)}/download` : '/api/v1/ai/local/service';
+        await requestJson(url, { method: 'POST', body: JSON.stringify({ action, model_id: draft.model_id, volume_id: draft.volume_id }) });
+      }
+      await refreshLocal();
+    } catch (error) { state.localError = error.message || '操作未完成'; }
+    finally { state.localPending = false; render(); }
+  }
+
+  function localView() {
+    const v = state.localStatus;
+    const reasonText = {
+      no_supported_inference_device: '此设备没有受支持的 Rockchip RK3588 推理硬件。', hardware_profile_unverified: '检测到候选硬件，驱动与模型尚未完成真机验证。', hardware_detection_failed: '暂时无法读取硬件信息。', runtime_missing: '尚未安装匹配的 RKLLM 运行时。', runtime_incompatible: '驱动或运行时版本与硬件配置不匹配。', model_missing: '请选择持久数据卷并准备模型。', service_stopped: '模型准备就绪，可以启动推理服务。', inference_unavailable: '推理服务异常，请查看任务结果后重试。', insufficient_memory: '当前可用内存不足。'
+    };
+    const value = value => value == null || value === '' ? '未确认' : String(value);
+    const size = n => n == null ? '未确认' : `${(n / 1024 ** 3).toFixed(2)} GiB`;
+    const draft = state.localDraft || {}, task = v?.task;
+    const phases = { running: '处理中', downloading: '下载中', verifying: '校验中', starting: '加载中', stopping: '停止中', ready: '就绪', stopped: '已停止', busy: '生成中', completed: '已完成', cancelled: '已取消', failed: '失败', interrupted: '已中断' };
+    const button = (action, label, allowed) => `<button type="button" class="ai-secondary-button" data-ai-local-action="${action}" ${!allowed || state.localPending ? 'disabled' : ''}>${label}</button>`;
+    const operations = v?.operations || {};
+    const changedModel = draft.model_id !== state.localCanonical?.model_id || draft.volume_id !== state.localCanonical?.volume_id;
+    return `<section class="ai-local-view"><div class="ai-local-summary"><h2>${v?.ready ? '本机推理已就绪' : v?.supported === false ? '此设备尚无可用的本机推理能力' : '本机推理'}</h2><p>${escapeHtml(reasonText[v?.reason] || phases[v?.state] || v?.reason || '正在读取设备状态')}</p><button type="button" class="ai-secondary-button" data-ai-view="chat">返回对话</button><button type="button" class="ai-secondary-button" data-ai-local-refresh>刷新状态</button></div>
+      ${state.localError ? `<p class="ai-local-error" role="alert">${escapeHtml(state.localError)}</p>` : ''}
+      <dl class="ai-local-facts">${[['设备架构', v?.hardware?.architecture], ['硬件', v?.hardware?.device], ['运行时', v?.runtime?.adapter], ['驱动 / ABI', v?.runtime?.driver_abi], ['可用内存', size(v?.resources?.available_memory_bytes)], ['可用磁盘空间', size(v?.resources?.available_storage_bytes)], ['已加载模型', v?.model?.loaded_id], ['服务', phases[v?.service?.state] || v?.service?.state]].map(([k, val]) => `<div><dt>${k}</dt><dd>${escapeHtml(value(val))}</dd></div>`).join('')}</dl>
+      <div class="ai-local-controls"><label class="ai-field"><span>模型</span><select data-ai-local-field="model_id" ${state.localPending ? 'disabled' : ''}><option value="">选择模型</option>${state.localModels.map(m => `<option value="${escapeHtml(m.id)}" ${draft.model_id === m.id ? 'selected' : ''}>${escapeHtml(m.name || m.id)} · ${escapeHtml(size(m.size_bytes))}${m.installed ? ' · 已安装' : ''}</option>`).join('')}</select></label>
+      <label class="ai-field"><span>持久数据卷</span><select data-ai-local-field="volume_id" ${state.localPending ? 'disabled' : ''}><option value="">选择数据卷</option>${state.localVolumes.map(v => `<option value="${escapeHtml(v.id)}" ${draft.volume_id === v.id ? 'selected' : ''}>${escapeHtml(v.path)} · 可用 ${escapeHtml(size(v.available_bytes))}</option>`).join('')}</select></label></div>
+      ${!state.localModels.length ? '<p>暂无匹配模型。安装适配此设备的模型目录后可选择和下载。</p>' : ''}
+      <div class="ai-local-actions">${button('save', '保存选择', state.localDirty && draft.model_id && draft.volume_id)}${button('download', '下载模型', !changedModel && draft.model_id && !state.localModels.find(m => m.id === draft.model_id)?.installed && operations.download?.available)}${button('start', '启动服务', !changedModel && operations.start?.available)}${button('stop', '停止服务', operations.stop?.available)}${button('switch', '切换模型', !changedModel && v?.model?.loaded_id && v.model.loaded_id !== draft.model_id && operations.switch?.available)}</div>
+      ${task ? `<div class="ai-local-task" role="status"><strong>${escapeHtml(phases[task.phase] || phases[task.state] || task.state)}</strong><span>${escapeHtml(task.model_id || '')}</span>${task.action === 'download' ? `<span>${escapeHtml(size(task.downloaded_bytes))}${task.total_bytes ? ' / ' + escapeHtml(size(task.total_bytes)) : ''}</span>${task.total_bytes > 0 ? `<progress max="${Number(task.total_bytes)}" value="${Number(task.downloaded_bytes) || 0}" aria-label="模型下载进度"></progress>` : ''}` : ''}${task.error ? `<p>${escapeHtml(reasonText[task.error] || task.error)}</p>` : ''}${operations.cancel_download?.available ? button('cancel', '取消下载', true) : ''}<small>任务 ${escapeHtml(task.task_id)}</small></div>` : ''}
+      <p>本机模型当前用于文字问答；系统工具操作继续通过 API 对话的审批流程。</p></section>`;
+  }
+
+  async function confirmAction(title, message, label = '确认') {
+    const dialog = document.createElement('dialog');
+    dialog.className = 'ai-confirm-dialog';
+    dialog.innerHTML = `<form method="dialog"><h2>${escapeHtml(title)}</h2><p>${escapeHtml(message)}</p><div><button value="cancel" autofocus>返回</button><button value="confirm">${escapeHtml(label)}</button></div></form>`;
+    document.body.append(dialog);
+    return new Promise(resolve => { dialog.addEventListener('close', () => { const yes = dialog.returnValue === 'confirm'; dialog.remove(); resolve(yes); }, { once: true }); dialog.showModal(); });
+  }
+
+  async function beforeClose() {
+    if (state.localDirty && !await confirmAction('本地模型选择尚未保存', '关闭将放弃尚未保存的模型与数据卷选择。已创建的下载任务会继续。', '放弃并关闭')) return false;
+    if (state.sending || state.resuming) {
+      if (!await confirmAction('停止本次生成并关闭？', '返回可继续查看对话。关闭前需要确认本次生成已经结束。', '停止并关闭')) return false;
+      await cancelStream();
+      const end = Date.now() + 8000;
+      while ((state.sending || state.resuming) && Date.now() < end) await new Promise(resolve => setTimeout(resolve, 100));
+      if (state.sending || state.resuming || !['completed', 'cancelled', 'failed', 'requires_action'].includes(state.stream.terminal)) {
+        state.chatError = '尚未确认后端已停止，窗口保持打开。'; render(); return false;
+      }
+    }
+    if (state.prompt.trim() || state.attachments.length || settingsDirty() || state.saveConflict || state.historyDirty)
+      return confirmAction('放弃未保存的内容？', '输入草稿、附件选择或尚未保存的修改将被放弃。', '放弃并关闭');
+    return true;
+  }
+
+  function leave(event) {
+    if (state.sending || state.resuming || state.prompt.trim() || state.attachments.length || settingsDirty() || state.saveConflict || state.historyDirty) { event.preventDefault(); event.returnValue = ''; }
+  }
+  if (hasChat) window.addEventListener('beforeunload', leave);
 
   function globalMarkup() {
     const position = orbPosition();
@@ -1592,14 +1776,14 @@ export function mount(context = {}) {
     const configured = credentialReady();
     const messages = state.current.messages;
     return `
-      <section class="ai-chat-card ai-page-card ${isGlobal ? 'ai-drawer-chat' : 'dwrt-kit-page-surface dwrt-kit-glass-surface'}">
+      <section class="ai-chat-card ai-page-card ${hasChat ? 'ai-drawer-chat' : 'dwrt-kit-page-surface dwrt-kit-glass-surface'}">
         <div class="ai-chat-scroll" data-ai-scroll="chat" role="log" aria-live="polite">
           ${state.loading ? loadingState('正在读取 AI 配置') : messages.length ? messages.map(messageMarkup).join('') : chatEmptyState()}
           ${state.loading ? '' : toolActivityMarkup()}
           ${state.loading ? '' : authorizationMarkup()}
         </div>
         <footer class="ai-composer-wrap">
-          ${state.chatError ? `<div class="ai-inline-message error">${icon('alert')}<span>${escapeHtml(state.chatError)}</span></div>` : ''}
+          ${state.saveConflict ? `<div class="ai-conflict-banner" role="alert">另一窗口已更新此对话。本地内容已保留。<button type="button" data-ai-conflict-copy>另存为新对话</button><button type="button" data-ai-conflict-reload>重新读取</button></div>` : ''}${state.chatError ? `<div class="ai-inline-message error">${icon('alert')}<span>${escapeHtml(state.chatError)}</span></div>` : ''}
           ${state.notice ? `<div class="ai-inline-message success">${icon('check')}<span>${escapeHtml(state.notice)}</span></div>` : ''}
           ${attachmentTray()}
           <div class="ai-composer ${configured ? '' : 'is-disabled'}">
@@ -1610,7 +1794,7 @@ export function mount(context = {}) {
                 ${addMenu(configured)}
               </div>
               <div class="ai-composer-options">
-                ${runtimeMenu()}
+                ${sourceMenu()}${runtimeMenu()}
                 ${state.stream.active && (state.config.capabilities.response_cancel || state.stream.controller)
                   ? `<button class="ai-send-button is-stop" type="button" data-ai-stop title="停止生成" aria-label="停止生成" ${state.stream.cancelling ? 'disabled' : ''}>${state.stream.cancelling ? icon('loader') : icon('stop')}</button>`
                   : `<button class="ai-send-button" type="button" data-ai-send title="发送" aria-label="发送" ${configured && !state.sending ? '' : 'disabled'}>${state.sending ? icon('loader') : icon('send')}</button>`}
@@ -1623,7 +1807,7 @@ export function mount(context = {}) {
   }
 
   function chatEmptyState() {
-    return '<div class="ai-chat-empty" aria-hidden="true"></div>';
+    return `<div class="ai-chat-empty"><h2>有什么可以帮你？</h2><p>${escapeHtml(runtimeStatusText())}</p>${!credentialReady() ? `<button type="button" class="ai-secondary-button" data-ai-open-settings>配置 API 接入</button>` : '<p>可以提问，或添加文本附件一起分析。</p>'}</div>`;
   }
 
   function addMenu(configured) {
@@ -1633,11 +1817,18 @@ export function mount(context = {}) {
       ${state.addMenuOpen ? `<div class="ai-add-popover" role="menu">
         <button type="button" role="menuitem" data-ai-add-file>${icon('paperclip')}<span><strong>上传附件</strong><small>日志、配置或文本文件</small></span></button>
         ${isGlobal ? `<button type="button" role="menuitem" data-ai-add-page>${icon('page-add')}<span><strong>添加当前页面</strong><small>发送当前页面内容</small></span></button>` : ''}
+        ${isDesktop ? `<button type="button" role="menuitem" data-ai-select-context>${icon('page-add')}<span>从打开的应用添加上下文</span></button>` : ''}
       </div>` : ''}
+      ${state.contextSources ? `<div class="ai-context-picker">${state.contextSources.length ? state.contextSources.map(item => `<button type="button" data-ai-context-id="${escapeHtml(item.id)}">${escapeHtml(item.title)}</button>`).join('') : '<p>没有可添加的应用页面</p>'}<button type="button" data-ai-context-close>关闭</button></div>` : ''}
     </div>`;
   }
 
+  function sourceMenu() {
+    return `<label class="ai-source-choice"><span class="ai-sr-only">执行来源</span><select data-ai-source ${state.sending || state.resuming ? 'disabled' : ''}><option value="api" ${state.current.execution_backend !== 'local' ? 'selected' : ''}>API</option><option value="local" ${state.current.execution_backend === 'local' ? 'selected' : ''} ${state.localStatus?.ready === true ? '' : 'disabled'}>${state.localStatus?.ready === true ? '本机推理' : '本机推理未就绪'}</option></select></label>`;
+  }
+
   function runtimeMenu() {
+    if (state.current.execution_backend === 'local') return `<span class="ai-runtime-trigger">${escapeHtml(currentModel() || '未选择本机模型')} · 文字问答</span>`;
     const effort = REASONING_LABELS[currentEffort()] || currentEffort();
     return `<div class="ai-runtime-control ${state.runtimeMenuOpen ? 'is-open' : ''}">
       <button class="ai-runtime-trigger" type="button" data-ai-runtime-toggle aria-haspopup="menu" aria-expanded="${state.runtimeMenuOpen ? 'true' : 'false'}" ${state.loading ? 'disabled' : ''}>
@@ -1684,8 +1875,9 @@ export function mount(context = {}) {
         <div class="ai-message-author">${message.role === 'user' ? '你' : 'AI'}</div>
         <div class="ai-message-bubble">
           <div class="ai-message-content" data-ai-message-body="${escapeHtml(message.id)}">${escapeHtml(message.content).replace(/\n/g, '<br>')}${message.streaming ? '<span class="ai-stream-caret" aria-hidden="true"></span>' : ''}</div>
+          ${isTerminal && message.role === 'assistant' && !message.streaming ? `<div class="ai-terminal-actions">${[['copy','复制'],['insert','插入待发送区'],['execute','在指定会话执行']].map(([action,label]) => `<button type="button" class="ai-secondary-button" data-ai-terminal-action="${action}" data-ai-terminal-message="${escapeHtml(message.id)}">${label}</button>`).join('')}</div>` : ''}
           ${attachments.length ? `<div class="ai-message-files">${attachments.map((file) => `<span>${icon('file')}${escapeHtml(file.name)}</span>`).join('')}</div>` : ''}
-          ${message.streaming ? '' : `<time>${formatMessageTime(message.created_at)}</time>`}
+          ${message.streaming ? '' : `<time>${formatMessageTime(message.created_at)}${message.role === 'assistant' ? ` · ${message.execution_backend === 'local' ? '本机推理' : 'API'}${message.model ? ' · ' + escapeHtml(message.model) : ''}${message.status && message.status !== 'completed' ? ' · ' + escapeHtml(({ cancelled: '已取消', interrupted: '连接中断', failed: '失败' })[message.status] || message.status) : ''}${message.usage?.total_tokens == null ? '' : ' · ' + formatInteger(message.usage.total_tokens) + ' tokens'}` : ''}</time>`}
         </div>
       </article>
     `;
@@ -1765,13 +1957,13 @@ export function mount(context = {}) {
 
   function historyView() {
     const rows = filteredHistory();
-    if (isGlobal) {
-      const totalPages = Math.max(1, Math.ceil(rows.length / state.historyPageSize));
+    if (hasChat) {
+      const totalPages = Math.max(1, Math.ceil(state.historyTotal / state.historyPageSize));
       const page = Math.max(1, Math.min(totalPages, state.historyPage));
-      const pageRows = rows.slice((page - 1) * state.historyPageSize, page * state.historyPageSize);
+      const pageRows = rows;
       return `<section class="ai-drawer-history">
         <div class="ai-drawer-history-toolbar"><label>${icon('search')}<input type="search" value="${escapeHtml(state.historyQuery)}" placeholder="搜索对话" data-ai-history-search></label></div>
-        <div class="ai-drawer-history-list" data-ai-scroll="history">${state.historyLoading ? loadingState('正在读取历史对话') : pageRows.length ? pageRows.map(historyStrip).join('') : `<div class="ai-empty-state"><strong>${state.historyQuery ? '没有匹配的对话' : '暂无历史对话'}</strong></div>`}</div>
+        <div class="ai-drawer-history-list" data-ai-scroll="history">${state.historyError ? `<div class="ai-error-banner" role="alert">${escapeHtml(state.historyError)}</div>` : state.historyLoading ? loadingState('正在读取历史对话') : pageRows.length ? pageRows.map(historyStrip).join('') : `<div class="ai-empty-state"><strong>${state.historyQuery ? '没有匹配的对话' : '暂无历史对话'}</strong></div>`}</div>
         <footer class="ai-history-pagination"><button type="button" data-ai-history-page="${page - 1}" ${page <= 1 ? 'disabled' : ''}>上一页</button><span>${page} / ${totalPages}</span><button type="button" data-ai-history-page="${page + 1}" ${page >= totalPages ? 'disabled' : ''}>下一页</button></footer>
       </section>`;
     }
@@ -1802,7 +1994,7 @@ export function mount(context = {}) {
 
   function historyStrip(item) {
     const deleting = state.deletingConversation === item.id;
-    return `<article class="ai-history-strip ${state.loadingConversation === item.id ? 'is-loading' : ''}"><button type="button" data-ai-open-history="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title)}</strong><span>${formatHistoryDate(item.updated_at)}</span><small>${escapeHtml(item.model || '--')} · ${formatInteger(item.message_count)} 条消息</small></button><button class="ai-history-strip-delete" type="button" data-ai-delete-history="${escapeHtml(item.id)}" title="删除对话" aria-label="删除 ${escapeHtml(item.title)}" ${deleting ? 'disabled' : ''}>${deleting ? icon('loader') : icon('trash')}</button></article>`;
+    return `<article class="ai-history-strip ${state.loadingConversation === item.id ? 'is-loading' : ''}"><button type="button" data-ai-open-history="${escapeHtml(item.id)}"><strong>${escapeHtml(item.title)}</strong><span>${formatHistoryDate(item.updated_at)}</span><small>${item.execution_backend === 'local' ? '本机推理' : 'API'} · ${escapeHtml(item.model || '未记录模型')} · ${formatInteger(item.message_count)} 条消息</small></button><button class="ai-history-strip-delete" type="button" data-ai-delete-history="${escapeHtml(item.id)}" title="删除对话" aria-label="删除 ${escapeHtml(item.title)}" ${deleting ? 'disabled' : ''}>${deleting ? icon('loader') : icon('trash')}</button></article>`;
   }
 
   function historyRow(item) {
@@ -1820,11 +2012,7 @@ export function mount(context = {}) {
     `;
   }
 
-  function filteredHistory() {
-    const query = state.historyQuery.trim().toLowerCase();
-    if (!query) return state.history;
-    return state.history.filter((item) => `${item.title} ${item.model} ${item.reasoning_effort}`.toLowerCase().includes(query));
-  }
+  function filteredHistory() { return state.history; }
 
   function formatHistoryDate(value) {
     const timestamp = normalizeTimestamp(value);
@@ -2422,26 +2610,9 @@ export function mount(context = {}) {
   }
 
   function connectionBadge() {
-    let stateName = 'off';
-    let text = '未启用';
-    if (state.loading) {
-      stateName = 'checking';
-      text = '读取中';
-    } else if (state.config.auth_mode === 'oauth' && credentialReady()) {
-      stateName = 'configured';
-      text = 'OAuth 就绪';
-    } else if (state.config.enabled && state.config.auth_mode === 'api_key' && state.config.api_key_set) {
-      stateName = 'configured';
-      text = '凭据就绪';
-    } else if (state.config.enabled && state.config.auth_mode === 'oauth') {
-      stateName = 'warning';
-      text = oauthStatus()?.expired ? 'OAuth 已过期' : 'OAuth 未连接';
-    } else if (state.config.enabled) {
-      stateName = 'warning';
-      text = '缺少 API Key';
-    }
-    const tone = stateName === 'configured' ? 'success' : stateName === 'checking' ? 'info' : stateName === 'warning' ? 'warning' : 'muted';
-    return ui.statusBadgeMarkup?.(text, tone) || `<span>${escapeHtml(text)}</span>`;
+    const text = runtimeStatusText();
+    const tone = state.runtimeStatus?.ready ? 'success' : state.loading ? 'info' : 'warning';
+    return ui.statusBadgeMarkup?.(text, tone) || `<span class="ai-runtime-status" role="status">${escapeHtml(text)}</span>`;
   }
 
   function reasoningDisabled() {
@@ -2468,6 +2639,42 @@ export function mount(context = {}) {
   }
 
   function bindEvents() {
+    if (isTerminal) root.querySelectorAll('[data-ai-terminal-action]').forEach(button => button.addEventListener('click', async () => {
+      const message = state.current.messages.find(item => item.id === button.dataset.aiTerminalMessage);
+      if (!message) return;
+      const selected = window.getSelection();
+      const text = selected && root.contains(selected.anchorNode) && selected.toString() ? selected.toString() : message.content;
+      try { await context.onTerminalText?.(button.dataset.aiTerminalAction, text, terminalTargets.get(message.id) || null); }
+      catch (error) { state.chatError = error.message; render(); }
+    }));
+    root.querySelector('[data-ai-local-refresh]')?.addEventListener('click', refreshLocal);
+    root.querySelectorAll('[data-ai-local-field]').forEach(field => field.addEventListener('change', () => {
+      state.localDraft[field.dataset.aiLocalField] = field.value;
+      state.localDirty = true; render();
+    }));
+    root.querySelectorAll('[data-ai-local-action]').forEach(button => button.addEventListener('click', () => localAction(button.dataset.aiLocalAction)));
+    root.querySelectorAll('[data-ai-view]').forEach(button => button.addEventListener('click', () => { setTab(button.dataset.aiView); if (state.tab === 'history') refreshHistory(); else if (state.tab === 'local') { render(); refreshLocal(); } else render(); }));
+    root.querySelectorAll('[data-ai-open-settings]').forEach(button => button.addEventListener('click', () => { if (isDesktop) { setTab('settings'); render(); } else api.routeTo?.('/app/#/system/llm-settings'); }));
+    root.querySelector('[data-ai-source]')?.addEventListener('change', async event => {
+      const next = event.target.value;
+      if (state.sending || state.resuming || (next === 'local' && state.localStatus?.ready !== true)) { render(); return; }
+      if ((state.current.messages.length || state.prompt.trim() || state.attachments.length) && !await confirmAction('更换执行来源？', '将创建新对话，未保存内容会被放弃，当前对话上下文不会发送到新来源。', '创建新对话')) { render(); return; }
+      await startNewConversation({ confirmed: true });
+      state.current.execution_backend = next;
+      if (next === 'local') { state.current.model = state.localStatus.model.loaded_id; state.current.provider = 'rkllm'; }
+      render();
+    });
+    root.querySelector('[data-ai-select-context]')?.addEventListener('click', () => { state.contextSources = context.listContextSources?.() || []; state.addMenuOpen = false; render(); });
+    root.querySelector('[data-ai-context-close]')?.addEventListener('click', () => { state.contextSources = null; render(); });
+    root.querySelectorAll('[data-ai-context-id]').forEach(button => button.addEventListener('click', () => {
+      const page = context.getSourceContext?.(button.dataset.aiContextId);
+      if (page?.text) state.attachments.push({ name: `${page.title || '页面'}上下文.txt`, type: 'text/plain', size: new Blob([page.text]).size, content: `来源：${page.title} ${page.route || ''}\n时间：${new Date().toISOString()}\n${page.text}` });
+      else state.chatError = '无法读取所选页面的上下文';
+      state.contextSources = null; render();
+    }));
+    root.querySelector('[data-ai-conflict-copy]')?.addEventListener('click', async () => { state.current.id = ''; state.current.revision = 0; state.saveConflict = false; try { await persistCurrentConversation(); state.notice = '已另存为新对话'; } catch (e) { state.chatError = e.message; } render(); });
+    root.querySelector('[data-ai-conflict-reload]')?.addEventListener('click', async () => { if (await confirmAction('读取最新对话？', '将放弃当前窗口尚未保存的回合。也可以返回并选择另存为新对话。', '重新读取')) openHistory(state.current.id, { discard: true }); });
+
     root.querySelector('.ai-settings-card')?.addEventListener('submit', (event) => event.preventDefault());
     const settingsTabs = root.querySelector('.ai-settings-tabs');
     if (settingsTabs) {
@@ -2620,8 +2827,8 @@ export function mount(context = {}) {
     historySearch?.addEventListener('input', (event) => {
       state.historyQuery = event.target.value;
       state.historyPage = 1;
-      if (isGlobal) updateDrawerHistoryView();
-      else updateHistoryRows();
+      clearTimeout(historySearchTimer);
+      historySearchTimer = setTimeout(() => refreshHistory(), 250);
     });
     bindHistoryItemEvents(root);
     root.querySelectorAll('[data-ai-provider]').forEach((button) => button.addEventListener('click', () => selectProvider(button.dataset.aiProvider)));
@@ -2650,7 +2857,7 @@ export function mount(context = {}) {
       const page = Number(button.dataset.aiHistoryPage);
       if (!Number.isFinite(page) || page < 1) return;
       state.historyPage = page;
-      render();
+      refreshHistory();
     }));
     scope.querySelectorAll('[data-ai-open-history]').forEach((row) => {
       row.addEventListener('click', (event) => {
@@ -2776,9 +2983,13 @@ export function mount(context = {}) {
     return `请基于我当前打开的页面指导或代替我完成操作。\n页面：${title}\n路由：${route}\n页面内容：\n${text || '当前页面没有可读取的文本内容。'}`;
   }
 
-  function startNewConversation() {
+  async function startNewConversation(options = {}) {
+    if (state.sending || state.resuming) return false;
+    if (!options.confirmed && (state.prompt.trim() || state.attachments.length || state.historyDirty || state.saveConflict) &&
+        !await confirmAction('新建对话？', '当前未保存的输入、附件或回合将被放弃。', '新建对话')) return false;
     clearActiveConversation();
     state.current = newConversation();
+    state.saveConflict = false;
     state.current.model = state.config.model;
     state.current.reasoning_effort = state.config.reasoning_effort;
     state.current.tool_policy = state.config.tool_policy;
@@ -2808,6 +3019,7 @@ export function mount(context = {}) {
     const accepted = [];
     let error = '';
     for (const file of files) {
+      if (!/\.(txt|log|conf|cfg|json|xml|ya?ml|csv|tsv|md|ini|sh)$/i.test(file.name) && !/^text\//.test(file.type)) { error = `${file.name} 不是支持的文本附件`; continue; }
       if (file.size > 512 * 1024) {
         error = `${file.name} 超过 512 KB`;
         continue;
@@ -2826,6 +3038,7 @@ export function mount(context = {}) {
 
   async function sendMessage() {
     if (state.sending || !credentialReady()) return;
+    if (isTerminal && !state.config.capabilities.terminal_text_only) { state.chatError = '当前 AI 服务尚不支持终端专用问答，无法隔离设备本机工具。'; render(); return; }
     const prompt = root.querySelector('[data-ai-prompt]');
     const content = firstText(prompt?.value);
     if (content === '/new') {
@@ -2834,10 +3047,12 @@ export function mount(context = {}) {
     }
     if (!content && !state.attachments.length) return;
     const now = Date.now();
+    if (isTerminal) pendingTerminalTarget = context.getTerminalTarget?.() || null;
     const selectedAttachments = state.attachments.map(({ name, size, type, content: fileContent }) => ({ name, size, type, content: fileContent }));
     const attachments = selectedAttachments.map(({ name, size, type }) => ({ name, size, type }));
     const userMessage = { id: `user-${now}`, role: 'user', content: content || '请分析附件。', created_at: now, attachments };
     state.current.messages.push(userMessage);
+    state.historyDirty = true;
     state.current.model = currentModel();
     state.current.reasoning_effort = currentEffort();
     state.current.tool_policy = currentToolPolicy();
@@ -2852,7 +3067,9 @@ export function mount(context = {}) {
     clearToolRuntime();
     state.stream.responseId = '';
     state.stream.messageId = '';
+    state.stream.terminal = '';
     render();
+    let uploadsComplete = !selectedAttachments.length;
     try {
       let outboundAttachments = selectedAttachments;
       if (state.config.capabilities.attachment_ids && selectedAttachments.length) {
@@ -2871,14 +3088,19 @@ export function mount(context = {}) {
         userMessage.attachments = uploaded;
         outboundAttachments = uploaded;
       }
+      uploadsComplete = true;
       const payload = {
         conversation_id: conversationId(),
+        revision: state.current.revision || 0,
+        execution_backend: state.current.execution_backend || 'api',
+        local_model_id: state.current.execution_backend === 'local' ? currentModel() : undefined,
         model: currentModel(),
         reasoning_effort: currentEffort(),
         tool_policy: currentToolPolicy(),
+        ...(isTerminal ? { terminal_context: { mode: 'text_only' } } : {}),
         messages: state.current.messages
           .filter((item) => !item.streaming)
-          .map(({ role, content: text }) => ({ role, content: text })),
+          .map(({ id, role, content: text, status, response_id, execution_backend, provider, model, usage, created_at }) => ({ message_id: id, role, content: text, status, response_id, execution_backend, provider, model, usage, created_at: Math.floor(normalizeTimestamp(created_at) / 1000) })),
         attachments: outboundAttachments
       };
       let streamed = false;
@@ -2889,10 +3111,11 @@ export function mount(context = {}) {
           await streamRequest(streamEndpoint(), payload, {
             onEvent: (name, eventPayload) => handleStreamEvent(name, eventPayload)
           });
+          if (!state.stream.terminal) { if (streamingMessage()) streamingMessage().status = 'interrupted'; throw new Error('连接已中断，已保留收到的内容。此服务不支持断点续传。'); }
           streamed = true;
         } catch (error) {
-          if (error?.name === 'AbortError') streamed = true;
-          else if (!error?.notStream) throw error;
+          if (error?.name === 'AbortError') { state.chatError = '本地连接已中断，后端生成状态尚未确认。'; if (streamingMessage()) streamingMessage().status = 'interrupted'; streamed = true; }
+          else throw error;
         } finally {
           state.stream.active = false;
           state.stream.controller = null;
@@ -2902,6 +3125,9 @@ export function mount(context = {}) {
         const result = await postJson(ENDPOINTS.chat, payload);
         if (!state.mounted) return;
         const data = unwrap(result);
+        if (Number.isInteger(data.history_revision)) state.current.revision = data.history_revision;
+        if (data.history_saved) state.historyDirty = false;
+        state.current.execution_backend = firstText(data.execution_backend, 'api'); state.current.provider = firstText(data.provider); state.current.model = firstText(data.model, state.current.model);
         state.current.id = firstText(data.conversation_id, data.conversation?.id, state.current.id);
         state.current.title = firstText(data.conversation_title, data.title, data.conversation?.title, state.current.title);
         touchActiveConversation();
@@ -2921,20 +3147,25 @@ export function mount(context = {}) {
           const notReady = firstText(data.message).toLowerCase().includes('integration pending') || data.status === 'ready';
           throw new Error(notReady ? '模型运行时尚未接入，后端未生成回答' : firstText(data.error, '后端未返回 AI 回答'));
         }
-        if (reply) state.current.messages.push({ id: `assistant-${Date.now()}`, role: 'assistant', content: reply, created_at: Date.now(), attachments: [] });
+        if (reply) state.current.messages.push(bindTerminalMessage({ id: `assistant-${Date.now()}`, role: 'assistant', content: reply, created_at: Date.now(), attachments: [], execution_backend: state.current.execution_backend, provider: state.current.provider, model: state.current.model, usage: data.usage ?? null, status: 'completed' }));
         state.current.usage = data.usage && typeof data.usage === 'object' ? data.usage : state.current.usage;
       }
       if (!state.mounted) return;
       finishStreamingMessage();
       if (state.pendingAuthorizations.length) {
         state.notice = '模型请求执行工具，请确认授权';
-        await persistCurrentConversation().catch(() => {});
+        // The server owns the pending checkpoint and its frozen revision.
       } else {
-        await persistCurrentConversation();
+        if (state.historyDirty) await persistCurrentConversation();
+        else await refreshHistory(false);
         state.notice = '对话已保存';
       }
     } catch (error) {
+      if (!uploadsComplete) { state.attachments = selectedAttachments; state.prompt = content; state.current.messages = state.current.messages.filter(item => item !== userMessage); }
       if (error?.name !== 'AbortError') state.chatError = error?.message || 'AI 请求失败';
+      if (error?.payload?.error?.code === 'conversation_conflict' || error?.status === 409) state.saveConflict = true;
+      const unsaved = error?.payload?.data;
+      if (unsaved?.reply && !streamingMessage()) state.current.messages.push(bindTerminalMessage({ id: `assistant-${Date.now()}`, role: 'assistant', content: unsaved.reply, status: 'completed', execution_backend: unsaved.execution_backend, provider: unsaved.provider, model: unsaved.model, usage: unsaved.usage ?? null }));
       finishStreamingMessage();
       await persistCurrentConversation().catch(() => {});
     } finally {
@@ -2949,55 +3180,59 @@ export function mount(context = {}) {
   }
 
   function extractAssistantReply(data = {}) {
-    const direct = firstText(data.reply, data.response, data.output_text, data.assistant?.content, data.assistant?.text);
+    const direct = messageText(data.reply, data.response, data.output_text, data.assistant?.content, data.assistant?.text);
     if (direct) return direct;
     const choices = asArray(data.choices);
-    return firstText(choices[0]?.message?.content, choices[0]?.text);
+    return messageText(choices[0]?.message?.content, choices[0]?.text);
   }
 
   async function persistCurrentConversation() {
     const persistable = state.current.messages.filter((item) => !item.streaming && firstText(item.content));
     if (!persistable.length) return;
+    if (state.saveConflict) throw new Error('对话保存冲突，本地内容已保留');
     const result = await postJson(ENDPOINTS.history, {
       id: conversationId(),
+      revision: state.current.revision || 0, execution_backend: state.current.execution_backend || 'api', provider: state.current.provider || '',
       title: conversationTitle(),
       model: currentModel(),
       reasoning_effort: currentEffort(),
       tool_policy: currentToolPolicy(),
-      usage: state.current.usage || {},
-      messages: persistable.map(({ id: message_id, role, content, created_at, attachments }) => ({
-        message_id,
+      usage: state.current.usage?.total_tokens == null ? null : state.current.usage,
+      messages: persistable.map(({ id: message_id, role, content, created_at, attachments, status, response_id, execution_backend, provider, model, usage }) => ({
+        message_id, status, response_id, execution_backend, provider, model, usage,
         role,
         content,
         created_at: Math.floor(normalizeTimestamp(created_at) / 1000),
         attachments: asArray(attachments).map(({ attachment_id, name, type, size }) => ({ attachment_id, name, type, size }))
       }))
-    });
+    }).catch(error => { if (error?.status === 409 || /conversation_conflict/.test(error.message)) state.saveConflict = true; throw error; });
     const data = unwrap(result);
+    state.current.revision = Number(data.revision) || state.current.revision;
+    state.historyDirty = false;
+    configChannel?.postMessage({ type: 'history', source: INSTANCE_ID });
     state.current.id = firstText(data.id, state.current.id);
     state.current.title = firstText(data.conversation_title, data.title, data.conversation?.title, state.current.title);
     touchActiveConversation();
     await refreshHistory(false);
   }
 
+  let historySearchTimer = 0;
+  function historyUrl() { return `${ENDPOINTS.history}?limit=${state.historyPageSize}&offset=${(state.historyPage - 1) * state.historyPageSize}&q=${encodeURIComponent(state.historyQuery)}`; }
   async function refreshHistory(shouldRender = true) {
-    state.historyLoading = true;
-    state.historyError = '';
+    const seq = ++state.historySeq;
+    state.historyLoading = true; state.historyError = '';
     if (shouldRender) render();
-    const result = await fetchApi('ai-history', `${ENDPOINTS.history}?limit=100&offset=0`);
-    if (!state.mounted) return;
-    if (result?.ok) state.history = normalizeHistory(result.data);
+    const result = await fetchApi('ai-history', historyUrl());
+    if (!state.mounted || seq !== state.historySeq) return;
+    if (result?.ok) { state.history = normalizeHistory(result.data); state.historyTotal = Number(unwrap(result.data).total) || 0; }
     else state.historyError = result?.error?.message || '无法读取历史对话';
     state.historyLoading = false;
-    if (shouldRender && document.activeElement?.matches('[data-ai-history-search]')) {
-      if (isGlobal) updateDrawerHistoryView();
-      else updateHistoryView();
-    }
-    else if (shouldRender) render();
+    if (shouldRender) render();
   }
 
   async function openHistory(id, options = {}) {
-    if (!id || state.loadingConversation) return;
+    if (!id || state.loadingConversation || state.sending || state.resuming) return;
+    if (!options.quiet && !options.discard && (state.prompt.trim() || state.attachments.length || state.saveConflict || state.historyDirty) && !await confirmAction('打开另一段对话？', '当前未保存的输入和修改将被放弃。', '打开对话')) return;
     state.loadingConversation = id;
     if (!options.quiet) render();
     const result = await fetchApi('ai-history-detail', `${ENDPOINTS.history}/${encodeURIComponent(id)}`);
@@ -3009,6 +3244,7 @@ export function mount(context = {}) {
       return;
     }
     state.current = normalizeConversation(result.data);
+    state.saveConflict = false; state.historyDirty = false; state.prompt = '';
     touchActiveConversation(state.current.id);
     state.attachments = [];
     state.chatError = '';
@@ -3022,12 +3258,13 @@ export function mount(context = {}) {
   }
 
   async function deleteHistory(id) {
-    if (!id || state.deletingConversation) return;
+    if (!id || state.deletingConversation || state.sending) return;
+    if (!await confirmAction('删除对话？', state.history.find(item => item.id === id)?.title || id, '删除对话')) return;
     state.deletingConversation = id;
     render();
     try {
       await requestJson(`${ENDPOINTS.history}/${encodeURIComponent(id)}`, { method: 'DELETE' });
-      state.history = state.history.filter((item) => item.id !== id);
+      await refreshHistory(false);
       if (state.current.id === id) {
         clearActiveConversation();
         state.current = newConversation();
@@ -3067,10 +3304,10 @@ export function mount(context = {}) {
     const pagination = history?.querySelector('.ai-history-pagination');
     if (!history || !list || !pagination) return;
     const rows = filteredHistory();
-    const totalPages = Math.max(1, Math.ceil(rows.length / state.historyPageSize));
+    const totalPages = Math.max(1, Math.ceil(state.historyTotal / state.historyPageSize));
     const page = Math.max(1, Math.min(totalPages, state.historyPage));
     state.historyPage = page;
-    const pageRows = rows.slice((page - 1) * state.historyPageSize, page * state.historyPageSize);
+    const pageRows = rows;
     list.innerHTML = state.historyLoading
       ? loadingState('正在读取历史对话')
       : pageRows.length
@@ -3107,7 +3344,9 @@ export function mount(context = {}) {
     }
     const status = root.querySelector('.ai-settings-status > span:last-child');
     if (status) status.textContent = settingsDirty() ? '有未保存的修改' : '配置已同步';
+    const interaction = window.DWRT_UI_KIT?.captureInteractionState(root);
     render();
+    window.DWRT_UI_KIT?.restoreInteractionState(root, interaction);
   }
 
   async function syncModels() {
@@ -3175,6 +3414,7 @@ export function mount(context = {}) {
     }
     if (!state.mounted) return;
     state.testingProvider = false;
+    await loadRuntimeStatus();
     render();
   }
 
@@ -3386,7 +3626,7 @@ export function mount(context = {}) {
     if (text) {
       try { json = JSON.parse(text); } catch (_) { throw new Error('后端返回了无效 JSON'); }
     }
-    if (!response.ok || json?.ok === false) {
+    if (!response.ok || json?.ok === false || json?.data?.ok === false) {
       const error = new Error(apiErrorText(json, `${response.status}`));
       error.status = response.status;
       error.payload = json;
@@ -3482,15 +3722,16 @@ export function mount(context = {}) {
   loadInitial();
 
   return {
+    beforeClose,
     open(options = {}) {
-      if (!isGlobal) return;
+      if (!hasChat) return;
       const prompt = firstText(options.prompt).slice(0, 12000);
       expireInactiveConversation();
       state.drawerOpen = true;
       state.tab = options.history ? 'history' : 'chat';
       touchActiveConversation();
       if (prompt) {
-        state.prompt = prompt;
+        state.prompt = state.prompt ? `${state.prompt}\n${prompt}` : prompt;
         state.initialAutoSend = Boolean(options.autoSend);
       }
       render();
@@ -3506,11 +3747,16 @@ export function mount(context = {}) {
       render();
     },
     unmount() {
+      clearInterval(localPollTimer);
+      configChannel?.close();
+      window.removeEventListener('focus', refreshOnFocus);
       state.mounted = false;
       state.seq += 1;
       try { state.stream.controller?.abort(); } catch (_) {}
       state.stream.controller = null;
       clearOAuthPollTimer();
+      clearTimeout(historySearchTimer);
+      window.removeEventListener('beforeunload', leave);
       window.removeEventListener('message', receiveOAuthCompletion);
       window.removeEventListener('dwrt:ai-config-updated', receiveConfigUpdated);
       window.removeEventListener('dwrt:ai-oauth-updated', receiveOAuthUpdated);

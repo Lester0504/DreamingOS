@@ -1,5 +1,33 @@
+#include "../system/memory_profile.h"
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "logd_internal.h"
+#include <openssl/rand.h>
+
+#ifndef LOGD_ROLE_PATH
+#define LOGD_ROLE_PATH "/etc/dreamingwrt/device_role"
+#endif
+
+int logd_ap_mode(void)
+{
+    static int cached = -1;
+    char role[32] = "";
+    FILE *fp;
+    if (cached >= 0) return cached;
+    fp = fopen(LOGD_ROLE_PATH, "r");
+    if (fp) {
+        if (fscanf(fp, "%31s", role) != 1) role[0] = '\0';
+        fclose(fp);
+    }
+    cached = !strcmp(role, "ap");
+    return cached;
+}
+
+int logd_storage_ready(void)
+{
+    const char *path = g_logd_db ? sqlite3_db_filename(g_logd_db, "main") : NULL;
+    return path && (logd_ap_mode() ? !path[0] : !strcmp(path, g_logd_db_path));
+}
+
 
 #define WORKER_STATUS_VERSION "1.0"
 
@@ -12,6 +40,10 @@
 #include <openssl/err.h>
 #include <openssl/ssl.h>
 #include <openssl/x509v3.h>
+
+int logd_storage_authorizer(void *opaque, int action,
+                                   const char *arg1, const char *arg2,
+                                   const char *db_name, const char *trigger);
 
 #define LOGD_SYSLOG_CERT_DIR "/etc/dreamingwrt/syslog"
 #define LOGD_SYSLOG_CERT_MAX_BYTES 65536
@@ -922,14 +954,23 @@ static int logd_syslog_cert_file_kind(const char *name, char *kind, size_t kind_
     return 0;
 }
 
+static void logd_memory_compact_sql(sqlite3_context *ctx, int argc, sqlite3_value **argv)
+{
+    (void)argc; (void)argv;
+    sqlite3_result_int(ctx, dw_mp_compact());
+}
+
 int logd_db_init(void)
 {
     if (g_logd_db)
         return 0;
-    mkdir("/etc/dreamingwrt", 0755);
-    if (sqlite3_open(LOGD_DB_PATH, &g_logd_db) != SQLITE_OK) {
+    if (logd_ap_mode())
+        snprintf(g_logd_db_path, sizeof(g_logd_db_path), ":memory:");
+    else
+        mkdir("/etc/dreamingwrt", 0755);
+    if (sqlite3_open(g_logd_db_path, &g_logd_db) != SQLITE_OK) {
         fprintf(stderr, "[dreamingwrt-logd] open %s failed: %s\n",
-                LOGD_DB_PATH, g_logd_db ? sqlite3_errmsg(g_logd_db) : "no db handle");
+                g_logd_db_path, g_logd_db ? sqlite3_errmsg(g_logd_db) : "no db handle");
         if (g_logd_db) {
             sqlite3_close(g_logd_db);
             g_logd_db = NULL;
@@ -937,6 +978,14 @@ int logd_db_init(void)
         return -1;
     }
     sqlite3_busy_timeout(g_logd_db, 3000);
+    if (sqlite3_create_function(g_logd_db, "dw_memory_compact", 0, SQLITE_UTF8,
+                                NULL, logd_memory_compact_sql, NULL, NULL) != SQLITE_OK) goto fail;
+    if (logd_ap_mode() && (logd_exec("PRAGMA temp_store=MEMORY") != 0 ||
+        logd_exec("PRAGMA page_size=4096") != 0 ||
+        logd_exec("PRAGMA max_page_count=4096") != 0 ||
+        logd_exec("CREATE TABLE IF NOT EXISTS ap_log_queue(id TEXT PRIMARY KEY,payload TEXT NOT NULL)") != 0 ||
+        logd_exec("CREATE TABLE IF NOT EXISTS logd_collector_state(name TEXT NOT NULL,key TEXT NOT NULL,value TEXT NOT NULL,updated_at INTEGER NOT NULL,PRIMARY KEY(name,key))") != 0))
+        goto fail;
     if (logd_exec("PRAGMA journal_mode=WAL") != 0)
         goto fail;
     if (logd_exec("PRAGMA foreign_keys=ON") != 0)
@@ -970,6 +1019,10 @@ int logd_db_init(void)
         " created_at INTEGER NOT NULL)") != 0)
         goto fail;
     if (logd_add_column_if_missing("log_events", "seq", "INTEGER NOT NULL DEFAULT 0") != 0)
+        goto fail;
+    if (logd_exec("CREATE TABLE IF NOT EXISTS log_compact_deadlines (id TEXT PRIMARY KEY REFERENCES log_events(id) ON DELETE CASCADE,expires_at INTEGER NOT NULL)") != 0 ||
+        logd_exec("CREATE INDEX IF NOT EXISTS idx_log_compact_expiry ON log_compact_deadlines(expires_at)") != 0 ||
+        logd_exec("CREATE TRIGGER IF NOT EXISTS log_compact_new_detail AFTER INSERT ON log_events WHEN dw_memory_compact()=1 BEGIN INSERT INTO log_compact_deadlines VALUES(NEW.id,CAST(strftime('%s','now') AS INTEGER)+86400); END") != 0)
         goto fail;
     if (logd_exec("UPDATE log_events SET seq=rowid WHERE seq=0") != 0)
         goto fail;
@@ -1026,6 +1079,7 @@ int logd_db_init(void)
     if (logd_kernel_structured_v2_migrate() != 0)
         fprintf(stderr, "[dreamingwrt-logd] structured kernel migration deferred: %s\n",
                 sqlite3_errmsg(g_logd_db));
+    sqlite3_set_authorizer(g_logd_db, logd_storage_authorizer, NULL);
     return 0;
 
 fail:
@@ -1217,6 +1271,99 @@ void logd_db_close(void)
     }
 }
 
+int logd_storage_authorizer(void *opaque, int action,
+                                   const char *arg1, const char *arg2,
+                                   const char *db_name, const char *trigger)
+{
+    (void)opaque; (void)arg1; (void)arg2; (void)db_name; (void)trigger;
+    if (!g_logd_storage_frozen)
+        return SQLITE_OK;
+    switch (action) {
+    case SQLITE_INSERT: case SQLITE_UPDATE: case SQLITE_DELETE:
+    case SQLITE_CREATE_INDEX: case SQLITE_CREATE_TABLE: case SQLITE_CREATE_TRIGGER:
+    case SQLITE_CREATE_VIEW: case SQLITE_DROP_INDEX: case SQLITE_DROP_TABLE:
+    case SQLITE_DROP_TRIGGER: case SQLITE_DROP_VIEW: case SQLITE_ALTER_TABLE:
+    case SQLITE_ATTACH: case SQLITE_DETACH: case SQLITE_REINDEX:
+        return SQLITE_DENY;
+    default:
+        return SQLITE_OK;
+    }
+}
+
+int logd_db_reopen_path(const char *new_path)
+{
+    sqlite3 *old_db;
+    char old_path[sizeof(g_logd_db_path)];
+    int was_frozen;
+    int reopen_rc;
+
+    if (logd_ap_mode()) return -1; /* AP runtime data never migrates to flash. */
+    if (!g_logd_storage_frozen || !new_path || new_path[0] != '/' ||
+        strlen(new_path) >= sizeof(g_logd_db_path))
+        return -1;
+    snprintf(old_path, sizeof(old_path), "%s", g_logd_db_path);
+    was_frozen = g_logd_storage_frozen;
+    /* logd_db_init() performs schema/bootstrap writes. Temporarily lift the
+     * frozen authorizer while opening either the migrated DB or the restored
+     * old DB, then reinstall the write gate before returning. */
+    g_logd_storage_frozen = 0;
+    old_db = g_logd_db;
+    g_logd_db = NULL;
+    if (old_db) {
+        sqlite3_exec(old_db, "PRAGMA wal_checkpoint(TRUNCATE)", NULL, NULL, NULL);
+        sqlite3_close(old_db);
+    }
+    snprintf(g_logd_db_path, sizeof(g_logd_db_path), "%s", new_path);
+    reopen_rc = logd_db_init();
+    if (reopen_rc != 0 || !g_logd_db ||
+        !sqlite3_db_filename(g_logd_db, "main") ||
+        strcmp(sqlite3_db_filename(g_logd_db, "main"), g_logd_db_path)) {
+        if (g_logd_db) {
+            sqlite3_close(g_logd_db);
+            g_logd_db = NULL;
+        }
+        /* The coordinator owns rollback ordering.  old_path is still hidden
+         * under its rollback name until the coordinator restores it, so do not
+         * let logd_db_init() create a replacement empty database there. */
+        (void)old_path;
+        g_logd_storage_frozen = was_frozen;
+        return reopen_rc == 0 ? -1 : reopen_rc;
+    }
+    g_logd_storage_frozen = was_frozen;
+    sqlite3_set_authorizer(g_logd_db, logd_storage_authorizer, NULL);
+    return 0;
+}
+
+static uint64_t logd_detail_limit_rejections;
+void logd_memory_write_failed(int sqlite_code)
+{
+    if ((sqlite_code & 0xff) == SQLITE_FULL) logd_detail_limit_rejections++;
+}
+
+void logd_memory_prepare_write(void)
+{
+    static int compact_before = -1;
+    static sqlite3 *connection;
+    static int64_t standard_pages;
+    int compact = dw_mp_compact();
+    if (logd_ap_mode()) return;
+    if (connection != g_logd_db) { connection = g_logd_db; compact_before = -1; standard_pages = 0; }
+    if (compact == compact_before) return;
+    sqlite3_stmt *st = logd_prepare("PRAGMA max_page_count");
+    if (!st) return;
+    if (sqlite3_step(st) == SQLITE_ROW && !standard_pages) standard_pages = sqlite3_column_int64(st, 0);
+    sqlite3_finalize(st);
+    st = logd_prepare("PRAGMA page_size");
+    if (!st) return;
+    int64_t page_size = sqlite3_step(st) == SQLITE_ROW ? sqlite3_column_int64(st, 0) : 0;
+    sqlite3_finalize(st);
+    if (!page_size || !standard_pages) return;
+    int64_t cap = compact ? (int64_t)(128 * DW_MP_MIB) / page_size : standard_pages;
+    if (compact && standard_pages < cap) cap = standard_pages;
+    char sql[96]; snprintf(sql, sizeof(sql), "PRAGMA max_page_count=%lld", (long long)cap);
+    if (logd_exec(sql) == 0) compact_before = compact;
+}
+
 int logd_prune_if_needed(void)
 {
     sqlite3_stmt *st;
@@ -1225,6 +1372,7 @@ int logd_prune_if_needed(void)
     int64_t cutoff;
     int rc;
 
+    logd_memory_prepare_write();
     st = logd_config_prepare("SELECT retention_days,max_events,auto_cleanup FROM logd_settings WHERE id=1");
     if (st) {
         rc = sqlite3_step(st);
@@ -1241,8 +1389,11 @@ int logd_prune_if_needed(void)
     } else {
         return -1;
     }
+    if (logd_exec("DELETE FROM log_events WHERE id IN (SELECT id FROM log_compact_deadlines WHERE expires_at<=CAST(strftime('%s','now') AS INTEGER))") != 0)
+        return -1;
     if (retention_days < 1) retention_days = 30;
     if (max_events < 1000) max_events = 1000;
+    if (logd_ap_mode()) max_events = 512;
     cutoff = logd_now_s() - (int64_t)retention_days * 86400;
     st = logd_prepare("DELETE FROM log_events WHERE ts<?");
     if (!st)
@@ -1271,7 +1422,7 @@ int logd_collector_state_prune(void)
     int64_t cutoff = logd_now_s() - LOGD_COOLDOWN_STATE_RETENTION_SEC;
     int rc;
 
-    st = logd_config_prepare(
+    st = (logd_ap_mode() ? logd_prepare : logd_config_prepare)(
         "DELETE FROM logd_collector_state "
         "WHERE key LIKE 'cooldown:%' AND updated_at<?1");
     if (!st)
@@ -1282,7 +1433,7 @@ int logd_collector_state_prune(void)
     if (rc != SQLITE_DONE)
         return -1;
 
-    st = logd_config_prepare(
+    st = (logd_ap_mode() ? logd_prepare : logd_config_prepare)(
         "DELETE FROM logd_collector_state "
         "WHERE key LIKE 'cooldown:%' AND rowid IN ("
         " SELECT rowid FROM logd_collector_state "
@@ -1296,7 +1447,7 @@ int logd_collector_state_prune(void)
     if (rc != SQLITE_DONE)
         return -1;
 
-    logd_config_exec("PRAGMA wal_checkpoint(PASSIVE)");
+    if (!logd_ap_mode()) logd_config_exec("PRAGMA wal_checkpoint(PASSIVE)");
     return 0;
 }
 
@@ -1312,7 +1463,7 @@ int logd_collector_state_get(const char *name, const char *key,
     snprintf(out, out_len, "%s", def ? def : "");
     if (!name || !key)
         return -1;
-    st = logd_config_prepare("SELECT value FROM logd_collector_state WHERE name=?1 AND key=?2");
+    st = (logd_ap_mode() ? logd_prepare : logd_config_prepare)("SELECT value FROM logd_collector_state WHERE name=?1 AND key=?2");
     if (!st)
         return -1;
     sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
@@ -1333,7 +1484,7 @@ int logd_collector_state_set(const char *name, const char *key, const char *valu
 
     if (!name || !key || !value)
         return -1;
-    st = logd_config_prepare(
+    st = (logd_ap_mode() ? logd_prepare : logd_config_prepare)(
         "INSERT OR REPLACE INTO logd_collector_state(name,key,value,updated_at) VALUES(?1,?2,?3,?4)");
     if (!st)
         return -1;
@@ -1354,7 +1505,7 @@ int logd_collector_state_delete(const char *name, const char *key)
 
     if (!name || !key)
         return -1;
-    st = logd_config_prepare("DELETE FROM logd_collector_state WHERE name=?1 AND key=?2");
+    st = (logd_ap_mode() ? logd_prepare : logd_config_prepare)("DELETE FROM logd_collector_state WHERE name=?1 AND key=?2");
     if (!st)
         return -1;
     sqlite3_bind_text(st, 1, name, -1, SQLITE_TRANSIENT);
@@ -1380,10 +1531,15 @@ struct json_object *logd_status_json(void)
     int degraded;
     int rc;
     struct jmx_storage_guard_stats storage_guard;
+    struct json_object *memory_policy = json_object_new_object();
+    json_object_object_add(memory_policy, "compact", json_object_new_boolean(dw_mp_compact()));
+    json_object_object_add(memory_policy, "detail_limit_rejections_since_start", json_object_new_int64(logd_detail_limit_rejections));
+    json_object_object_add(memory_policy, "disk_limit_scope", json_object_new_string("database_pages_excluding_wal"));
+    json_object_object_add(resp, "memory_policy", memory_policy);
 
     memset(&storage_guard, 0, sizeof(storage_guard));
     jmx_storage_guard_get_stats(&storage_guard);
-    (void)jmx_storage_guard_check("/", &storage_guard.state);
+    (void)jmx_storage_guard_check(logd_ap_mode() ? "/tmp" : g_logd_db_path, &storage_guard.state);
 
     st = logd_prepare("SELECT COUNT(*),MIN(ts),MAX(ts) FROM log_events");
     if (st) {
@@ -1470,7 +1626,13 @@ struct json_object *logd_status_json(void)
     json_object_object_add(resp, "degraded", json_object_new_boolean(degraded));
     json_object_object_add(resp, "last_error", json_object_new_string(last_error));
     json_object_object_add(resp, "updated_at", json_object_new_int64(updated_at));
-    json_object_object_add(resp, "db_path", json_object_new_string(LOGD_DB_PATH));
+    json_object_object_add(resp, "ap_forward", logd_ap_status());
+    json_object_object_add(resp, "db_path", json_object_new_string(g_logd_db_path));
+    json_object_object_add(resp, "active_path", json_object_new_string(g_logd_db_path));
+    json_object_object_add(resp, "frozen", json_object_new_boolean(g_logd_storage_frozen));
+    json_object_object_add(resp, "control_db_migrated", json_object_new_boolean(0));
+    json_object_object_add(resp, "lifecycle_ready",
+                           json_object_new_boolean(logd_storage_ready()));
     json_object_object_add(resp, "storage_pressure",
                            json_object_new_string(jmx_storage_pressure_name(storage_guard.state.pressure)));
     json_object_object_add(resp, "storage_reason", json_object_new_string(storage_guard.state.reason));
@@ -1567,7 +1729,7 @@ struct json_object *logd_settings_json(void)
     int ok = 1;
     int rc;
 
-    json_object_object_add(resp, "db_path", json_object_new_string(LOGD_DB_PATH));
+    json_object_object_add(resp, "db_path", json_object_new_string(g_logd_db_path));
     json_object_object_add(resp, "config_db_path", json_object_new_string(LOGD_CONFIG_DB_PATH));
     st = logd_config_prepare("SELECT retention_days,kernel_retention_days,max_size_mb,max_events,auto_cleanup,archive_compress,updated_at,log_level_device,log_level_management,log_level_remote_access,log_level_system FROM logd_settings WHERE id=1");
     if (st) {
@@ -3391,4 +3553,170 @@ struct json_object *logd_syslog_test(struct json_object *body)
         json_object_object_add(resp, "error", json_object_new_string(error));
     json_object_object_add(resp, "capabilities", logd_unifi_capabilities_json());
     return resp;
+}
+
+/* AP operational logs are volatile. Only the authenticated controller records
+ * them durably. A bounded queue survives reconnects, never process restarts. */
+static uint64_t ap_logs_dropped;
+static uint64_t ap_logs_acked;
+static int64_t ap_logs_last_ack;
+
+int logd_ap_enqueue(struct json_object *body, const char *detail)
+{
+    unsigned char random[16];
+    char id[33];
+    sqlite3_stmt *st;
+    struct json_object *event;
+    const char *fields[] = {"severity", "category", "event", "source", "title"};
+    int rc;
+    size_t i;
+    if (!logd_ap_mode() || RAND_bytes(random, sizeof(random)) != 1) return -1;
+    for (i = 0; i < sizeof(random); i++) snprintf(id + i * 2, 3, "%02x", random[i]);
+    event = json_object_new_object();
+    json_object_object_add(event, "id", json_object_new_string(id));
+    json_object_object_add(event, "ts", json_object_new_int64(logd_json_i64(body, "ts", logd_now_s())));
+    for (i = 0; i < ARRAY_SIZE(fields); i++)
+        json_object_object_add(event, fields[i], json_object_new_string(logd_json_str(body, fields[i],
+            !strcmp(fields[i], "severity") ? logd_json_str(body, "level", "info") :
+            (!strcmp(fields[i], "category") ? "system" : ""))));
+    json_object_object_add(event, "detail_json", json_object_new_string(detail ? detail : "{}"));
+    if (!ap_log_event_valid(event)) { json_object_put(event); ap_logs_dropped++; return -1; }
+    if (logd_exec("DELETE FROM ap_log_queue WHERE rowid IN (SELECT rowid FROM ap_log_queue ORDER BY rowid DESC LIMIT -1 OFFSET 255)") != 0) {
+        json_object_put(event); return -1;
+    }
+    ap_logs_dropped += sqlite3_changes(g_logd_db);
+    st = logd_prepare("INSERT INTO ap_log_queue(id,payload) VALUES(?1,?2)");
+    if (!st) { json_object_put(event); return -1; }
+    sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+    sqlite3_bind_text(st, 2, json_object_to_json_string_ext(event, JSON_C_TO_STRING_PLAIN), -1, SQLITE_TRANSIENT);
+    rc = sqlite3_step(st);
+    sqlite3_finalize(st);
+    json_object_put(event);
+    if (rc != SQLITE_DONE) ap_logs_dropped++;
+    return rc == SQLITE_DONE ? 0 : -1;
+}
+
+struct json_object *logd_ap_status(void)
+{
+    struct json_object *r = json_object_new_object();
+    sqlite3_stmt *st;
+    json_object_object_add(r, "enabled", json_object_new_boolean(logd_ap_mode()));
+    json_object_object_add(r, "storage", json_object_new_string(logd_ap_mode() ? "memory_only" : "persistent"));
+    if (!logd_ap_mode()) return r;
+    st = logd_prepare("SELECT COUNT(*) FROM ap_log_queue");
+    if (st && sqlite3_step(st) == SQLITE_ROW)
+        json_object_object_add(r, "pending", json_object_new_int(sqlite3_column_int(st, 0)));
+    sqlite3_finalize(st);
+    json_object_object_add(r, "queue_limit", json_object_new_int(AP_LOG_QUEUE_LIMIT));
+    json_object_object_add(r, "database_limit_bytes", json_object_new_int(4096 * 4096));
+    json_object_object_add(r, "acked", json_object_new_int64(ap_logs_acked));
+    json_object_object_add(r, "dropped", json_object_new_int64(ap_logs_dropped));
+    json_object_object_add(r, "last_ack_at", json_object_new_int64(ap_logs_last_ack));
+    return r;
+}
+
+static struct json_object *logd_ap_ingest(struct json_object *body)
+{
+    struct json_object *events = json_object_object_get(body, "events");
+    const char *ap_id = logd_json_str(body, "ap_id", "");
+    size_t i;
+    sqlite3_stmt *st = NULL;
+    const char *error = "ap_log_store_failed";
+    if (logd_ap_mode() || !ap_log_string(body, "ap_id", 36, 36) ||
+        strspn(ap_id, "0123456789abcdef-") != 36 || !ap_log_batch_valid(events))
+        return ap_log_result(0, "invalid_ap_log_batch");
+    if (g_logd_storage_frozen || !logd_storage_ready() ||
+        !jmx_storage_guard_allow(g_logd_db_path, JMX_STORAGE_WRITE_IMPORTANT, NULL))
+        return ap_log_result(0, "storage_unavailable");
+    if (logd_exec("BEGIN IMMEDIATE") != 0) return ap_log_result(0, error);
+    for (i = 0; i < json_object_array_length(events); i++) {
+        struct json_object *e = json_object_array_get_idx(events, i);
+        struct json_object *detail = json_object_new_object();
+        const char *encoded;
+        char id[96];
+        int exists = 0, same = 0;
+        snprintf(id, sizeof(id), "ap:%s:%s", ap_id, logd_json_str(e, "id", ""));
+        json_object_object_add(detail, "ap_id", json_object_new_string(ap_id));
+        json_object_object_add(detail, "ap_log", json_object_get(e));
+        encoded = json_object_to_json_string_ext(detail, JSON_C_TO_STRING_PLAIN);
+        st = logd_prepare("SELECT detail_json FROM log_events WHERE id=?1");
+        if (!st) { json_object_put(detail); goto fail; }
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        int query_rc = sqlite3_step(st);
+        if (query_rc == SQLITE_ROW) {
+            exists = 1;
+            same = !strcmp(logd_sqlite_text(st, 0, ""), encoded);
+        }
+        sqlite3_finalize(st); st = NULL;
+        if (query_rc != SQLITE_ROW && query_rc != SQLITE_DONE) { json_object_put(detail); goto fail; }
+        if (exists) {
+            json_object_put(detail);
+            if (!same) { error = "ap_log_id_conflict"; goto fail; }
+            continue;
+        }
+        logd_memory_prepare_write();
+        st = logd_prepare("INSERT INTO log_events(id,seq,ts,severity,category,event,source,actor,title,detail_json,state,first_seen,last_seen,count,created_at) "
+            "VALUES(?1,(SELECT CAST(value AS INTEGER) FROM log_meta WHERE key='event_seq_next'),?2,?3,?4,?5,'ap_remote',?6,?7,?8,'active',?2,?2,1,?9)");
+        if (!st) { json_object_put(detail); goto fail; }
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 2, logd_json_i64(e, "ts", 0));
+        sqlite3_bind_text(st, 3, logd_json_str(e, "severity", ""), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 4, logd_json_str(e, "category", ""), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 5, logd_json_str(e, "event", ""), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 6, ap_id, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 7, logd_json_str(e, "title", ""), -1, SQLITE_TRANSIENT);
+        sqlite3_bind_text(st, 8, encoded, -1, SQLITE_TRANSIENT);
+        sqlite3_bind_int64(st, 9, logd_now_s());
+        int rc = sqlite3_step(st);
+        sqlite3_finalize(st); st = NULL;
+        json_object_put(detail);
+        if (rc != SQLITE_DONE || logd_exec("UPDATE log_meta SET value=CAST(value AS INTEGER)+1 WHERE key='event_seq_next'") != 0) goto fail;
+    }
+    if (logd_exec("COMMIT") != 0) goto fail;
+    logd_prune_if_needed();
+    return ap_log_result(1, NULL);
+fail:
+    sqlite3_finalize(st);
+    logd_exec("ROLLBACK");
+    return ap_log_result(0, error);
+}
+
+struct json_object *logd_ap_exchange(const char *method, struct json_object *body)
+{
+    struct json_object *r, *events;
+    sqlite3_stmt *st;
+    size_t i;
+    int rc;
+    if (!strcmp(method, "ap_log_ingest")) return logd_ap_ingest(body);
+    if (!logd_ap_mode()) return ap_log_result(0, "not_ap");
+    if (!strcmp(method, "ap_log_peek")) {
+        events = json_object_new_array();
+        st = logd_prepare("SELECT payload FROM ap_log_queue ORDER BY rowid LIMIT 4");
+        if (!st) { json_object_put(events); return ap_log_result(0, "queue_read_failed"); }
+        while ((rc = sqlite3_step(st)) == SQLITE_ROW) {
+            struct json_object *e = json_tokener_parse(logd_sqlite_text(st, 0, ""));
+            if (!e) { sqlite3_finalize(st); json_object_put(events); return ap_log_result(0, "queue_corrupt"); }
+            json_object_array_add(events, e);
+        }
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) { json_object_put(events); return ap_log_result(0, "queue_read_failed"); }
+        r = ap_log_result(1, NULL);
+        json_object_object_add(r, "persisted", json_object_new_boolean(0));
+        json_object_object_add(r, "events", events);
+        return r;
+    }
+    events = json_object_object_get(body, "events");
+    if (strcmp(method, "ap_log_ack") || !ap_log_batch_valid(events)) return ap_log_result(0, "invalid_ack");
+    for (i = 0; i < json_object_array_length(events); i++) {
+        const char *id = logd_json_str(json_object_array_get_idx(events, i), "id", "");
+        st = logd_prepare("DELETE FROM ap_log_queue WHERE id=?1");
+        if (!st) return ap_log_result(0, "queue_ack_failed");
+        sqlite3_bind_text(st, 1, id, -1, SQLITE_TRANSIENT);
+        rc = sqlite3_step(st);
+        if (rc == SQLITE_DONE) ap_logs_acked += sqlite3_changes(g_logd_db);
+        sqlite3_finalize(st);
+        if (rc != SQLITE_DONE) return ap_log_result(0, "queue_ack_failed");
+    }
+    ap_logs_last_ack = logd_now_s();
+    return ap_log_result(1, NULL);
 }

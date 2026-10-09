@@ -6,7 +6,7 @@ export function mount(context = {}) {
   if (!root) return () => {};
   const stage = root.closest('.console-stage');
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260810-front-release-01';
+  const VERSION = '20261002-multicast-save-01';
   const TABS = [
     ['overview', '总览'],
     ['igmp', 'IGMP / MLD 代理'],
@@ -344,8 +344,12 @@ export function mount(context = {}) {
     render();
     try {
       await requestJson('/api/v1/services/multicast', { method: 'PUT', body: JSON.stringify(configPayload()) });
-      const applied = await requestJson('/api/v1/services/multicast/apply', { method: 'POST', body: JSON.stringify({ dry_run: false }) });
-      state.notice = firstText(applied.message, applied.result, '配置已保存。运行状态以后端实时回读为准。');
+      if (capability('service_apply')) {
+        const applied = await requestJson('/api/v1/services/multicast/apply', { method: 'POST', body: JSON.stringify({ dry_run: false }) });
+        state.notice = applied.applied === true ? '配置已保存，运行态已应用。' : '配置已保存，运行态尚未确认。';
+      } else {
+        state.notice = '配置已保存；当前版本尚未实现运行应用，网络未因此改变。';
+      }
       state.dirty = false;
       state.confirmation = null;
       state.initial = clone(state.draft);
@@ -425,8 +429,7 @@ export function mount(context = {}) {
   function canWrite() {
     const caps = state.draft?.capabilities || state.data?.capabilities || {};
     const update = ['service_update', 'config_update', 'multicast_update', 'write'].some((key) => caps[key] === true || caps[key] === 1 || caps[key] === 'true');
-    const apply = ['service_apply', 'config_apply', 'multicast_apply', 'apply'].some((key) => caps[key] === true || caps[key] === 1 || caps[key] === 'true');
-    return update && apply;
+    return update && capability('can_manage');
   }
 
   function tabsMarkup() {
@@ -453,7 +456,7 @@ export function mount(context = {}) {
     return renderer([
       { key: 'service', label: '服务配置', value: configured ? '已配置' : '未启用', detail: runtimeVerified ? '运行态已验证' : '尚无运行态验证', tone: configured ? (runtimeVerified ? 'ok' : 'warn') : 'neutral', icon: icon('activity', 22) },
       { key: 'groups', label: '组播订阅', value: String(status.groups), detail: `${status.subscribers} 个订阅端`, tone: 'info', icon: icon('network', 22) },
-      { key: 'throughput', label: '转发速率', value: formatRate(status.rx_rate + status.tx_rate), detail: `丢弃 ${status.dropped}`, tone: status.dropped ? 'warn' : 'neutral', icon: icon('gauge', 22) },
+      { key: 'throughput', label: '转发速率', value: capability('group_rate_metrics') ? formatRate(status.rx_rate + status.tx_rate) : '—', detail: capability('group_rate_metrics') ? `丢弃 ${status.dropped}` : '尚未采集', tone: 'neutral', icon: icon('gauge', 22) },
       { key: 'udpxy', label: 'UDPXY', value: `${instances} / ${data.udpxy.instances.length}`, detail: data.udpxy.status === 'unknown' ? '运行状态未知' : `后端状态：${data.udpxy.status}`, tone: instances ? 'ok' : 'neutral', icon: icon('router', 22) }
     ], { className: 'multicast-overview', label: '组播服务概览' });
   }
@@ -472,7 +475,7 @@ export function mount(context = {}) {
     const runtimeVerified = state.draft?.runtime?.verified === true || state.draft?.runtime?.applied === true || state.draft?.runtime?.state === 'running';
     if (runtimeVerified && canWrite()) return '';
     if (!canWrite()) {
-      return `<div class="multicast-capability" role="status">${icon('warning')}<span><strong>当前为只读</strong><small>后端未声明组播配置写入与应用能力；页面只展示真实配置和运行态，不会把已配置冒充已应用。</small></span></div>`;
+      return `<div class="multicast-capability" role="status">${icon('warning')}<span><strong>当前为只读</strong><small>当前会话没有配置写入权限，或后端尚未声明写入能力。</small></span></div>`;
     }
     return `<div class="multicast-capability" role="status">${icon('warning')}<span><strong>运行状态尚未完整验证</strong><small>当前后端可以保存配置，但 IGMP、IPTV、UDPXY 与局域发现是否真正生效，必须以后端运行态回读为准。</small></span></div>`;
   }
@@ -574,7 +577,7 @@ export function mount(context = {}) {
       disabled: !canWrite() || state.saving,
       message: canWrite() ? '组播服务有未保存的更改' : '后端未声明组播配置写入与应用能力',
       discardLabel: '放弃',
-      saveLabel: canWrite() ? '保存并应用' : '等待后端能力',
+      saveLabel: canWrite() ? (capability('service_apply') ? '保存并应用' : '保存配置') : '等待后端能力',
       busyLabel: '正在保存'
     }) : '';
     return markup.replace('dwrt-kit-savebar', 'dwrt-kit-savebar multicast-savebar');

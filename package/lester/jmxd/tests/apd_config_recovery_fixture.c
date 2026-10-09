@@ -58,10 +58,26 @@ int apd_config_rollback(const struct apd_config_paths *paths,
            !rollback_fail ? 0 : -1;
 }
 
-static int prepare(const struct apd_config_job_assignment *job,
-                   const char *state, int64_t now)
+int apd_config_rollback_readback(const struct apd_config_paths *paths,
+                                 struct json_object *previous,
+                                 struct json_object **out)
 {
-    if (apd_config_job_offer_store(job, "{\"candidate\":true}", now,
+    (void)paths;
+    *out = json_tokener_parse(
+        "{\"ok\":true,\"operation\":\"rollback_readback\","
+        "\"match\":true,\"mismatches\":[]}");
+    return previous && *out && !rollback_fail ? 0 : -1;
+}
+
+static int prepare(const struct apd_config_job_assignment *job,
+                   const char *state, int64_t now, int action)
+{
+    const char *candidate = action ?
+        "{\"sections\":[{\"section\":\"ath1\",\"options\":{"
+        "\"hostapd_action_type\":\"btm_request\"}}]}" :
+        "{\"candidate\":true}";
+
+    if (apd_config_job_offer_store(job, candidate, now,
                                    NULL) != APD_CONFIG_JOB_JOURNAL_OK)
         return -1;
     if (!strcmp(state, "offered"))
@@ -83,19 +99,19 @@ static int prepare(const struct apd_config_job_assignment *job,
 int main(void)
 {
     struct apd_config_paths paths = { "uci", "wifi", "config", "stage" };
-    struct apd_config_job_assignment jobs[5];
+    struct apd_config_job_assignment jobs[11];
     struct apd_config_job_journal_entry entry;
     int recovered = 0;
     int i;
 
     CHECK("db", sqlite3_open(":memory:", &g_apd_db) == SQLITE_OK);
     CHECK("schema", apd_config_job_journal_init() == APD_CONFIG_JOB_JOURNAL_OK);
-    for (i = 0; i < 5; i++)
+    for (i = 0; i < 11; i++)
         jobs[i] = assignment((unsigned int)i + 1);
-    CHECK("offer", prepare(&jobs[0], "offered", 100) == 0);
-    CHECK("stage", prepare(&jobs[1], "staged", 200) == 0);
-    CHECK("applying", prepare(&jobs[2], "applying", 300) == 0);
-    CHECK("applied", prepare(&jobs[3], "applied", 400) == 0);
+    CHECK("offer", prepare(&jobs[0], "offered", 100, 0) == 0);
+    CHECK("stage", prepare(&jobs[1], "staged", 200, 0) == 0);
+    CHECK("applying", prepare(&jobs[2], "applying", 300, 0) == 0);
+    CHECK("applied", prepare(&jobs[3], "applied", 400, 0) == 0);
     CHECK("recover", apd_config_jobs_restart_recover(
         &paths, 1000, finish_id, &recovered) == 0);
     CHECK("count", recovered == 4);
@@ -109,7 +125,56 @@ int main(void)
         CHECK("finish pending", entry.finish_id[0] && !entry.finish_acked);
     }
 
-    CHECK("prepare failure", prepare(&jobs[4], "applying", 500) == 0);
+    CHECK("action offered", prepare(&jobs[5], "offered", 500, 1) == 0);
+    CHECK("action staged", prepare(&jobs[6], "staged", 600, 1) == 0);
+    CHECK("action applying", prepare(&jobs[7], "applying", 700, 1) == 0);
+    CHECK("action applied", prepare(&jobs[8], "applied", 800, 1) == 0);
+    CHECK("recover actions", apd_config_jobs_restart_recover(
+        &paths, 1050, finish_id, &recovered) == 0 && recovered == 4);
+    CHECK("actions never roll back wireless", rollback_calls == 2);
+    for (i = 5; i < 9; i++) {
+        CHECK("action terminal", apd_config_job_journal_get(jobs[i].job_id,
+            &entry) == APD_CONFIG_JOB_JOURNAL_OK &&
+            !strcmp(entry.state, "failed") && entry.finish_id[0]);
+        CHECK("action outcome is not invented", !strcmp(entry.error_code,
+            i < 7 ? "interrupted_before_apply" :
+                    "hostapd_action_outcome_unknown_after_restart"));
+    }
+    CHECK("recovery is idempotent", apd_config_jobs_restart_recover(
+        &paths, 1051, finish_id, &recovered) == 0 && recovered == 0 &&
+        rollback_calls == 2);
+
+    /* A controller compensation offer may arrive just before APD restarts.
+     * Recovery must resolve the previous snapshot from the completed apply
+     * journal and finish the rollback without re-applying the candidate. */
+    {
+        struct apd_config_job_finish finish = { 0 };
+        int rollback_before = rollback_calls;
+
+        CHECK("source apply", prepare(&jobs[9], "applied", 850, 0) == 0);
+        finish.assignment = jobs[9];
+        CHECK("source finish id", finish_id(finish.finish_id) == 0);
+        snprintf(finish.outcome, sizeof(finish.outcome), "applied");
+        finish.observed_at = 854;
+        finish.readback_json = "{\"match\":true}";
+        CHECK("source completed", apd_config_job_finish_store(&finish, 855,
+              NULL) == APD_CONFIG_JOB_JOURNAL_OK);
+        snprintf(jobs[10].operation, sizeof(jobs[10].operation), "rollback");
+        snprintf(jobs[10].rollback_of_job_id,
+                 sizeof(jobs[10].rollback_of_job_id), "%s", jobs[9].job_id);
+        CHECK("rollback offered", apd_config_job_offer_store(&jobs[10],
+              "{\"candidate\":true}", 856, NULL) ==
+              APD_CONFIG_JOB_JOURNAL_OK);
+        CHECK("recover compensation", apd_config_jobs_restart_recover(
+              &paths, 1060, finish_id, &recovered) == 0 && recovered == 1 &&
+              rollback_calls == rollback_before + 1);
+        CHECK("compensation terminal", apd_config_job_journal_get(
+              jobs[10].job_id, &entry) == APD_CONFIG_JOB_JOURNAL_OK &&
+              !strcmp(entry.state, "rolled_back") &&
+              !strcmp(entry.error_code, "transaction_peer_failed"));
+    }
+
+    CHECK("prepare failure", prepare(&jobs[4], "applying", 900, 0) == 0);
     rollback_fail = 1;
     recovered = 99;
     CHECK("fail closed", apd_config_jobs_restart_recover(

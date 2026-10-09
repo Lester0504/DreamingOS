@@ -4,8 +4,9 @@ export function mount(context = {}) {
   const ui = context.ui || {};
   const utils = context.utils || {};
   const escapeHtml = utils.escapeHtml || ((value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[character]));
-  const VERSION = '20260817-terminal-policy-drawer-demo-22';
+  const VERSION = '20260822-terminal-policy-savebar-24';
   const embedded = context.embedded === true;
+  const parentDraftController = context.enabledDraftController || null;
   const stage = root?.closest('.console-stage');
   const WEEKDAYS = ['一', '二', '三', '四', '五', '六', '日'];
 
@@ -38,6 +39,28 @@ export function mount(context = {}) {
     editor: {},
     confirmDelete: false
   };
+  const localEnabledBaseline = new Map();
+  const localEnabledDraft = new Map();
+
+  function ruleEnabled(rule) {
+    return parentDraftController
+      ? parentDraftController.value('speed', rule.id, rule.enabled)
+      : localEnabledDraft.has(rule.id) ? localEnabledDraft.get(rule.id) : Boolean(rule.enabled);
+  }
+
+  function enabledDirty(rule) {
+    return parentDraftController ? parentDraftController.dirty('speed', rule.id) : localEnabledDraft.has(rule.id);
+  }
+
+  function localEnabledChanges() {
+    return Array.from(localEnabledDraft.entries()).filter(([id, enabled]) => localEnabledBaseline.get(id) !== enabled);
+  }
+
+  function localSavebarMarkup() {
+    if (parentDraftController) return '';
+    const changes = localEnabledChanges();
+    return ui.floatingSavebarMarkup?.({ visible: changes.length > 0 || state.saving, message: state.saving ? '正在保存 MAC 限速状态…' : `${changes.length} 条限速规则状态待保存`, busy: state.saving, disabled: !changes.length, discardLabel: '撤销更改', saveLabel: '保存并应用' }) || '';
+  }
 
   function firstText(...values) {
     for (const value of values) {
@@ -218,7 +241,7 @@ export function mount(context = {}) {
   }
 
   function runtimeStatus(rule) {
-    if (!rule.enabled) return { label: '已停用', tone: 'error', detail: '规则保留但不进入运行态' };
+    if (!ruleEnabled(rule)) return { label: enabledDirty(rule) ? '待停用' : '已停用', tone: 'error', detail: enabledDirty(rule) ? '草稿尚未保存' : '规则保留但不进入运行态' };
     if (rule.runtime_apply) return { label: '运行中', tone: 'success', detail: firstText(rule.runtime_precision, 'client_mac_exact') };
     if (/fail|error|rollback/i.test(rule.apply_state)) return { label: '应用失败', tone: 'error', detail: firstText(rule.apply_reason, '后端未返回原因') };
     if (/queue|pending|draft|schedule/i.test(`${rule.apply_state} ${rule.apply_reason}`)) return { label: '等待调度', tone: 'warning', detail: firstText(rule.apply_reason, '等待计划窗口') };
@@ -241,8 +264,8 @@ export function mount(context = {}) {
     const query = state.query.trim().toLowerCase();
     return state.rules.filter((rule) => {
       const runtime = runtimeStatus(rule);
-      if (state.filter === 'enabled' && !rule.enabled) return false;
-      if (state.filter === 'disabled' && rule.enabled) return false;
+      if (state.filter === 'enabled' && !ruleEnabled(rule)) return false;
+      if (state.filter === 'disabled' && ruleEnabled(rule)) return false;
       if (state.filter === 'attention' && runtime.tone === 'success') return false;
       if (!query) return true;
       return [rule.name, rule.mac, rule.clientName, rule.clientIp, rule.protocol, rule.note, rule.apply_reason]
@@ -314,7 +337,8 @@ export function mount(context = {}) {
       ? '<tr><td colspan="8" class="dwrt-kit-table-empty">正在读取终端限速规则</td></tr>'
       : rows.length ? rows.map((rule) => {
         const runtime = runtimeStatus(rule);
-        return `<tr data-client-speed-rule="${escapeHtml(rule.id)}"><td><div class="client-speed-client"><strong>${escapeHtml(rule.clientName || '未命名终端')}</strong><span>${escapeHtml(rule.clientIp || '--')} · <code>${escapeHtml(rule.mac)}</code></span></div></td><td><strong>${escapeHtml(rule.name)}</strong>${rule.note ? `<small>${escapeHtml(rule.note)}</small>` : ''}</td><td>${escapeHtml(scheduleText(rule))}</td><td>${escapeHtml(rateText(rule.up_limit, rule.up_unit))}</td><td>${escapeHtml(rateText(rule.down_limit, rule.down_unit))}</td><td>${escapeHtml(rule.protocol || '任意')}</td><td><div class="client-speed-runtime">${statusBadge(runtime.label, runtime.tone)}<small title="${escapeHtml(runtime.detail)}">${escapeHtml(runtime.detail)}</small></div></td><td><div class="user-auth-row-actions"><button class="user-auth-icon-button" type="button" data-client-speed-toggle="${escapeHtml(rule.id)}" ${rule.writable && !state.saving ? '' : 'disabled'} aria-label="${rule.enabled ? '停用' : '启用'}" data-dwrt-tooltip="${rule.enabled ? '停用' : '启用'}">${icon(rule.enabled ? 'pause' : 'play')}</button><button class="user-auth-icon-button" type="button" data-client-speed-edit="${escapeHtml(rule.id)}" ${rule.writable && !state.saving ? '' : 'disabled'} aria-label="编辑" data-dwrt-tooltip="编辑">${icon('edit')}</button><button class="user-auth-icon-button danger" type="button" data-client-speed-delete="${escapeHtml(rule.id)}" ${rule.writable && !state.saving ? '' : 'disabled'} aria-label="删除" data-dwrt-tooltip="删除">${icon('trash')}</button></div></td></tr>`;
+        const enabled = ruleEnabled(rule);
+        return `<tr class="${enabledDirty(rule) ? 'is-dirty' : ''}" data-client-speed-rule="${escapeHtml(rule.id)}"><td><div class="client-speed-client"><strong>${escapeHtml(rule.clientName || '未命名终端')}</strong><span>${escapeHtml(rule.clientIp || '--')} · <code>${escapeHtml(rule.mac)}</code></span></div></td><td><strong>${escapeHtml(rule.name)}</strong>${rule.note ? `<small>${escapeHtml(rule.note)}</small>` : ''}</td><td>${escapeHtml(scheduleText(rule))}</td><td>${escapeHtml(rateText(rule.up_limit, rule.up_unit))}</td><td>${escapeHtml(rateText(rule.down_limit, rule.down_unit))}</td><td>${escapeHtml(rule.protocol || '任意')}</td><td><div class="client-speed-runtime">${statusBadge(enabledDirty(rule) && enabled ? '待启用' : runtime.label, enabledDirty(rule) ? 'warning' : runtime.tone)}<small title="${escapeHtml(runtime.detail)}">${escapeHtml(runtime.detail)}</small></div></td><td><div class="user-auth-row-actions"><button class="user-auth-icon-button" type="button" data-client-speed-toggle="${escapeHtml(rule.id)}" ${rule.writable && !state.saving ? '' : 'disabled'} aria-label="${enabled ? '停用' : '启用'}" data-dwrt-tooltip="${enabled ? '停用' : '启用'}">${icon(enabled ? 'pause' : 'play')}</button><button class="user-auth-icon-button" type="button" data-client-speed-edit="${escapeHtml(rule.id)}" ${rule.writable && !state.saving ? '' : 'disabled'} aria-label="编辑" data-dwrt-tooltip="编辑">${icon('edit')}</button><button class="user-auth-icon-button danger" type="button" data-client-speed-delete="${escapeHtml(rule.id)}" ${rule.writable && !state.saving ? '' : 'disabled'} aria-label="删除" data-dwrt-tooltip="删除">${icon('trash')}</button></div></td></tr>`;
       }).join('') : '<tr><td colspan="8" class="dwrt-kit-table-empty">暂无终端限速规则</td></tr>';
     return `<section class="user-auth-main-surface user-auth-table-card client-speed-table-card dwrt-kit-table-wrap dwrt-kit-ikuai-table-wrap dwrt-kit-glass-surface" data-client-speed-table><div class="dwrt-kit-table-toolbar user-auth-table-toolbar-rich"><div class="dwrt-kit-table-title"><strong>MAC 限速规则</strong></div><span class="dwrt-kit-table-count">${rows.length} 条</span>${toolbarControls()}</div><div class="dwrt-kit-table-scroll"><table class="dwrt-kit-table dwrt-kit-ikuai-table user-auth-table client-speed-table"><thead><tr><th>终端</th><th>规则</th><th>计划</th><th>上行</th><th>下行</th><th>协议</th><th>运行状态</th><th>操作</th></tr></thead><tbody>${body}</tbody></table></div></section>`;
   }
@@ -399,7 +423,7 @@ export function mount(context = {}) {
      * 重绘换掉 `<main>` 都会让探针失效，抽屉被当成孤儿销毁。给它一个专属
      * 容器，探针就落在容器内部，不受页面重绘影响。
      */
-    root.innerHTML = `<section class="user-auth-shell client-speed-shell" data-client-speed-version="${VERSION}">${embedded ? '' : `<header class="user-auth-header client-speed-header">${tabsMarkup()}</header>`}<main class="user-auth-workbench">${noticeMarkup()}${bodyMarkup()}</main><div class="client-speed-overlay-host" data-client-speed-sheet-host></div><div class="client-speed-overlay-host" data-client-speed-confirmation-host></div></section>`;
+    root.innerHTML = `<section class="user-auth-shell client-speed-shell" data-client-speed-version="${VERSION}">${embedded ? '' : `<header class="user-auth-header client-speed-header">${tabsMarkup()}</header>`}<main class="user-auth-workbench">${noticeMarkup()}${bodyMarkup()}</main><div data-client-speed-savebar-host>${localSavebarMarkup()}</div><div class="client-speed-overlay-host" data-client-speed-sheet-host></div><div class="client-speed-overlay-host" data-client-speed-confirmation-host></div></section>`;
     renderOverlays();
     ui.mountAll?.(root);
   }
@@ -512,7 +536,15 @@ export function mount(context = {}) {
     patchToolbar();
     patchNotice();
     patchBody();
+    patchLocalSavebar();
     renderOverlays();
+  }
+
+  function patchLocalSavebar() {
+    const host = root?.querySelector('[data-client-speed-savebar-host]');
+    if (!host) return;
+    host.innerHTML = localSavebarMarkup();
+    ui.mountAll?.(host);
   }
 
   function patchTabs() {
@@ -599,7 +631,7 @@ export function mount(context = {}) {
   async function load(background = false) {
     const seq = ++state.seq;
     state.error = '';
-    state.notice = '';
+    if (!background) state.notice = '';
     state.loading = !background;
     state.refreshing = background;
     render();
@@ -628,6 +660,14 @@ export function mount(context = {}) {
         };
         return normalizeRule(rule, client, state.capabilities, index);
       });
+      if (parentDraftController) {
+        parentDraftController.register('speed', state.rules, { id: (rule) => rule.id, enabled: (rule) => rule.enabled, canWrite: (rule) => rule.writable, describe: (rule) => `${rule.clientName || rule.mac} · ${rule.name}`, render, refresh: () => load(true), save: saveEnabledCanonical });
+      } else {
+        state.rules.forEach((rule) => {
+          localEnabledBaseline.set(rule.id, Boolean(rule.enabled));
+          if (localEnabledDraft.has(rule.id) && localEnabledDraft.get(rule.id) === Boolean(rule.enabled)) localEnabledDraft.delete(rule.id);
+        });
+      }
       state.loading = false;
       state.refreshing = false;
       if (clientsResult.status === 'rejected') {
@@ -715,22 +755,38 @@ export function mount(context = {}) {
     }
   }
 
-  async function toggleRule(rule) {
+  function toggleRule(rule) {
     if (!rule?.writable || state.saving) return;
+    const enabled = !ruleEnabled(rule);
+    if (parentDraftController) parentDraftController.toggle('speed', rule, enabled);
+    else if (localEnabledBaseline.get(rule.id) === enabled) localEnabledDraft.delete(rule.id); else localEnabledDraft.set(rule.id, enabled);
+    state.notice = '';
+    render();
+  }
+
+  async function saveEnabledCanonical(rule, enabled) {
+    await requestJson('/api/v1/client_control_rule/toggle', { method: 'POST', body: JSON.stringify({ id: rule.id, mac: rule.mac, enabled }) });
+    const payload = await requestJson('/api/v1/client_control_rules');
+    const found = asArray(payload).find((item) => firstText(item.id, item.rule_id, item.uuid) === rule.id);
+    if (!found) throw new Error('保存后回读找不到限速规则');
+    return bool(found.enabled, true);
+  }
+
+  async function saveLocalEnabledDrafts() {
+    const changes = localEnabledChanges();
+    if (!changes.length || state.saving) return;
     state.saving = true;
     render();
-    try {
-      await requestJson('/api/v1/client_control_rule/toggle', { method: 'POST', body: JSON.stringify({ id: rule.id, mac: rule.mac, enabled: !rule.enabled }) });
-      state.saving = false;
-      state.notice = rule.enabled ? '规则已停用。' : '规则已启用，运行状态将按调度结果显示。';
-      state.noticeTone = 'ok';
-      await load(true);
-    } catch (error) {
-      state.saving = false;
-      state.notice = `操作失败：${firstText(error.message, '后端未接受操作')}`;
-      state.noticeTone = 'error';
-      render();
+    const failed = [];
+    for (const [id, enabled] of changes) {
+      const rule = state.rules.find((item) => item.id === id);
+      try { if (!rule || await saveEnabledCanonical(rule, enabled) !== enabled) throw new Error('保存后回读与草稿不一致'); localEnabledDraft.delete(id); }
+      catch (error) { failed.push(`${rule?.name || id}（${firstText(error.message, '保存失败')}）`); }
     }
+    state.saving = false;
+    state.notice = failed.length ? `${changes.length - failed.length} 条已保存，${failed.length} 条失败并保留草稿：${failed.join('、')}` : `${changes.length} 条限速规则状态已保存。`;
+    state.noticeTone = failed.length ? 'warning' : 'ok';
+    await load(true);
   }
 
   async function deleteRule() {
@@ -758,6 +814,8 @@ export function mount(context = {}) {
   }
 
   function onClick(event) {
+    if (event.target.closest('[data-dwrt-savebar-discard]')) { localEnabledDraft.clear(); state.notice = ''; render(); return; }
+    if (event.target.closest('[data-dwrt-savebar-save]')) { saveLocalEnabledDrafts(); return; }
     if (event.target.closest('[data-client-speed-close]')) { state.drawer = false; state.editor = {}; state.notice = ''; renderOverlays(); patchNotice(); return; }
     if (event.target.closest('[data-dwrt-confirm-cancel], [data-dwrt-modal-close]')) { state.confirmDelete = false; renderOverlays(); return; }
     if (event.target.closest('[data-dwrt-confirm-accept]')) { deleteRule(); return; }

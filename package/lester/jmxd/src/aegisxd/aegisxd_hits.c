@@ -21,9 +21,9 @@
 #define AEGISXD_POLICY_HIT_POLL_S 10
 #define AEGISXD_NFT_TABLE "dreamingwrt_aegis"
 #define AEGISXD_NFT_ACTIVE_FILE AEGISXD_RUNTIME_DIR "/nft-active.json"
-#define AEGISXD_POLICY_DB_PATH "/etc/dreamingwrt/dreamingwrt.db"
+#define AEGISXD_POLICY_DB_PATH jmx_dataset_path("core")
 #define AEGISXD_POLICY_CONFIG_DB_PATH "/etc/dreamingwrt/config.db"
-#define AEGISXD_POLICY_FLOW_DB_PATH "/etc/dreamingwrt/flow.db"
+#define AEGISXD_POLICY_FLOW_DB_PATH jmx_dataset_path("flow")
 #define AEGISXD_POLICY_ROUTE_DB_PATH "/var/lib/dreamingwrt/network_state.db"
 
 struct aegisxd_dns_query_seen {

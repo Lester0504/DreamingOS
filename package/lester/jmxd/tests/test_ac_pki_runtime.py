@@ -19,7 +19,7 @@ FIXTURE = ROOT / "tests/ac_pki_runtime_fixture.c"
 OPENSSL_PREFIX = Path("/opt/homebrew/opt/openssl@3")
 FILES = (
     "ca.ed25519", "ca.crt.der", "server.ed25519", "server.crt.der",
-    "init.lock",
+    "init.lock", "controller.id",
 )
 
 
@@ -226,14 +226,79 @@ def expect_failure(binary: Path, pki: Path) -> None:
     assert result.returncode != 0, result.stdout
 
 
+def expect_reason(binary: Path, pki: Path, reason: str) -> None:
+    result = run(binary, pki, "inspect", check=False)
+    assert result.returncode != 0, result.stdout
+    assert fields(result.stdout).get("reason") == reason, (
+        f"expected reason={reason}\nstdout={result.stdout}\nstderr={result.stderr}"
+    )
+
+
+def test_existing_directory_mode_converges(binary: Path, root: Path,
+                                           source: Path) -> None:
+    """0755 is repaired in place; a writable-by-others directory is not.
+
+    An install path, config restore, or image unpack can leave the directory at
+    0755 with intact key material inside. Refusing that forever is what put a
+    controller in a restart loop, so it converges to 0700. Group- or
+    world-writable stays fail-closed: files in such a directory could already
+    have been swapped, and tightening the mode would hide it.
+    """
+    relaxed = clone_pki(source, root / "converge-0755" / "ac-pki")
+    os.chmod(relaxed, 0o755)
+    identity = fields(run(binary, relaxed, "inspect").stdout)
+    assert identity["controller_id"] and identity["ca_fingerprint"]
+    assert (relaxed.stat().st_mode & 0o777) == 0o700
+    assert_secure_files(relaxed)
+    assert (relaxed / "ca.ed25519").read_bytes() == (source / "ca.ed25519").read_bytes()
+    assert (relaxed / "ca.crt.der").read_bytes() == (source / "ca.crt.der").read_bytes()
+
+    group_writable = clone_pki(source, root / "reject-0770" / "ac-pki")
+    os.chmod(group_writable, 0o770)
+    expect_reason(binary, group_writable, "pki_directory_mode_invalid")
+    assert (group_writable.stat().st_mode & 0o777) == 0o770
+
+    world_writable = clone_pki(source, root / "reject-0707" / "ac-pki")
+    os.chmod(world_writable, 0o707)
+    expect_reason(binary, world_writable, "pki_directory_mode_invalid")
+
+
+def test_failure_reasons_are_specific(binary: Path, root: Path,
+                                      source: Path) -> None:
+    """Every fail-closed cause reports its own reason, not one generic string."""
+    broad_parent = root / "reason-broad-parent"
+    broad_parent.mkdir(mode=0o777)
+    os.chmod(broad_parent, 0o777)
+    expect_reason(binary, broad_parent / "ac-pki", "pki_parent_untrusted")
+
+    lock_dir = clone_pki(source, root / "reason-lock" / "ac-pki")
+    (lock_dir / "init.lock").unlink()
+    (lock_dir / "init.lock").symlink_to(source / "init.lock")
+    expect_reason(binary, lock_dir, "pki_lock_invalid")
+
+    tamper_key = clone_pki(source, root / "reason-key" / "ac-pki")
+    changed = bytearray((tamper_key / "ca.ed25519").read_bytes())
+    changed[0] ^= 0x80
+    (tamper_key / "ca.ed25519").write_bytes(changed)
+    os.chmod(tamper_key / "ca.ed25519", 0o600)
+    expect_reason(binary, tamper_key, "pki_certificate_invalid")
+
+    tamper_cert = clone_pki(source, root / "reason-cert" / "ac-pki")
+    changed = bytearray((tamper_cert / "ca.crt.der").read_bytes())
+    changed[-1] ^= 0x01
+    (tamper_cert / "ca.crt.der").write_bytes(changed)
+    os.chmod(tamper_cert / "ca.crt.der", 0o600)
+    expect_reason(binary, tamper_cert, "pki_certificate_invalid")
+
+    bad_file_mode = clone_pki(source, root / "reason-file-mode" / "ac-pki")
+    os.chmod(bad_file_mode / "ca.ed25519", 0o644)
+    expect_reason(binary, bad_file_mode, "pki_key_invalid")
+
+
 def test_fail_closed_filesystem(binary: Path, root: Path, source: Path) -> None:
     mode_dir = clone_pki(source, root / "bad-mode" / "ac-pki")
     os.chmod(mode_dir / "ca.crt.der", 0o644)
     expect_failure(binary, mode_dir)
-
-    directory_mode = clone_pki(source, root / "bad-directory" / "ac-pki")
-    os.chmod(directory_mode, 0o755)
-    expect_failure(binary, directory_mode)
 
     symlink_dir = clone_pki(source, root / "symlink" / "ac-pki")
     (symlink_dir / "server.crt.der").unlink()
@@ -301,6 +366,8 @@ def main() -> None:
         test_crash_recovery(binary, root)
         test_x509_and_issuer(binary, root)
         test_fail_closed_filesystem(binary, root, stable_pki)
+        test_existing_directory_mode_converges(binary, root, stable_pki)
+        test_failure_reasons_are_specific(binary, root, stable_pki)
     print("ok: AC PKI initialization, recovery, X.509 issuance, and file boundaries verified")
 
 

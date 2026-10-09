@@ -1,0 +1,49 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="robots" content="noindex,nofollow">
+  <title>Docker · DreamingOS</title>
+  <script>
+    (() => {
+      const root = document.documentElement;
+      function theme() {
+        let family = 'frosted-glass', pref = 'system';
+        try {
+          family = localStorage.getItem('dreamingwrt.web.themeFamily') || family;
+          pref = localStorage.getItem('dreamingwrt.web.themePref') || pref;
+        } catch (_) {}
+        root.dataset.themeFamily = ['frosted-glass', 'liquid-glass', 'traditional'].includes(family) ? family : 'frosted-glass';
+        root.dataset.themeResolved = pref === 'dark' || (pref === 'system' && matchMedia('(prefers-color-scheme: dark)').matches) ? 'dark' : 'light';
+      }
+      theme();
+      addEventListener('storage', theme);
+      matchMedia('(prefers-color-scheme: dark)').addEventListener('change', theme);
+      try {
+        if (parent !== window && parent.location.origin === location.origin && parent.DWRT_DESKTOP_HOST) {
+          window.DWRT_SESSION = parent.DWRT_SESSION;
+          root.dataset.desktopApp = 'true';
+        }
+      } catch (_) {}
+      window.DWRT_DESKTOP_HOST = true;
+    })();
+  </script>
+  <link rel="stylesheet" href="/static/ui-kit/dwrt-ui-kit.css?v=20260905-sidebar-tabs-01">
+  <link rel="stylesheet" href="/static/css/dwrt-theme.css?v=20260722-03">
+  <link rel="stylesheet" href="/static/css/theme-families.css?v=20260929-frosted-argon-03">
+  <link rel="stylesheet" href="/static/desktop/dwrt-rail.css?v=20261004-rail-foreground-01">
+  <link rel="stylesheet" href="/static/desktop/docker/docker.css?v=20261005-docker-05">
+</head>
+<body>
+  <div id="dockerApp"></div>
+  <script src="/static/js/dwrt-session-gate.js?v=20260808-region-ink-uses-painted-density-01" defer></script>
+  <script src="/static/ui-kit/lucide.min.js" defer></script>
+  <script src="/static/ui-kit/dwrt-ui-kit.js?v=20260905-sidebar-tabs-01" defer></script>
+  <script src="/static/desktop/glass-foreground.js?v=20261004-transparent-foreground-01" defer></script>
+  <script type="module">
+    import { mount } from '/static/desktop/docker/docker.js?v=20261005-docker-05';
+    window.dockerWorkbench = mount({ root: document.getElementById('dockerApp'), host: 'desktop' });
+  </script>
+</body>
+</html>

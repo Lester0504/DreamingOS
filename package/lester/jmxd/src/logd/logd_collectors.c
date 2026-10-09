@@ -2,7 +2,9 @@
 #include "logd_internal.h"
 
 #include <dirent.h>
+#include <errno.h>
 #include <fcntl.h>
+#include <math.h>
 #include <sys/statvfs.h>
 #include <sys/wait.h>
 
@@ -38,6 +40,7 @@ static struct logd_collector_runtime g_collectors[] = {
     { .name = "resource" },
     { .name = "port" },
     { .name = "dhcp_lease" },
+    { .name = "roaming" },
 };
 
 static struct logd_port_state g_ports[LOGD_MAX_PORTS];
@@ -125,7 +128,13 @@ static int logd_collector_config_load(const char *name, struct logd_collector_co
 
 static int logd_cooldown_allow(const char *collector, const char *key, int cooldown_s)
 {
-    char state_key[160];
+    /*
+     * Sized for the longest dedupe key any caller builds (log:<hash> is 320
+     * bytes in logd_collect_log_line) plus the "cooldown:" prefix. It used to
+     * be 160, which silently truncated long keys -- two distinct events then
+     * shared one cooldown slot and the second was suppressed as a duplicate.
+     */
+    char state_key[352];
     char buf[64];
     int64_t now = logd_now_s();
     int64_t last = 0;
@@ -702,7 +711,7 @@ static void logd_normalize_callbacks_suppressed(char *line)
 
 static void logd_cooldown_mark(const char *collector, const char *key, int cooldown_s)
 {
-    char state_key[160];
+    char state_key[352];   /* see logd_cooldown_allow() */
     char buf[64];
     int64_t now = logd_now_s();
 
@@ -728,47 +737,360 @@ static const char *logd_line_severity(const char *line)
     return "info";
 }
 
-static void logd_line_classify(const char *line, int kernel, const char **category, const char **event)
+static void logd_auth_detail_token(struct json_object *detail, const char *key,
+                                   const char *line, const char *marker,
+                                   int source_ip)
+{
+    const char *start;
+    const char *end;
+    char value[128];
+    size_t n;
+
+    if (!detail || !key || !line || !marker)
+        return;
+    start = strstr(line, marker);
+    if (!start)
+        return;
+    start += strlen(marker);
+    while (*start == ' ' || *start == '\t' || *start == '\'' ||
+           *start == '"' || *start == '<' || *start == '(' || *start == '[')
+        start++;
+    end = start;
+    while (*end && !isspace((unsigned char)*end) && *end != '\'' &&
+           *end != '"' && *end != '>' && *end != ')' && *end != ']')
+        end++;
+    n = (size_t)(end - start);
+    if (!n)
+        return;
+    if (n >= sizeof(value))
+        n = sizeof(value) - 1;
+    memcpy(value, start, n);
+    value[n] = 0;
+    if (source_ip) {
+        char *colon = strrchr(value, ':');
+        char *first_colon = strchr(value, ':');
+
+        /* Dropbear appends :port to IPv4. Keep IPv6 literals intact. */
+        if (colon && colon == first_colon && strchr(value, '.'))
+            *colon = 0;
+    }
+    if (value[0])
+        json_object_object_add(detail, key, json_object_new_string(value));
+}
+
+static int logd_business_line(const char *line, const char *program,
+                              const char **category, const char **event,
+                              struct json_object *detail)
+{
+    const char *prefix = "DWRT_BUSINESS_V1 ";
+    if (strncmp(line, prefix, strlen(prefix))) return 0;
+    struct json_object *root = json_tokener_parse(line + strlen(prefix)), *payload = NULL;
+    if (!root) return 0;
+    const char *producer = logd_json_str(root, "producer", "");
+    const char *id = logd_json_str(root, "event", "");
+    int allowed = (!strcmp(producer, "backup") && !strcmp(program, "dreamingwrt-webd") && !strcmp(id, "CONFIG_BACKUP_FINISHED")) ||
+        (!strcmp(producer, "power") && (!strcmp(program, "dreamingwrt-core") || !strcmp(program, "jmxd")) && !strcmp(id, "SYSTEM_POWER_ACTION")) ||
+        (!strcmp(producer, "appstore") && !strcmp(program, "dwrt-appstore-worker") && !strcmp(id, "APP_OPERATION_FINISHED")) ||
+        (!strcmp(producer, "vm") && !strcmp(program, "dreamingos-vm") && (!strcmp(id, "VM_OPERATION_FINISHED") || !strcmp(id, "VM_ACTION_RESULT"))) ||
+        (!strcmp(producer, "storage") && (!strcmp(program, "dreamingwrt-core") || !strcmp(program, "jmxd")) && !strcmp(id, "STORAGE_MIGRATION_FINISHED")) ||
+        (!strcmp(producer, "storage-health") && (!strcmp(program, "dreamingwrt-core") || !strcmp(program, "jmxd")) &&
+         (!strcmp(id, "STORAGE_SMART_FAILED") || !strcmp(id, "STORAGE_SMART_RECOVERED")));
+    const struct dw_event_definition *def = allowed ? dw_event_definition_find(id) : NULL;
+    if (def && !strcmp(logd_json_str(root, "schema", ""), "dreamingwrt.business/1") &&
+        json_object_object_get_ex(root, "detail", &payload) && json_object_is_type(payload, json_type_object)) {
+        static const char *fields[] = { "task_id", "request_id", "object_id", "object_name", "app_id", "actor", "source_ip", "action", "result", "failure_stage", "failure_reason", "version", "previous_version", "engine", "provider", "use", "path", "trigger", "checksum", "size_bytes", "smart_status", "previous_smart_status" };
+        for (size_t i = 0; i < ARRAY_SIZE(fields); i++) {
+            struct json_object *v = NULL;
+            if (json_object_object_get_ex(payload, fields[i], &v) && json_object_is_type(v, json_type_string))
+                json_object_object_add(detail, fields[i], json_object_get(v));
+        }
+        *category = def->category; *event = def->id;
+        json_object_put(root);
+        return 1;
+    }
+    json_object_put(root);
+    return 0;
+}
+
+/* vsftpd 3.0.5 logging.c syslog format. Its path text is not escaped: keep
+ * rename/chmod arguments together rather than guessing where paths split. */
+static int logd_ftp_line(const char *line, const char *program,
+                         const char **category, const char **event,
+                         struct json_object *detail)
+{
+    static const struct { const char *wire, *action, *id; } actions[] = {
+        { "LOGIN", "login", "FTP_AUTH_RESULT" },
+        { "UPLOAD", "upload", "FTP_TRANSFER_FINISHED" },
+        { "DOWNLOAD", "download", "FTP_TRANSFER_FINISHED" },
+        { "MKDIR", "mkdir", "FTP_FILE_ACTION" },
+        { "DELETE", "delete", "FTP_FILE_ACTION" },
+        { "RENAME", "rename", "FTP_FILE_ACTION" },
+        { "RMDIR", "rmdir", "FTP_FILE_ACTION" },
+        { "CHMOD", "chmod", "FTP_FILE_ACTION" },
+        { "CONNECT", "connect", "FTP_CONNECTION" },
+    };
+    const char *p = line, *user = NULL, *user_end = NULL;
+    const char *ip, *ip_end, *object = NULL, *object_end = NULL;
+    const char *result = NULL, *reason = NULL;
+    size_t a;
+    long long bytes = 0;
+    double rate = 0;
+    int transfer;
+
+    if (strcmp(program, "vsftpd")) return 0;
+    if (*p == '[') {
+        user = ++p;
+        user_end = strstr(p, "] ");
+        if (!user_end || user_end == user) return 0;
+        p = user_end + 2;
+    }
+    if (!strncmp(p, "OK ", 3)) { result = "success"; p += 3; }
+    else if (!strncmp(p, "FAIL ", 5)) { result = "failed"; p += 5; }
+    for (a = 0; a < ARRAY_SIZE(actions); a++) {
+        size_t n = strlen(actions[a].wire);
+        if (!strncmp(p, actions[a].wire, n) && !strncmp(p + n, ": Client \"", 10)) {
+            p += n + 10;
+            break;
+        }
+    }
+    if (a == ARRAY_SIZE(actions) || ((result == NULL) != !strcmp(actions[a].action, "connect")))
+        return 0;
+    ip = p;
+    ip_end = strchr(ip, '"');
+    if (!ip_end || ip_end == ip) return 0;
+    p = ip_end + 1;
+    if (!strncmp(p, ", \"", 3)) {
+        object = p + 3;
+        object_end = strrchr(object, '"');
+        if (!object_end) return 0;
+        p = object_end + 1;
+    }
+    transfer = !strcmp(actions[a].id, "FTP_TRANSFER_FINISHED");
+    if (transfer) {
+        char *end;
+        long long parsed;
+        if (strncmp(p, ", ", 2)) return 0;
+        p += 2;
+        if (!isdigit((unsigned char)*p)) return 0;
+        errno = 0;
+        parsed = strtoll(p, &end, 10);
+        if (!strncmp(end, " bytes, ", 8)) {
+            if (errno || parsed < 0) return 0;
+            bytes = parsed;
+            p = end + 8;
+        }
+        if (!isdigit((unsigned char)*p)) return 0;
+        errno = 0;
+        rate = strtod(p, &end);
+        if (errno || end == p || strcmp(end, "Kbyte/sec") || !isfinite(rate) || rate < 0)
+            return 0;
+    } else if (*p) return 0;
+    if (!strcmp(actions[a].action, "connect")) {
+        result = "connected";
+        if (object) {
+            static const char *refused[] = {
+                "Connection refused: too many sessions.",
+                "Connection refused: too many sessions for this address.",
+                "Connection refused: tcp_wrappers denial."
+            };
+            for (size_t i = 0; i < ARRAY_SIZE(refused); i++)
+                if (strlen(refused[i]) == (size_t)(object_end - object) &&
+                    !strncmp(object, refused[i], (size_t)(object_end - object))) reason = refused[i];
+            if (!reason) return 0;
+            result = "refused";
+        }
+    } else if (!strcmp(actions[a].action, "login") && object) return 0;
+
+    *event = actions[a].id;
+    *category = (!strcmp(actions[a].action, "login") || !strcmp(actions[a].action, "connect")) ? "AUTH" : "FILES";
+    json_object_object_add(detail, "protocol", json_object_new_string("ftp"));
+    json_object_object_add(detail, "action", json_object_new_string(actions[a].action));
+    json_object_object_add(detail, "result", json_object_new_string(result));
+    json_object_object_add(detail, "source_ip", json_object_new_string_len(ip, (int)(ip_end - ip)));
+    if (user) {
+        json_object_object_add(detail, "username", json_object_new_string_len(user, (int)(user_end - user)));
+        json_object_object_add(detail, (!strcmp(actions[a].action, "login") && !strcmp(result, "failed")) ? "attempted_user" : "actor",
+                               json_object_new_string_len(user, (int)(user_end - user)));
+    }
+    if (reason) json_object_object_add(detail, "failure_reason", json_object_new_string(reason));
+    else if (object) {
+        const char *key = (!strcmp(actions[a].action, "rename") || !strcmp(actions[a].action, "chmod")) ? "operation_args" : "path";
+        json_object_object_add(detail, key, json_object_new_string_len(object, (int)(object_end - object)));
+    }
+    if (transfer) {
+        /* vsftpd omits the byte field only when transfer_size is zero. Rate is
+         * rounded; it cannot establish an exact duration or TLS state. */
+        json_object_object_add(detail, "size_bytes", json_object_new_int64(bytes));
+        json_object_object_add(detail, "rate_kib_s", json_object_new_double(rate));
+    }
+    return 1;
+}
+
+static void logd_line_classify(const char *line, int kernel,
+                               const char *program, const char *facility,
+                               const char **category, const char **event,
+                               struct json_object *detail)
 {
     *category = kernel ? "kernel" : "system";
     *event = "log_line";
+    if (!kernel && logd_business_line(line, program, category, event, detail)) return;
+    if (!kernel && logd_ftp_line(line, program, category, event, detail)) return;
+    if (!kernel && !strcmp(program, "nfsmount")) {
+        char host[96] = "";
+        int code = 0, retry = 0;
+        if (sscanf(line, "NAS %95s unreachable, will still try mount", host) == 1 && strstr(line, " unreachable, will still try mount")) {
+            *category = "FILES"; *event = "NFS_TARGET_UNREACHABLE";
+            json_object_object_add(detail, "object_id", json_object_new_string(host));
+            json_object_object_add(detail, "failure_reason", json_object_new_string("target_unreachable"));
+        } else if (sscanf(line, "mount attempt failed (code=%d), retry in %ds", &code, &retry) == 2 && retry > 0) {
+            *category = "FILES"; *event = "NFS_MOUNT_RETRYING";
+            json_object_object_add(detail, "error_code", json_object_new_int(code));
+            json_object_object_add(detail, "retry_seconds", json_object_new_int(retry));
+            json_object_object_add(detail, "failure_reason", json_object_new_string("mount_attempt_failed"));
+        }
+        if (strcmp(*event, "log_line")) {
+            json_object_object_add(detail, "protocol", json_object_new_string("nfs"));
+            json_object_object_add(detail, "result", json_object_new_string("retrying"));
+            return;
+        }
+    }
     if (kernel && logd_contains_ci(line, "callbacks suppressed")) {
         *event = "callbacks_suppressed";
         return;
     }
-    if (logd_contains_ci(line, "pppoe") || logd_contains_ci(line, "pppd")) {
-        *category = "pppoe";
-        *event = "pppoe_log";
-    } else if (logd_contains_ci(line, "dhcp") || logd_contains_ci(line, "dnsmasq") ||
-               logd_contains_ci(line, "odhcpd") || logd_contains_ci(line, "udhcpc")) {
-        *category = "dhcp";
-        *event = "dhcp_log";
-    } else if (logd_contains_ci(line, "netifd") || logd_contains_ci(line, " wan") ||
-               logd_contains_ci(line, "interface 'wan'")) {
-        *category = "wan";
-        *event = "wan_log";
-    } else if (logd_contains_ci(line, "link is up") || logd_contains_ci(line, "link is down") ||
-               logd_contains_ci(line, "carrier")) {
-        *category = "port";
-        *event = "port_log";
-    } else if (logd_contains_ci(line, "auth") || logd_contains_ci(line, "login") ||
-               logd_contains_ci(line, "dropbear") || logd_contains_ci(line, "sshd") ||
-               logd_contains_ci(line, "sudo")) {
-        /*
-         * Daemon authentication text (dropbear/sshd/sudo/nginx login lines) is
-         * device-side SECURITY logging, not the admin operation audit ledger.
-         *
-         * This branch used to set category="audit"/event="auth_log", which the
-         * classifier then promoted to ADMIN_AUTH_EVENT and the log center showed
-         * under AUDIT. That let an nginx 404 or a dropbear probe masquerade as an
-         * administrator action inferred purely from the substring "login". The
-         * real admin operation audit is written by webd with an explicit
-         * web_audit flag; a raw log line is never that. Route these to SECURITY
-         * with a non-admin event name so they stay searchable but out of the
-         * ledger.
-         */
+    if (kernel || !strcasecmp(facility, "kern")) {
+        /* Kernel identity is required; application text cannot synthesize disk errors. */
+        char device[96] = "";
+        unsigned long long sector = 0;
+        const char *io = strstr(line, "I/O error, dev ");
+        if (io && sscanf(io, "I/O error, dev %95[^,], sector %llu", device, &sector) == 2) {
+            *category = "STORAGE"; *event = "STORAGE_IO_ERROR";
+            json_object_object_add(detail, "disk_id", json_object_new_string(device));
+            json_object_object_add(detail, "sector", json_object_new_int64((int64_t)sector));
+            json_object_object_add(detail, "result", json_object_new_string("failed"));
+            return;
+        }
+        if (sscanf(line, "EXT4-fs (%95[^)]):", device) == 1 &&
+            strstr(line, "Remounting filesystem read-only")) {
+            *category = "STORAGE"; *event = "STORAGE_READ_ONLY";
+            json_object_object_add(detail, "disk_id", json_object_new_string(device));
+            json_object_object_add(detail, "filesystem", json_object_new_string("ext4"));
+            json_object_object_add(detail, "result", json_object_new_string("read_only"));
+            return;
+        }
+        if (logd_contains_ci(line, "out of memory") ||
+            logd_contains_ci(line, "oom-killer")) {
+            *event = "out_of_memory";
+            return;
+        }
+        if (logd_contains_ci(line, "kernel panic")) {
+            *event = "kernel_panic";
+            return;
+        }
+        if (logd_contains_ci(line, "thermal shutdown") ||
+            logd_contains_ci(line, "critical temperature")) {
+            *event = "thermal_shutdown";
+            return;
+        }
+    }
+    if ((!strcasecmp(program, "dreamingwrt-webd") ||
+         !strcasecmp(program, "webd")) &&
+        (logd_contains_ci(line, "worker restarted") ||
+         logd_contains_ci(line, "persistent worker restarted"))) {
+        const char *idx = strstr(line, "index=");
+        const char *pid = strstr(line, "pid=");
+
+        *event = "service_worker_restarted";
+        json_object_object_add(detail, "service",
+                               json_object_new_string("dreamingwrt-webd"));
+        if (idx)
+            json_object_object_add(detail, "worker_index",
+                                   json_object_new_int(atoi(idx + 6)));
+        if (pid)
+            json_object_object_add(detail, "worker_pid",
+                                   json_object_new_int(atoi(pid + 4)));
+        return;
+    }
+    if (!strcasecmp(program, "sshd") ||
+        !strcasecmp(program, "sshd-session") ||
+        !strcasecmp(program, "dropbear") ||
+        !strcasecmp(program, "sudo")) {
         *category = "security";
         *event = "security_auth_log";
+        if (!strcasecmp(program, "sudo"))
+            json_object_object_add(detail, "service", json_object_new_string("sudo"));
+        else
+            json_object_object_add(detail, "service", json_object_new_string("ssh"));
+        if (logd_contains_ci(line, "publickey") ||
+            logd_contains_ci(line, "pubkey"))
+            json_object_object_add(detail, "auth_method", json_object_new_string("publickey"));
+        else if (logd_contains_ci(line, "password"))
+            json_object_object_add(detail, "auth_method", json_object_new_string("password"));
+        else if (!strcasecmp(program, "sudo"))
+            json_object_object_add(detail, "auth_method", json_object_new_string("sudo"));
+        if (logd_contains_ci(line, "accepted") ||
+            logd_contains_ci(line, "auth succeeded") ||
+            (!strcasecmp(program, "sudo") && !logd_contains_ci(line, "not allowed")))
+            json_object_object_add(detail, "auth_result", json_object_new_string("success"));
+        else if (logd_contains_ci(line, "failed") ||
+                 logd_contains_ci(line, "invalid") ||
+                 logd_contains_ci(line, "not allowed") ||
+                 logd_contains_ci(line, "bad password"))
+            json_object_object_add(detail, "auth_result", json_object_new_string("failure"));
+        else if (logd_contains_ci(line, "disconnected") ||
+                 logd_contains_ci(line, "connection closed") ||
+                 logd_contains_ci(line, "received disconnect") ||
+                 logd_contains_ci(line, "disconnect received"))
+            json_object_object_add(detail, "auth_result", json_object_new_string("disconnected"));
+        if (strstr(line, " for invalid user "))
+            logd_auth_detail_token(detail, "username", line, " for invalid user ", 0);
+        else if (strstr(line, "Disconnected from user "))
+            logd_auth_detail_token(detail, "username", line, "Disconnected from user ", 0);
+        else if (strstr(line, "Connection closed by authenticating user "))
+            logd_auth_detail_token(detail, "username", line,
+                                   "Connection closed by authenticating user ", 0);
+        else if (strstr(line, "Exit ("))
+            logd_auth_detail_token(detail, "username", line, "Exit (", 0);
+        else
+            logd_auth_detail_token(detail, "username", line, " for ", 0);
+
+        if (strstr(line, "Received disconnect from "))
+            logd_auth_detail_token(detail, "source_ip", line,
+                                   "Received disconnect from ", 1);
+        else if (strstr(line, "Disconnected from user ")) {
+            const char *user = strstr(line, "Disconnected from user ") +
+                               strlen("Disconnected from user ");
+            const char *ip = strchr(user, ' ');
+
+            if (ip)
+                logd_auth_detail_token(detail, "source_ip", ip, " ", 1);
+        } else if (strstr(line, "Connection closed by authenticating user ")) {
+            const char *user = strstr(line, "Connection closed by authenticating user ") +
+                               strlen("Connection closed by authenticating user ");
+            const char *ip = strchr(user, ' ');
+
+            if (ip)
+                logd_auth_detail_token(detail, "source_ip", ip, " ", 1);
+        } else
+            logd_auth_detail_token(detail, "source_ip", line, " from ", 1);
+        return;
+    }
+    if (!strcasecmp(program, "pppd") || !strcasecmp(program, "pppoe")) {
+        *category = "pppoe";
+        *event = "pppoe_log";
+    } else if (!strcasecmp(program, "dnsmasq") ||
+               !strcasecmp(program, "odhcpd") ||
+               !strcasecmp(program, "udhcpc")) {
+        *category = "dhcp";
+        *event = "dhcp_log";
+    } else if (!strcasecmp(program, "netifd")) {
+        *category = "wan";
+        *event = "wan_log";
+    } else if (kernel && (logd_contains_ci(line, "link is up") ||
+                          logd_contains_ci(line, "link is down") ||
+                          logd_contains_ci(line, "carrier"))) {
+        *category = "port";
+        *event = "port_log";
     }
 }
 
@@ -806,18 +1128,29 @@ static int logd_publish_log_line(const char *name, const char *line, int kernel,
     logd_program_normalize(kernel ? "kernel" : parsed.module, program, sizeof(program));
     if (!program[0])
         snprintf(program, sizeof(program), "%s", kernel ? "kernel" : "system");
-    logd_line_classify(canonical_message, kernel, &category, &event);
     severity = logd_facility_severity(parsed.facility_level, canonical_message);
+    detail = json_object_new_object();
+    if (!detail)
+        return -1;
+    logd_line_classify(canonical_message, kernel, program, parsed.facility,
+                       &category, &event, detail);
     snprintf(fingerprint_input, sizeof(fingerprint_input), "%s|%s|%s",
              kernel ? "kernel" : (!strcmp(category, "audit") ? "audit" : "general"),
              program, normalized);
-    logd_hash_hex(fingerprint_input, hash, sizeof(hash));
+    /* File operations are occurrences, not recurring status alarms. Preserve
+     * their timestamp, PID and case-sensitive paths; replay of the exact same
+     * syslog record still deduplicates. Native syslog has only second precision. */
+    if (!strcmp(program, "vsftpd") && !strncmp(event, "FTP_", 4))
+        logd_hash_hex(line, hash, sizeof(hash));
+    else
+        logd_hash_hex(fingerprint_input, hash, sizeof(hash));
     snprintf(dedupe, sizeof(dedupe), "log:%s", hash);
-    if (!logd_cooldown_allow(name, dedupe, cooldown_s))
+    if (!logd_cooldown_allow(name, dedupe, cooldown_s)) {
+        json_object_put(detail);
         return 0;
+    }
     logd_title_from_line(canonical_message, title, sizeof(title));
-    detail = json_object_new_object();
-    if (detail) {
+    {
         struct json_object *collectors = json_object_new_array();
         const char *source_id = kernel ? "kernel" : (!strcmp(category, "audit") ? "audit" : "general");
         const char *package = logd_program_package(program);
@@ -1134,6 +1467,13 @@ static void logd_collect_resource_one(const char *metric, double value, int warn
         severity = "warning";
     snprintf(active_key, sizeof(active_key), "active:%s", metric);
     if (!severity) {
+        if (logd_collector_state_get("resource", active_key, active_value, sizeof(active_value), "") == 0 && active_value[0]) {
+            json_object_object_add(detail, "value", json_object_new_double(value));
+            json_object_object_add(detail, "threshold", json_object_new_int(warn));
+            json_object_object_add(detail, "result", json_object_new_string("recovered"));
+            snprintf(dedupe, sizeof(dedupe), "resource:recovered:%s:%s", metric, active_value);
+            if (logd_publish_event("info", "SYSTEM", "SYSTEM_RESOURCE_RECOVERED", "resource", "", "Resource usage recovered", dedupe, detail) != 0) return;
+        }
         logd_collector_state_delete("resource", active_key);
         return;
     }
@@ -1156,8 +1496,11 @@ static void logd_collect_resource_one(const char *metric, double value, int warn
         snprintf(title, sizeof(title), "temperature %.1f C", value);
     else
         snprintf(title, sizeof(title), "%s usage %.1f%%", metric, value);
-    if (detail)
+    if (detail) {
         json_object_object_add(detail, "value", json_object_new_double(value));
+        json_object_object_add(detail, "threshold", json_object_new_int(
+            !strcmp(severity, "critical") ? critical : warn));
+    }
     if (logd_publish_event(severity, "resource", "threshold_exceeded", "resource", "", title, dedupe, detail) == 0)
         logd_cooldown_mark("resource", cooldown_key, cooldown_s);
 }
@@ -1183,7 +1526,13 @@ static int logd_read_temperature(double *temperature_c, char *source,
 
         if (strncmp(de->d_name, "thermal_zone", 12))
             continue;
-        snprintf(path, sizeof(path), "/sys/class/thermal/%s/temp", de->d_name);
+        /*
+         * A truncated path names a different file (or none), so skip the zone
+         * instead of reading whatever the shortened name happens to resolve to.
+         */
+        if ((size_t)snprintf(path, sizeof(path), "/sys/class/thermal/%s/temp",
+                             de->d_name) >= sizeof(path))
+            continue;
         if (logd_file_read_line(path, value, sizeof(value)) != 0)
             continue;
         errno = 0;
@@ -1206,8 +1555,141 @@ static int logd_read_temperature(double *temperature_c, char *source,
     return 0;
 }
 
+/* Inventory changes come from complete sysfs scans, not page visits. A failed
+ * scan must never turn a missing read into a disk-removal event. */
+static struct json_object *logd_block_inventory(const char *root)
+{
+    DIR *dir = opendir(root);
+    struct dirent *entry;
+    struct json_object *items = json_object_new_object();
+    if (!dir || !items) { if (dir) closedir(dir); json_object_put(items); return NULL; }
+    while ((entry = readdir(dir)) != NULL) {
+        const char *name = entry->d_name;
+        char path[512], value[128];
+        struct stat st;
+        if (strncmp(name,"sd",2) && strncmp(name,"vd",2) && strncmp(name,"xvd",3) &&
+            strncmp(name,"nvme",4) && strncmp(name,"mmcblk",6)) continue;
+        snprintf(path, sizeof(path), "%s/%s/partition", root, name);
+        if (stat(path, &st) == 0) continue;
+        snprintf(path, sizeof(path), "%s/%s/dev", root, name);
+        if (logd_file_read_line(path, value, sizeof(value)) != 0 || json_object_object_length(items) >= 64) {
+            json_object_put(items); closedir(dir); return NULL;
+        }
+        struct json_object *item = json_object_new_object();
+        json_object_object_add(item,"disk_id",json_object_new_string(name));
+        json_object_object_add(item,"device_number",json_object_new_string(value));
+        const char *fields[] = {"model","serial"};
+        for (size_t i=0; i<2; i++) {
+            snprintf(path,sizeof(path),"%s/%s/device/%s",root,name,fields[i]);
+            if (logd_file_read_line(path,value,sizeof(value)) == 0 && value[0])
+                json_object_object_add(item,fields[i],json_object_new_string(value));
+        }
+        json_object_object_add(items,name,item);
+    }
+    closedir(dir);
+    return items;
+}
+
+static void logd_collect_block_inventory(const char *root)
+{
+    char previous[32768] = "", hash[32], dedupe[192];
+    struct json_object *current = logd_block_inventory(root), *old = NULL, *other = NULL;
+    if (!current) return;
+    int status = logd_collector_state_get("resource","block_inventory",previous,sizeof(previous),"");
+    if (status < 0) { json_object_put(current); return; }
+    if (previous[0]) old = json_tokener_parse(previous);
+    if (!old || !json_object_is_type(old,json_type_object)) {
+        json_object_put(old); old = json_object_new_object();
+    }
+    const char *next = json_object_to_json_string_ext(current,JSON_C_TO_STRING_PLAIN);
+    if (strlen(next) >= sizeof(previous)) { json_object_put(current); json_object_put(old); return; }
+    int failed = 0;
+    for (int removal=0; removal<2; removal++) {
+        struct json_object *from = removal ? old : current, *to = removal ? current : old;
+        json_object_object_foreach(from,name,item) {
+            if (json_object_object_get_ex(to,name,&other)) {
+                const char *serial = logd_json_str(item,"serial","");
+                const char *other_serial = logd_json_str(other,"serial","");
+                if (!serial[0] || !other_serial[0] || !strcmp(serial,other_serial)) continue;
+            }
+            const char *event = removal ? "STORAGE_DEVICE_REMOVED" : "STORAGE_DEVICE_OBSERVED";
+            json_object_object_add(item,"result",json_object_new_string(removal ? "removed" : "observed"));
+            logd_hash_hex(previous,hash,sizeof(hash));
+            snprintf(dedupe,sizeof(dedupe),"storage:%s:%s:%s",event,name,hash);
+            if (logd_publish_event(removal ? "notice" : "info","STORAGE",event,"resource","",event,dedupe,item) != 0) failed = 1;
+            json_object_object_del(item,"result");
+        }
+    }
+    next = json_object_to_json_string_ext(current,JSON_C_TO_STRING_PLAIN);
+    if (!failed && !json_object_equal(old,current)) logd_collector_state_set("resource","block_inventory",next);
+    json_object_put(current); json_object_put(old);
+}
+
+/* Restore owns its durable state. Observe transitions after services return;
+ * the query API and frontend never produce these events. */
+static void logd_collect_restore_state(const char *path)
+{
+    char raw[4096], previous[160] = "", identity[160], dedupe[192];
+    FILE *f = fopen(path,"r");
+    if (!f) return;
+    size_t n = fread(raw,1,sizeof(raw)-1,f);
+    int complete = !ferror(f) && feof(f);
+    fclose(f); if (!complete) return; raw[n] = '\0';
+    struct json_object *state = json_tokener_parse(raw);
+    if (!state) return;
+    const char *id = logd_json_str(state,"operation_id","");
+    const char *phase = logd_json_str(state,"phase","");
+    const char *result = !strcmp(phase,"armed") || !strcmp(phase,"pending_confirmation") ? "accepted" :
+        !strcmp(phase,"confirmed") ? "success" : !strcmp(phase,"rolled_back") ? "rolled_back" :
+        !strcmp(phase,"failed") || !strcmp(phase,"rollback_failed") ? "failed" : "";
+    if (!id[0] || !result[0]) { json_object_put(state); return; }
+    snprintf(identity,sizeof(identity),"%s:%s",id,phase);
+    if (logd_collector_state_get("resource","config_restore",previous,sizeof(previous),"") < 0 || !strcmp(previous,identity)) { json_object_put(state); return; }
+    struct json_object *detail = json_object_new_object(), *v = NULL;
+    json_object_object_add(detail,"task_id",json_object_new_string(id));
+    json_object_object_add(detail,"object_id",json_object_new_string("config.db"));
+    json_object_object_add(detail,"action",json_object_new_string("restore"));
+    json_object_object_add(detail,"result",json_object_new_string(result));
+    json_object_object_add(detail,"phase",json_object_new_string(phase));
+    if (!strcmp(result,"failed") || !strcmp(result,"rolled_back")) {
+        json_object_object_add(detail,"failure_stage",json_object_new_string(phase));
+        json_object_object_add(detail,"failure_reason",json_object_new_string(logd_json_str(state,"error","")));
+    }
+    if (json_object_object_get_ex(state,"source_sha256",&v)) json_object_object_add(detail,"checksum",json_object_get(v));
+    if (json_object_object_get_ex(state,"size_bytes",&v)) json_object_object_add(detail,"size_bytes",json_object_get(v));
+    snprintf(dedupe,sizeof(dedupe),"config-restore:%s",identity);
+    if (logd_publish_event(!strcmp(result,"failed") ? "error" : "info","BACKUP","CONFIG_RESTORE_STATE","resource","","Configuration restore state",dedupe,detail) == 0)
+        logd_collector_state_set("resource","config_restore",identity);
+    json_object_put(detail); json_object_put(state);
+}
+
+/* boot_id is a kernel fact; it says nothing about why the previous boot ended. */
+static void logd_collect_boot(void)
+{
+    char boot[96] = "", previous[96] = "", dedupe[128];
+    if (logd_file_read_line("/proc/sys/kernel/random/boot_id", boot, sizeof(boot)) != 0 || !boot[0]) return;
+    if (logd_collector_state_get("resource", "boot_id", previous, sizeof(previous), "") < 0 || !strcmp(boot, previous)) return;
+    struct json_object *detail = json_object_new_object();
+    json_object_object_add(detail, "boot_id", json_object_new_string(boot));
+    json_object_object_add(detail, "result", json_object_new_string("observed"));
+    FILE *f = fopen("/proc/stat", "r");
+    char line[256]; long long started = 0;
+    if (f) {
+        while (fgets(line, sizeof(line), f)) if (sscanf(line, "btime %lld", &started) == 1) break;
+        fclose(f);
+    }
+    if (started > 0) json_object_object_add(detail, "boot_time", json_object_new_int64(started));
+    snprintf(dedupe, sizeof(dedupe), "system:boot:%s", boot);
+    if (logd_publish_event("info", "SYSTEM", "SYSTEM_BOOT_OBSERVED", "resource", "", "System boot observed", dedupe, detail) == 0)
+        logd_collector_state_set("resource", "boot_id", boot);
+    json_object_put(detail);
+}
+
 static int logd_collect_resource(struct logd_collector_config *cfg)
 {
+    logd_collect_boot();
+    logd_collect_restore_state("/etc/dreamingwrt/restore-staging/state.json");
+    logd_collect_block_inventory("/sys/class/block");
     struct json_object *opts = logd_json_parse_or_object(cfg ? cfg->options_json : NULL);
     int cpu_warn = logd_json_int(opts, "cpu_warn", 85);
     int cpu_critical = logd_json_int(opts, "cpu_critical", 95);
@@ -1797,6 +2279,170 @@ static int logd_collect_dhcp_leases(struct logd_collector_config *cfg)
     return events;
 }
 
+/* --- roaming collector -----------------------------------------------------
+ * The AC records every steering decision in its own SQLite (ac_roaming_audit);
+ * nothing published it to logd, so roaming activity was invisible in the log /
+ * event store. Poll roaming_audit_list per domain, mirror entries newer than
+ * the last audit_id we ingested, and skip steady-state no_action so the log
+ * carries real decisions/actions, not every evaluation tick. audit_id is a
+ * single monotonic sequence, so one watermark covers all domains. */
+
+struct logd_ac_reply {
+    struct json_object *json;
+    int seen;
+};
+
+static void logd_ac_reply_cb(struct ubus_request *req, int type,
+                             struct blob_attr *msg)
+{
+    struct logd_ac_reply *reply = req ? req->priv : NULL;
+    char *s;
+
+    (void)type;
+    if (!reply || !msg)
+        return;
+    s = blobmsg_format_json(msg, true);
+    if (s) {
+        reply->json = json_tokener_parse(s);
+        reply->seen = 1;
+        free(s);
+    }
+}
+
+static struct json_object *logd_ac_call(const char *method,
+                                        struct json_object *request)
+{
+    struct blob_buf b = {};
+    struct logd_ac_reply reply = {};
+    uint32_t id;
+    const char *s;
+
+    if (!g_logd_ubus || !method)
+        return NULL;
+    if (ubus_lookup_id(g_logd_ubus, "dreamingwrt.ac", &id) != UBUS_STATUS_OK)
+        return NULL;
+    blob_buf_init(&b, 0);
+    if (request) {
+        s = json_object_to_json_string(request);
+        if (s && s[0])
+            blobmsg_add_json_from_string(&b, s);
+    }
+    ubus_invoke(g_logd_ubus, id, method, b.head, logd_ac_reply_cb, &reply, 3000);
+    blob_buf_free(&b);
+    return reply.seen ? reply.json : NULL;
+}
+
+static int logd_roaming_publish_entry(struct json_object *entry)
+{
+    struct json_object *v;
+    const char *station = "";
+    const char *decision = "";
+    const char *reason = "";
+    const char *severity = "info";
+    char title[192];
+    char dedupe[64];
+    int64_t audit_id = 0;
+
+    if (json_object_object_get_ex(entry, "audit_id", &v))
+        audit_id = json_object_get_int64(v);
+    if (json_object_object_get_ex(entry, "station_mac", &v))
+        station = json_object_get_string(v);
+    if (json_object_object_get_ex(entry, "decision", &v))
+        decision = json_object_get_string(v);
+    if (json_object_object_get_ex(entry, "reason", &v))
+        reason = json_object_get_string(v);
+
+    if (!strcmp(decision, "roam"))
+        severity = "notice";
+
+    snprintf(title, sizeof(title), "roaming %s: %s (%s)",
+             station[0] ? station : "?", decision[0] ? decision : "?",
+             reason[0] ? reason : "");
+    snprintf(dedupe, sizeof(dedupe), "roaming:%lld", (long long)audit_id);
+
+    return logd_publish_event(severity, "roaming",
+                              decision[0] ? decision : "decision",
+                              "dreamingwrt-ac", "", title, dedupe, entry);
+}
+
+static int logd_collect_roaming(struct logd_collector_config *cfg)
+{
+    struct json_object *domains = NULL, *items = NULL;
+    char last_str[32];
+    int64_t last_id = 0, max_id = 0;
+    int initialized;
+    int published = 0;
+    size_t di;
+
+    (void)cfg;
+    if (!g_logd_ubus)
+        return 0;
+    if (logd_collector_state_get("roaming", "last_audit_id", last_str,
+                                 sizeof(last_str), "0") == 0)
+        last_id = strtoll(last_str, NULL, 10);
+    initialized = last_id > 0;
+    max_id = last_id;
+
+    domains = logd_ac_call("roaming_domains_list", NULL);
+    if (!domains)
+        return 0;
+    if (!json_object_object_get_ex(domains, "items", &items) ||
+        !json_object_is_type(items, json_type_array)) {
+        json_object_put(domains);
+        return 0;
+    }
+    for (di = 0; di < json_object_array_length(items); di++) {
+        struct json_object *dom = json_object_array_get_idx(items, di);
+        struct json_object *idv = NULL, *entries = NULL, *req;
+        const char *domain_id;
+        size_t ei;
+
+        if (!json_object_object_get_ex(dom, "domain_id", &idv))
+            continue;
+        domain_id = json_object_get_string(idv);
+        req = json_object_new_object();
+        json_object_object_add(req, "domain_id",
+                               json_object_new_string(domain_id));
+        struct json_object *arr = logd_ac_call("roaming_audit_list", req);
+        json_object_put(req);
+        if (!arr)
+            continue;
+        if (json_object_object_get_ex(arr, "entries", &entries) &&
+            json_object_is_type(entries, json_type_array)) {
+            for (ei = 0; ei < json_object_array_length(entries); ei++) {
+                struct json_object *e = json_object_array_get_idx(entries, ei);
+                struct json_object *aidv = NULL, *decv = NULL;
+                int64_t aid;
+                const char *dec = "";
+
+                if (!json_object_object_get_ex(e, "audit_id", &aidv))
+                    continue;
+                aid = json_object_get_int64(aidv);
+                if (aid <= last_id)
+                    continue;
+                if (aid > max_id)
+                    max_id = aid;
+                if (json_object_object_get_ex(e, "decision", &decv))
+                    dec = json_object_get_string(decv);
+                /* steady state: skip the every-tick no_action noise */
+                if (!strcmp(dec, "no_action"))
+                    continue;
+                /* first run just sets the watermark; do not replay history */
+                if (initialized && logd_roaming_publish_entry(e) == 0)
+                    published++;
+            }
+        }
+        json_object_put(arr);
+    }
+    json_object_put(domains);
+
+    if (max_id > last_id) {
+        snprintf(last_str, sizeof(last_str), "%lld", (long long)max_id);
+        logd_collector_state_set("roaming", "last_audit_id", last_str);
+    }
+    return published;
+}
+
 static int logd_run_collector(const char *name, int force)
 {
     struct logd_collector_runtime *rt = logd_collector_runtime_find(name);
@@ -1820,6 +2466,8 @@ static int logd_run_collector(const char *name, int force)
         rc = logd_collect_ports(&cfg);
     else if (!strcmp(name, "dhcp_lease"))
         rc = logd_collect_dhcp_leases(&cfg);
+    else if (!strcmp(name, "roaming"))
+        rc = logd_collect_roaming(&cfg);
     else
         rc = -1;
     logd_runtime_note(rt, rc >= 0, rc >= 0 ? NULL : "collector_run_failed");
@@ -1833,7 +2481,7 @@ static void logd_collect_timer_cb(struct uloop_timeout *t)
     int64_t now = logd_now_s();
     (void)t;
 
-    if (jmx_storage_guard_allow("/", JMX_STORAGE_WRITE_BULK, NULL)) {
+    if (logd_ap_mode() || jmx_storage_guard_allow(g_logd_db_path, JMX_STORAGE_WRITE_BULK, NULL)) {
         for (i = 0; i < ARRAY_SIZE(g_collectors); i++)
             logd_run_collector(g_collectors[i].name, 0);
     } else {
@@ -1842,7 +2490,7 @@ static void logd_collect_timer_cb(struct uloop_timeout *t)
     }
     /* Keep draining an existing remote queue while local bulk collection is
      * paused. This bounds storage and still delivers critical events. */
-    logd_syslog_process_queue(LOGD_SYSLOG_QUEUE_BATCH);
+    if (!logd_ap_mode()) logd_syslog_process_queue(LOGD_SYSLOG_QUEUE_BATCH);
     if (last_state_prune <= 0 || now - last_state_prune >= 3600) {
         if (logd_collector_state_prune() == 0)
             last_state_prune = now;

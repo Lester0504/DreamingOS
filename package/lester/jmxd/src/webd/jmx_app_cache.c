@@ -12,6 +12,7 @@
 #include <pthread.h>
 #include <json-c/json.h>
 #include "jmx_app_cache.h"
+#include "../dw_memory_diagnostics.h"
 
 #define CACHE_BUCKETS 64
 #define CACHE_MAX_ENTRIES 256
@@ -74,8 +75,11 @@ struct json_object *jmx_cache_get(const char *key)
     struct cache_entry *e = find_entry(key);
     if (!e)
         goto out;
-    if (now_ms() >= e->expires_at) {
-        /* expired — remove */
+    int64_t now = now_ms();
+    if (now >= e->expires_at && now < e->stale_until)
+        goto out; /* A fresh miss must not destroy a still-usable stale value. */
+    if (now >= e->stale_until) {
+        /* Retention window ended — remove. */
         unsigned int b = hash_key(key);
         if (g_buckets[b] == e) {
             g_buckets[b] = e->next;
@@ -117,8 +121,13 @@ struct json_object *jmx_cache_get_allow_stale(const char *key,
     }
 
     now = now_ms();
-    if (now - e->created_at > (int64_t)max_age_seconds * 1000 ||
-        now >= e->stale_until) {
+    if (now < e->stale_until &&
+        now - e->created_at > (int64_t)max_age_seconds * 1000) {
+        /* This caller's tighter age bound does not invalidate other readers. */
+        pthread_mutex_unlock(&g_cache_lock);
+        return NULL;
+    }
+    if (now >= e->stale_until) {
         unsigned int b = hash_key(key);
         struct cache_entry *cur = g_buckets[b];
         struct cache_entry *prev = NULL;
@@ -163,6 +172,18 @@ void jmx_cache_put_with_stale(const char *key, struct json_object *val,
         stale_seconds = ttl_seconds;
     pthread_mutex_lock(&g_cache_lock);
 
+    struct cache_entry *existing = find_entry(key);
+    if (existing) {
+        struct json_object *replacement = json_object_get(val);
+        json_object_put(existing->val);
+        existing->val = replacement;
+        existing->created_at = now_ms();
+        existing->expires_at = existing->created_at + (int64_t)ttl_seconds * 1000;
+        existing->stale_until = existing->created_at + (int64_t)stale_seconds * 1000;
+        pthread_mutex_unlock(&g_cache_lock);
+        return;
+    }
+
     /* Evict if at capacity */
     if (g_entry_count >= CACHE_MAX_ENTRIES) {
         /* Simple eviction: remove oldest from first non-empty bucket */
@@ -176,21 +197,6 @@ void jmx_cache_put_with_stale(const char *key, struct json_object *val,
                 break;
             }
         }
-    }
-
-    /* Remove existing entry if present */
-    struct cache_entry *existing = find_entry(key);
-    if (existing) {
-        unsigned int b = hash_key(key);
-        if (g_buckets[b] == existing) {
-            g_buckets[b] = existing->next;
-        } else {
-            struct cache_entry *p = g_buckets[b];
-            while (p && p->next != existing) p = p->next;
-            if (p) p->next = existing->next;
-        }
-        g_entry_count--;
-        free_entry(existing);
     }
 
     struct cache_entry *e = calloc(1, sizeof(*e));
@@ -306,4 +312,35 @@ void jmx_cache_done(void)
     }
     g_entry_count = 0;
     pthread_mutex_unlock(&g_cache_lock);
+}
+
+struct json_object *jmx_cache_status_json(void)
+{
+    struct json_object *o = json_object_new_object();
+    uint64_t counts[3] = {0}, strings[3] = {0}, nodes[3] = {0}, owned[3] = {0};
+    const char *names[] = { "fresh", "stale", "expired" };
+    int64_t now = now_ms();
+
+    pthread_mutex_lock(&g_cache_lock);
+    for (int i = 0; i < CACHE_BUCKETS; ++i) {
+        for (struct cache_entry *e = g_buckets[i]; e; e = e->next) {
+            int state = now >= e->stale_until ? 2 : now >= e->expires_at ? 1 : 0;
+            ++counts[state];
+            owned[state] += sizeof(*e) + strlen(e->key) + 1;
+            dw_mem_json_content(e->val, &nodes[state], &strings[state]);
+        }
+    }
+    pthread_mutex_unlock(&g_cache_lock);
+    for (int i = 0; i < 3; ++i) {
+        struct json_object *part = json_object_new_object();
+        dw_mem_u64(part, "entries", counts[i]);
+        dw_mem_u64(part, "entry_and_key_bytes", owned[i]);
+        dw_mem_u64(part, "json_nodes", nodes[i]);
+        dw_mem_u64(part, "json_string_bytes", strings[i]);
+        json_object_object_add(part, "json_heap_bytes", NULL);
+        json_object_object_add(o, names[i], part);
+    }
+    dw_mem_u64(o, "capacity_entries", CACHE_MAX_ENTRIES);
+    json_object_object_add(o, "scope", json_object_new_string("calling_worker_only; json_content_is_not_heap_size"));
+    return o;
 }

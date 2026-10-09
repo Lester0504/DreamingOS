@@ -13,9 +13,27 @@ extern "C" {
 #define WEBD_UPLOAD_ID_LEN 36
 #define WEBD_UPLOAD_SHA256_HEX_LEN 64
 #define WEBD_UPLOAD_OWNER_ID_LEN 128
+#if defined(OTAD_SINGLE_SLOT_SUPPORTED) && OTAD_SINGLE_SLOT_SUPPORTED
+#define WEBD_UPLOAD_DEFAULT_ROOT "/tmp/dreamingwrt/upload-staging"
+#else
 #define WEBD_UPLOAD_DEFAULT_ROOT "/data/persist/var/lib/dreamingwrt/upload-staging"
+#endif
+
+int webd_upload_staging_check_capacity(uint64_t additional_bytes,
+                                      char *err, size_t err_len);
 #define WEBD_UPLOAD_DEFAULT_TTL_SECONDS 3600
 #define WEBD_UPLOAD_META_SCAN_LIMIT 512
+
+struct webd_upload_cleanup_status {
+    time_t last_run_at;
+    time_t last_success_at;
+    size_t scanned_count;
+    size_t deleted_count;
+    size_t busy_count;
+    size_t failed_count;
+    size_t recovered_count;
+    char last_error[96];
+};
 
 struct webd_upload_meta {
     char upload_id[WEBD_UPLOAD_ID_LEN + 1];
@@ -95,6 +113,13 @@ int webd_upload_cleanup_expired(time_t now,
                                 size_t *deleted_count,
                                 char *err,
                                 size_t err_len);
+
+int webd_upload_delete_privileged(const char *upload_id,
+                                  int *deleted,
+                                  char *err,
+                                  size_t err_len);
+
+void webd_upload_cleanup_status_get(struct webd_upload_cleanup_status *out);
 
 int webd_upload_open_final_readonly(const char *owner_id,
                                     const char *upload_id,

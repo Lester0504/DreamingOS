@@ -190,6 +190,9 @@
       formatBytes = (value) => String(value || 0),
       formatInteger = (value) => String(Math.round(Number(value) || 0)),
       formatRate = (value) => String(value || 0),
+      formatDateTime = (value) => new Date(Number(value) * 1000).toLocaleString('zh-CN', { hour12: false }),
+      formatDate = (value) => formatDateTime(value, { includeTime: false }),
+      formatTime = (value, options) => formatDateTime(value, { includeDate: false, ...(options || {}) }),
       realtime = window.DWRTRealtime,
       authHeaders = () => ({})
     } = options || {};
@@ -2084,10 +2087,7 @@
     }
 
     function activityTimeLabel(timestamp) {
-      const value = Number(timestamp);
-      const date = new Date(value > 1e12 ? value : value * 1000);
-      if (!Number.isFinite(date.getTime())) return '--';
-      return new Intl.DateTimeFormat('zh-CN', { hour: 'numeric', minute: '2-digit' }).format(date);
+      return formatTime(timestamp, { includeSeconds: false });
     }
 
     /* Axis and tooltip styling is taken from systemHealthChartOption() in

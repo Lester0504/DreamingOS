@@ -9,6 +9,7 @@
  * cache only to recover first_seen/last_seen/event_count for the final row.
  */
 #include "jmx_flow_event.h"
+#include "jmx_dataset_path.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -26,6 +27,9 @@
 #include <dirent.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
+#include <fcntl.h>
+#include <utime.h>
 
 #include <sqlite3.h>
 #include <libnetfilter_conntrack/libnetfilter_conntrack.h>
@@ -41,16 +45,42 @@
 #define JMX_FLOW_EVENT_MAX_TRACKED 120000
 #define JMX_FLOW_EVENT_TRACK_TTL_SEC (6 * 3600)
 #define JMX_FLOW_EVENT_DB_BUSY_MS 80
-#define JMX_FLOW_EVENT_AUDIT_DIR "/opt/dreamingwrt/audit"
-#define JMX_FLOW_EVENT_AUDIT_DB JMX_FLOW_EVENT_AUDIT_DIR "/audit.db"
-#define JMX_FLOW_EVENT_STREAM_DIR JMX_FLOW_EVENT_AUDIT_DIR "/flow-stream"
-#define JMX_FLOW_EVENT_INDEX_DIR JMX_FLOW_EVENT_AUDIT_DIR "/flow-index"
+/* The audit dataset is relocatable; co-write wherever auditd writes. */
+#define JMX_FLOW_EVENT_AUDIT_DIR jmx_dataset_path("audit")
+#define JMX_FLOW_EVENT_AUDIT_DB jmx_dataset_child("audit", "audit.db")
+#define JMX_FLOW_EVENT_STREAM_DIR jmx_dataset_child("audit", "flow-stream")
+#define JMX_FLOW_EVENT_INDEX_DIR jmx_dataset_child("audit", "flow-index")
 #define JMX_FLOW_EVENT_STREAM_RETENTION_SEC (32 * 86400)
+#define JMX_FLOW_EVENT_STREAM_MAX_DATA_PCT 30
+#define JMX_FLOW_EVENT_STREAM_MIN_BYTES (1ULL * 1024ULL * 1024ULL * 1024ULL)
+#define JMX_FLOW_EVENT_STREAM_MAX_BYTES (8ULL * 1024ULL * 1024ULL * 1024ULL)
+#define JMX_FLOW_EVENT_STREAM_MAX_FILES 4096
+#define JMX_FLOW_EVENT_STREAM_FORMAT_VERSION 2
 #define JMX_FLOW_EVENT_INDEX_FLUSH_ROWS 256
 #define JMX_FLOW_EVENT_LOCAL_PREFIX_MAX 64
 #define JMX_FLOW_EVENT_LOCAL_PREFIX_TTL_SEC 30
 #define JMX_FLOW_EVENT_RCVBUF_BYTES (4 * 1024 * 1024)
-#define JMX_FLOW_EVENT_GROUPS (NFCT_T_NEW | NFCT_T_UPDATE | NFCT_T_DESTROY)
+/*
+ * 性能优化（PM-to-Backend-perf-ac-mem-core-cpu，B1）：不订阅 UPDATE 组。
+ *
+ * 现象：core 订阅 conntrack NEW|UPDATE|DESTROY，UPDATE 在忙时是每包刷新的洪流，
+ * 把主 uloop 线程间歇冲到 ~97% of one core（实测 31.250）。
+ *
+ * 为什么砍 UPDATE 不丢流量记账（逐行核 jmx_flow_event_cb 后的结论）：
+ *   1. 只有 DESTROY 写库（jmx_flow_event_persist_destroy 只在 type==DESTROY 调用）。
+ *   2. 写库取字节数时**优先用 DESTROY 事件自带的计数**，仅当 DESTROY 缺计数属性时
+ *      才回退到 UPDATE 累积的 track 值：
+ *        orig_bytes = t->orig_bytes_set ? t->orig_bytes : (tr ? tr->orig_bytes : 0);
+ *   3. 聚合计数 destroy_orig_bytes/destroy_repl_bytes 也取 DESTROY 事件自带 tuple 计数。
+ *   4. nf_conntrack_acct=1 时（本机实测为真，且下面运行时再断言一次）DESTROY 必带最终
+ *      计数 → UPDATE 累积值在正常路径从不被使用。
+ *   5. 无「实时/在途每流字节」读取者：g_tracks/tr->orig_bytes 仅被 persist_destroy 作
+ *      回退读；status_json 只报聚合/诊断计数。
+ * 代价仅限诊断：events_update 恒为 0、counter_reset_observed 不再置位（溯源标志，非
+ * 记账本身；持久化字节值仍是内核在 DESTROY 上报的最终值，正确）。NEW 仍订阅以维持
+ * first_seen/track 生命周期。
+ */
+#define JMX_FLOW_EVENT_GROUPS (NFCT_T_NEW | NFCT_T_DESTROY)
 #define JMX_FLOW_EVENT_MAX_DB_ROWS 300000
 #define JMX_FLOW_EVENT_PRUNE_INTERVAL_SEC 15
 #define JMX_FLOW_EVENT_PRUNE_BATCH_ROWS 10000
@@ -84,9 +114,11 @@ struct jmx_flow_tuple {
     int snat_port;
     int dnat_port;
     uint32_t mark;
+    uint32_t conntrack_id;
     uint16_t route_rule_prio;
     uint16_t route_wan_id;
     int mark_set;
+    int conntrack_id_set;
     uint64_t orig_bytes;
     uint64_t repl_bytes;
     uint64_t orig_packets;
@@ -136,6 +168,7 @@ struct jmx_flow_event_state {
     uint64_t destroy_orig_bytes;
     uint64_t destroy_repl_bytes;
     uint64_t db_writes;
+    uint64_t db_replays;
     uint64_t db_write_errors;
     uint64_t db_open_errors;
     uint64_t db_completed_rows;
@@ -147,9 +180,28 @@ struct jmx_flow_event_state {
     uint64_t stream_write_errors;
     uint64_t stream_bytes;
     uint64_t stream_rotations;
+    uint64_t stream_unguarded_writes;
+    uint64_t stream_prune_runs;
+    uint64_t stream_prune_files;
+    uint64_t stream_prune_bytes;
+    uint64_t stream_prune_errors;
+    uint64_t stream_total_bytes_before_prune;
+    uint64_t stream_total_bytes_after_prune;
+    uint64_t stream_budget_bytes;
+    uint64_t stream_reclaimable_bytes;
+    uint64_t stream_closed_files;
+    uint64_t stream_identity_rows;
+    uint64_t stream_identity_duplicate_rows;
+    uint64_t stream_identity_undetermined_rows;
+    uint64_t stream_identity_unknown_files;
+    int stream_inventory_truncated;
+    int64_t last_stream_prune_at;
+    int64_t stream_oldest_closed_mtime;
+    int64_t stream_latest_closed_mtime;
     int64_t last_stream_write_at;
     char stream_hour[16];
     char last_stream_error[160];
+    char last_stream_prune_error[160];
     uint64_t tracked_current;
     uint64_t track_created;
     uint64_t track_evicted;
@@ -189,6 +241,8 @@ static uint64_t g_flow_stream_tcp;
 static uint64_t g_flow_stream_udp;
 static uint64_t g_flow_stream_icmp;
 static uint64_t g_flow_stream_other;
+static uint64_t g_flow_stream_identity_rows;
+static uint64_t g_flow_stream_identity_undetermined_rows;
 static struct jmx_flow_local_prefix g_local_prefixes[JMX_FLOW_EVENT_LOCAL_PREFIX_MAX];
 static int g_local_prefix_count;
 static int64_t g_local_prefix_updated_at;
@@ -200,85 +254,780 @@ static int64_t jmx_flow_event_now(void)
     return (int64_t)time(NULL);
 }
 
-static void jmx_flow_event_stream_index_write(void)
-{
-    char path[256];
-    char tmp[272];
-    FILE *fp;
+struct jmx_flow_stream_file {
+    char name[64];
+    uint64_t stream_bytes;
+    uint64_t index_bytes;
+    uint64_t records;
+    uint64_t identity_rows;
+    uint64_t identity_duplicate_rows;
+    uint64_t identity_undetermined_rows;
+    int identity_dedupe_complete;
+    int64_t mtime;
+    int format_version;
+    int expired;
+    int deleted;
+};
 
-    if (!g_flow_stream_hour[0])
-        return;
-    snprintf(path, sizeof(path), "%s/%s", JMX_FLOW_EVENT_INDEX_DIR,
-             g_flow_stream_hour);
-    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
-    fp = fopen(tmp, "w");
-    if (!fp)
-        return;
-    fprintf(fp,
-            "version\t1\nrecords\t%llu\ntx_bytes\t%llu\nrx_bytes\t%llu\n"
-            "proto_tcp\t%llu\nproto_udp\t%llu\nproto_icmp\t%llu\nproto_other\t%llu\n",
-            (unsigned long long)g_flow_stream_rows,
-            (unsigned long long)g_flow_stream_tx_bytes,
-            (unsigned long long)g_flow_stream_rx_bytes,
-            (unsigned long long)g_flow_stream_tcp,
-            (unsigned long long)g_flow_stream_udp,
-            (unsigned long long)g_flow_stream_icmp,
-            (unsigned long long)g_flow_stream_other);
-    if (fclose(fp) == 0)
-        (void)rename(tmp, path);
-    else
-        (void)unlink(tmp);
-}
+struct jmx_flow_stream_stats {
+    uint64_t records;
+    uint64_t tx_bytes;
+    uint64_t rx_bytes;
+    uint64_t tcp;
+    uint64_t udp;
+    uint64_t icmp;
+    uint64_t other;
+    uint64_t identity_rows;
+    uint64_t identity_duplicate_rows;
+    uint64_t identity_undetermined_rows;
+    int identity_dedupe_complete;
+};
 
-static void jmx_flow_event_stream_prune(int64_t now)
+static int jmx_flow_event_hour_name_ok(const char *name)
 {
-    const char *dirs[] = { JMX_FLOW_EVENT_STREAM_DIR, JMX_FLOW_EVENT_INDEX_DIR };
     size_t i;
 
-    for (i = 0; i < sizeof(dirs) / sizeof(dirs[0]); i++) {
-        DIR *dir = opendir(dirs[i]);
-        struct dirent *de;
-
-        if (!dir)
+    if (!name || strlen(name) != 15 || name[8] != 'T')
+        return 0;
+    for (i = 0; i < 15; i++) {
+        if (i == 8)
             continue;
-        while ((de = readdir(dir)) != NULL) {
-            char path[320];
-            struct stat st;
-
-            if (de->d_name[0] == '.')
-                continue;
-            snprintf(path, sizeof(path), "%s/%s", dirs[i], de->d_name);
-            if (stat(path, &st) == 0 && S_ISREG(st.st_mode) &&
-                now - (int64_t)st.st_mtime > JMX_FLOW_EVENT_STREAM_RETENTION_SEC)
-                (void)unlink(path);
-        }
-        closedir(dir);
+        if (!isdigit((unsigned char)name[i]))
+            return 0;
     }
+    return !strcmp(name + 11, "0000");
 }
 
-static void jmx_flow_event_stream_index_load(const char *hour)
+static int jmx_flow_stream_file_cmp(const void *a, const void *b)
+{
+    const struct jmx_flow_stream_file *fa = a;
+    const struct jmx_flow_stream_file *fb = b;
+
+    if (fa->mtime < fb->mtime)
+        return -1;
+    if (fa->mtime > fb->mtime)
+        return 1;
+    return strcmp(fa->name, fb->name);
+}
+
+static uint64_t jmx_flow_event_stream_budget_bytes(void)
+{
+    struct statvfs vfs;
+    uint64_t total;
+    uint64_t budget;
+
+    if (statvfs("/data", &vfs) != 0 || !vfs.f_frsize || !vfs.f_blocks)
+        return JMX_FLOW_EVENT_STREAM_MAX_BYTES;
+    total = (uint64_t)vfs.f_blocks * (uint64_t)vfs.f_frsize;
+    budget = total / 100U * JMX_FLOW_EVENT_STREAM_MAX_DATA_PCT;
+    if (budget < JMX_FLOW_EVENT_STREAM_MIN_BYTES)
+        budget = JMX_FLOW_EVENT_STREAM_MIN_BYTES;
+    if (budget > JMX_FLOW_EVENT_STREAM_MAX_BYTES)
+        budget = JMX_FLOW_EVENT_STREAM_MAX_BYTES;
+    return budget;
+}
+
+static int jmx_flow_event_stream_index_read(const char *hour,
+                                            struct jmx_flow_stream_stats *stats,
+                                            int *format_version)
 {
     char path[256];
     char key[64];
     unsigned long long value;
     FILE *fp;
+    int version = 1;
 
-    if (!hour || !hour[0])
-        return;
+    if (stats)
+        memset(stats, 0, sizeof(*stats));
+    if (format_version)
+        *format_version = 0;
+    if (!hour || !hour[0] || !stats)
+        return -1;
     snprintf(path, sizeof(path), "%s/%s", JMX_FLOW_EVENT_INDEX_DIR, hour);
     fp = fopen(path, "r");
     if (!fp)
-        return;
+        return -1;
     while (fscanf(fp, "%63[^\t]\t%llu\n", key, &value) == 2) {
-        if (!strcmp(key, "records")) g_flow_stream_rows = value;
-        else if (!strcmp(key, "tx_bytes")) g_flow_stream_tx_bytes = value;
-        else if (!strcmp(key, "rx_bytes")) g_flow_stream_rx_bytes = value;
-        else if (!strcmp(key, "proto_tcp")) g_flow_stream_tcp = value;
-        else if (!strcmp(key, "proto_udp")) g_flow_stream_udp = value;
-        else if (!strcmp(key, "proto_icmp")) g_flow_stream_icmp = value;
-        else if (!strcmp(key, "proto_other")) g_flow_stream_other = value;
+        if (!strcmp(key, "version")) version = (int)value;
+        else if (!strcmp(key, "records")) stats->records = value;
+        else if (!strcmp(key, "tx_bytes")) stats->tx_bytes = value;
+        else if (!strcmp(key, "rx_bytes")) stats->rx_bytes = value;
+        else if (!strcmp(key, "proto_tcp")) stats->tcp = value;
+        else if (!strcmp(key, "proto_udp")) stats->udp = value;
+        else if (!strcmp(key, "proto_icmp")) stats->icmp = value;
+        else if (!strcmp(key, "proto_other")) stats->other = value;
+        else if (!strcmp(key, "identity_rows")) stats->identity_rows = value;
+        else if (!strcmp(key, "identity_duplicate_rows")) stats->identity_duplicate_rows = value;
+        else if (!strcmp(key, "identity_undetermined_rows")) stats->identity_undetermined_rows = value;
+        else if (!strcmp(key, "identity_dedupe_complete")) stats->identity_dedupe_complete = value != 0;
     }
     fclose(fp);
+    if (version < JMX_FLOW_EVENT_STREAM_FORMAT_VERSION &&
+        stats->identity_undetermined_rows == 0)
+        stats->identity_undetermined_rows = stats->records;
+    if (format_version)
+        *format_version = version;
+    return 0;
+}
+
+static int jmx_flow_event_stream_index_write_values(const char *hour,
+                                                    const struct jmx_flow_stream_stats *stats,
+                                                    int dedupe_complete)
+{
+    char path[256];
+    char tmp[272];
+    FILE *fp;
+
+    if (!hour || !hour[0] || !stats)
+        return -1;
+    snprintf(path, sizeof(path), "%s/%s", JMX_FLOW_EVENT_INDEX_DIR, hour);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    fp = fopen(tmp, "w");
+    if (!fp)
+        return -1;
+    fprintf(fp,
+            "version\t%d\nrecords\t%llu\ntx_bytes\t%llu\nrx_bytes\t%llu\n"
+            "proto_tcp\t%llu\nproto_udp\t%llu\nproto_icmp\t%llu\nproto_other\t%llu\n"
+            "identity_rows\t%llu\nidentity_duplicate_rows\t%llu\nidentity_undetermined_rows\t%llu\n"
+            "identity_dedupe_complete\t%d\n",
+            JMX_FLOW_EVENT_STREAM_FORMAT_VERSION,
+            (unsigned long long)stats->records,
+            (unsigned long long)stats->tx_bytes,
+            (unsigned long long)stats->rx_bytes,
+            (unsigned long long)stats->tcp,
+            (unsigned long long)stats->udp,
+            (unsigned long long)stats->icmp,
+            (unsigned long long)stats->other,
+            (unsigned long long)stats->identity_rows,
+            (unsigned long long)stats->identity_duplicate_rows,
+            (unsigned long long)stats->identity_undetermined_rows,
+            dedupe_complete ? 1 : 0);
+    if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
+        fclose(fp);
+        (void)unlink(tmp);
+        return -1;
+    }
+    if (fclose(fp) != 0) {
+        (void)unlink(tmp);
+        return -1;
+    }
+    if (rename(tmp, path) != 0) {
+        (void)unlink(tmp);
+        return -1;
+    }
+    return 0;
+}
+
+static void jmx_flow_event_stream_index_write(void)
+{
+    struct jmx_flow_stream_stats stats;
+
+    if (!g_flow_stream_hour[0])
+        return;
+    memset(&stats, 0, sizeof(stats));
+    stats.records = g_flow_stream_rows;
+    stats.tx_bytes = g_flow_stream_tx_bytes;
+    stats.rx_bytes = g_flow_stream_rx_bytes;
+    stats.tcp = g_flow_stream_tcp;
+    stats.udp = g_flow_stream_udp;
+    stats.icmp = g_flow_stream_icmp;
+    stats.other = g_flow_stream_other;
+    stats.identity_rows = g_flow_stream_identity_rows;
+    stats.identity_undetermined_rows = g_flow_stream_identity_undetermined_rows;
+    (void)jmx_flow_event_stream_index_write_values(g_flow_stream_hour, &stats, 0);
+}
+
+static uint64_t jmx_flow_event_stream_hash(const char *s)
+{
+    uint64_t h = 1469598103934665603ULL;
+
+    if (!s)
+        return h;
+    while (*s) {
+        h ^= (unsigned char)*s++;
+        h *= 1099511628211ULL;
+    }
+    return h ? h : 1;
+}
+
+struct jmx_flow_stream_seen {
+    uint64_t hash;
+    char *key;
+};
+
+static int jmx_flow_event_stream_seen_add(struct jmx_flow_stream_seen *slots,
+                                          size_t slot_count, const char *key)
+{
+    uint64_t hash;
+    size_t pos;
+
+    if (!slots || !slot_count || !key || !key[0])
+        return -1;
+    hash = jmx_flow_event_stream_hash(key);
+    pos = (size_t)hash & (slot_count - 1);
+    for (size_t i = 0; i < slot_count; i++) {
+        struct jmx_flow_stream_seen *slot = &slots[pos];
+
+        if (!slot->key) {
+            slot->hash = hash;
+            slot->key = malloc(strlen(key) + 1);
+            if (slot->key)
+                memcpy(slot->key, key, strlen(key) + 1);
+            return slot->key ? 1 : -1;
+        }
+        if (slot->hash == hash && !strcmp(slot->key, key))
+            return 0;
+        pos = (pos + 1) & (slot_count - 1);
+    }
+    return -1;
+}
+
+static void jmx_flow_event_stream_seen_free(struct jmx_flow_stream_seen *slots,
+                                            size_t slot_count)
+{
+    if (!slots)
+        return;
+    for (size_t i = 0; i < slot_count; i++)
+        free(slots[i].key);
+    free(slots);
+}
+
+static int jmx_flow_event_stream_parse_v2(char *line, char **fields,
+                                          size_t max_fields)
+{
+    size_t count = 0;
+    char *p;
+
+    if (!line || !fields || max_fields < 3)
+        return -1;
+    p = line;
+    while (count < max_fields) {
+        char *sep = strpbrk(p, "\t\r\n");
+
+        fields[count++] = p;
+        if (!sep)
+            break;
+        if (*sep == '\r' || *sep == '\n') {
+            *sep = '\0';
+            break;
+        }
+        *sep = '\0';
+        p = sep + 1;
+    }
+    if (count < 22 || strcmp(fields[0], "v2") || !fields[1][0] || !fields[2][0])
+        return -1;
+    return (int)count;
+}
+
+static int jmx_flow_event_stream_dedupe_file(const char *hour)
+{
+    char path[320], tmp[352] = "", line[8192], key[512];
+    struct stat original;
+    struct jmx_flow_stream_seen *seen = NULL;
+    struct jmx_flow_stream_stats stats;
+    size_t slot_count = 1U << 19;
+    FILE *in = NULL, *out = NULL;
+    uint64_t duplicate_rows = 0;
+    uint64_t total_rows = 0;
+    uint64_t unique_rows = 0;
+    uint64_t undetermined_rows = 0;
+    int changed = 0;
+    int rc = -1;
+
+    if (!jmx_flow_event_hour_name_ok(hour))
+        return -1;
+    snprintf(path, sizeof(path), "%s/%s", JMX_FLOW_EVENT_STREAM_DIR, hour);
+    if (stat(path, &original) != 0 || !S_ISREG(original.st_mode))
+        return 0;
+    in = fopen(path, "r");
+    if (!in)
+        return -1;
+    seen = calloc(slot_count, sizeof(*seen));
+    if (!seen)
+        goto done;
+    memset(&stats, 0, sizeof(stats));
+    while (fgets(line, sizeof(line), in)) {
+        char parse[sizeof(line)];
+        char *fields[32] = {0};
+        int field_count;
+        int is_duplicate;
+
+        total_rows++;
+        if (!strchr(line, '\n')) {
+            undetermined_rows++;
+            continue;
+        }
+        snprintf(parse, sizeof(parse), "%s", line);
+        field_count = jmx_flow_event_stream_parse_v2(parse, fields,
+                                                      sizeof(fields) / sizeof(fields[0]));
+        if (field_count < 0) {
+            undetermined_rows++;
+            continue;
+        }
+        snprintf(key, sizeof(key), "%s\t%s", fields[1], fields[2]);
+        is_duplicate = jmx_flow_event_stream_seen_add(
+            seen, slot_count, key);
+        if (is_duplicate < 0) {
+            undetermined_rows++;
+            continue;
+        }
+        stats.identity_rows++;
+        if (is_duplicate == 0) {
+            duplicate_rows++;
+            continue;
+        }
+        unique_rows++;
+        stats.records++;
+        stats.tx_bytes += strtoull(fields[20], NULL, 10);
+        stats.rx_bytes += strtoull(fields[21], NULL, 10);
+        if (!strcasecmp(fields[6], "tcp")) stats.tcp++;
+        else if (!strcasecmp(fields[6], "udp")) stats.udp++;
+        else if (!strncasecmp(fields[6], "icmp", 4)) stats.icmp++;
+        else stats.other++;
+    }
+    if (undetermined_rows > 0)
+        stats.records = total_rows;
+    else
+        stats.records = unique_rows;
+    stats.identity_duplicate_rows = duplicate_rows;
+    stats.identity_undetermined_rows = undetermined_rows;
+    if (duplicate_rows > 0 && undetermined_rows == 0) {
+        snprintf(tmp, sizeof(tmp), "%s.dedupe.tmp", path);
+        out = fopen(tmp, "w");
+        if (!out)
+            goto done;
+        rewind(in);
+        for (size_t i = 0; i < slot_count; i++) {
+            free(seen[i].key);
+            seen[i].key = NULL;
+            seen[i].hash = 0;
+        }
+        while (fgets(line, sizeof(line), in)) {
+            char parse[sizeof(line)];
+            char *fields[32] = {0};
+            int field_count;
+            int is_duplicate;
+
+            if (!strchr(line, '\n')) {
+                fputs(line, out);
+                continue;
+            }
+            snprintf(parse, sizeof(parse), "%s", line);
+            field_count = jmx_flow_event_stream_parse_v2(parse, fields,
+                                                          sizeof(fields) / sizeof(fields[0]));
+            if (field_count < 0) {
+                fputs(line, out);
+                continue;
+            }
+            snprintf(key, sizeof(key), "%s\t%s", fields[1], fields[2]);
+            is_duplicate = jmx_flow_event_stream_seen_add(seen, slot_count, key);
+            if (is_duplicate != 0)
+                fputs(line, out);
+        }
+        if (fflush(out) != 0 || fsync(fileno(out)) != 0 || fclose(out) != 0) {
+            out = NULL;
+            unlink(tmp);
+            goto done;
+        }
+        out = NULL;
+        if (rename(tmp, path) != 0) {
+            unlink(tmp);
+            goto done;
+        }
+        {
+            struct utimbuf times;
+            times.actime = original.st_atime;
+            times.modtime = original.st_mtime;
+            (void)utime(path, &times);
+        }
+        changed = 1;
+    }
+    if (jmx_flow_event_stream_index_write_values(hour, &stats,
+                                                 undetermined_rows == 0) != 0)
+        goto done;
+    rc = changed ? 1 : 0;
+
+done:
+    if (out)
+        fclose(out);
+    if (in)
+        fclose(in);
+    if (tmp[0] && out)
+        unlink(tmp);
+    jmx_flow_event_stream_seen_free(seen, slot_count);
+    (void)total_rows;
+    return rc;
+}
+
+static void jmx_flow_event_stream_dedupe_closed(const char *current)
+{
+    DIR *dir = opendir(JMX_FLOW_EVENT_STREAM_DIR);
+    struct dirent *de;
+
+    if (!dir)
+        return;
+    while ((de = readdir(dir)) != NULL) {
+        struct jmx_flow_stream_stats stats;
+        int format_version = 0;
+
+        if (!jmx_flow_event_hour_name_ok(de->d_name) ||
+            (current && current[0] && !strcmp(current, de->d_name)))
+            continue;
+        if (jmx_flow_event_stream_index_read(de->d_name, &stats,
+                                             &format_version) == 0 &&
+            format_version >= JMX_FLOW_EVENT_STREAM_FORMAT_VERSION &&
+            stats.identity_dedupe_complete)
+            continue;
+        (void)jmx_flow_event_stream_dedupe_file(de->d_name);
+    }
+    closedir(dir);
+}
+
+static void jmx_flow_event_stream_current_hour(int64_t now, char hour[16])
+{
+    struct tm tmv;
+    time_t when = (time_t)now;
+
+    if (!hour)
+        return;
+    hour[0] = '\0';
+    if (localtime_r(&when, &tmv))
+        (void)strftime(hour, 16, "%Y%m%dT%H0000", &tmv);
+}
+
+static void jmx_flow_event_stream_recover_tombstones(void)
+{
+    DIR *dir = opendir(JMX_FLOW_EVENT_STREAM_DIR);
+    struct dirent *de;
+
+    if (!dir)
+        return;
+    while ((de = readdir(dir)) != NULL) {
+        char stream_gc[320];
+        char index_gc[320];
+        char stream_path[320];
+        char index_path[320];
+        const char *hour;
+        struct stat st;
+
+        if (strncmp(de->d_name, ".gc-", 4) != 0 ||
+            !jmx_flow_event_hour_name_ok(de->d_name + 4))
+            continue;
+        hour = de->d_name + 4;
+        snprintf(stream_path, sizeof(stream_path), "%s/%s", JMX_FLOW_EVENT_STREAM_DIR, hour);
+        snprintf(index_path, sizeof(index_path), "%s/%s", JMX_FLOW_EVENT_INDEX_DIR, hour);
+        snprintf(stream_gc, sizeof(stream_gc), "%s/.gc-%s", JMX_FLOW_EVENT_STREAM_DIR, hour);
+        snprintf(index_gc, sizeof(index_gc), "%s/.gc-%s", JMX_FLOW_EVENT_INDEX_DIR, hour);
+        if (stat(stream_gc, &st) == 0) {
+            (void)unlink(stream_path);
+            (void)unlink(index_path);
+            (void)unlink(stream_gc);
+            (void)unlink(index_gc);
+        } else if (stat(index_gc, &st) == 0) {
+            if (stat(stream_path, &st) == 0)
+                (void)rename(index_gc, index_path);
+            else
+                (void)unlink(index_gc);
+        }
+    }
+    closedir(dir);
+    dir = opendir(JMX_FLOW_EVENT_INDEX_DIR);
+    if (!dir)
+        return;
+    while ((de = readdir(dir)) != NULL) {
+        char index_gc[320];
+        char index_path[320];
+        char stream_path[320];
+        const char *hour;
+        struct stat st;
+
+        if (strncmp(de->d_name, ".gc-", 4) != 0 ||
+            !jmx_flow_event_hour_name_ok(de->d_name + 4))
+            continue;
+        hour = de->d_name + 4;
+        snprintf(index_gc, sizeof(index_gc), "%s/%s", JMX_FLOW_EVENT_INDEX_DIR, de->d_name);
+        snprintf(index_path, sizeof(index_path), "%s/%s", JMX_FLOW_EVENT_INDEX_DIR, hour);
+        snprintf(stream_path, sizeof(stream_path), "%s/%s", JMX_FLOW_EVENT_STREAM_DIR, hour);
+        if (stat(index_gc, &st) == 0 && stat(stream_path, &st) != 0)
+            (void)unlink(index_gc);
+    }
+    closedir(dir);
+}
+
+static void jmx_flow_event_stream_prune_orphan_indexes(void)
+{
+    DIR *dir = opendir(JMX_FLOW_EVENT_INDEX_DIR);
+    struct dirent *de;
+
+    if (!dir)
+        return;
+    while ((de = readdir(dir)) != NULL) {
+        char stream_path[320];
+        char index_path[320];
+        char index_gc[320];
+        struct stat st;
+
+        if (!jmx_flow_event_hour_name_ok(de->d_name))
+            continue;
+        snprintf(stream_path, sizeof(stream_path), "%s/%s", JMX_FLOW_EVENT_STREAM_DIR, de->d_name);
+        if (stat(stream_path, &st) == 0)
+            continue;
+        snprintf(index_path, sizeof(index_path), "%s/%s", JMX_FLOW_EVENT_INDEX_DIR, de->d_name);
+        snprintf(index_gc, sizeof(index_gc), "%s/.gc-%s", JMX_FLOW_EVENT_INDEX_DIR, de->d_name);
+        (void)unlink(index_gc);
+        if (rename(index_path, index_gc) == 0) {
+            if (unlink(index_gc) != 0 && errno != ENOENT)
+                (void)rename(index_gc, index_path);
+        }
+    }
+    closedir(dir);
+}
+
+static int jmx_flow_event_stream_collect(struct jmx_flow_stream_file *files,
+                                         size_t max_files, size_t *count_out,
+                                         uint64_t *total_bytes_out,
+                                         int *truncated_out, int64_t now)
+{
+    DIR *dir;
+    struct dirent *de;
+    size_t count = 0;
+    uint64_t total = 0;
+    int truncated = 0;
+
+    if (count_out) *count_out = 0;
+    if (total_bytes_out) *total_bytes_out = 0;
+    if (truncated_out) *truncated_out = 0;
+    if (!files || !max_files)
+        return -1;
+    dir = opendir(JMX_FLOW_EVENT_STREAM_DIR);
+    if (!dir)
+        return errno == ENOENT ? 0 : -1;
+    while ((de = readdir(dir)) != NULL) {
+        char stream_path[320];
+        char index_path[320];
+        struct stat stream_st;
+        struct stat index_st;
+        struct jmx_flow_stream_stats stats;
+        struct jmx_flow_stream_file *file;
+
+        if (!jmx_flow_event_hour_name_ok(de->d_name))
+            continue;
+        if (count >= max_files) {
+            truncated = 1;
+            continue;
+        }
+        snprintf(stream_path, sizeof(stream_path), "%s/%s",
+                 JMX_FLOW_EVENT_STREAM_DIR, de->d_name);
+        if (stat(stream_path, &stream_st) != 0 || !S_ISREG(stream_st.st_mode))
+            continue;
+        file = &files[count++];
+        memset(file, 0, sizeof(*file));
+        snprintf(file->name, sizeof(file->name), "%s", de->d_name);
+        file->stream_bytes = stream_st.st_size > 0 ? (uint64_t)stream_st.st_size : 0;
+        file->mtime = (int64_t)stream_st.st_mtime;
+        file->expired = now > file->mtime &&
+                        now - file->mtime > JMX_FLOW_EVENT_STREAM_RETENTION_SEC;
+        snprintf(index_path, sizeof(index_path), "%s/%s",
+                 JMX_FLOW_EVENT_INDEX_DIR, de->d_name);
+        if (stat(index_path, &index_st) == 0 && S_ISREG(index_st.st_mode))
+            file->index_bytes = index_st.st_size > 0 ? (uint64_t)index_st.st_size : 0;
+        if (jmx_flow_event_stream_index_read(de->d_name, &stats,
+                                             &file->format_version) == 0) {
+            file->records = stats.records;
+            file->identity_rows = stats.identity_rows;
+            file->identity_duplicate_rows = stats.identity_duplicate_rows;
+            file->identity_undetermined_rows = stats.identity_undetermined_rows;
+            file->identity_dedupe_complete = stats.identity_dedupe_complete;
+        } else {
+            file->format_version = 0;
+        }
+        total += file->stream_bytes + file->index_bytes;
+    }
+    closedir(dir);
+    qsort(files, count, sizeof(files[0]), jmx_flow_stream_file_cmp);
+    if (count_out) *count_out = count;
+    if (total_bytes_out) *total_bytes_out = total;
+    if (truncated_out) *truncated_out = truncated;
+    return 0;
+}
+
+static int jmx_flow_event_stream_delete_pair(const char *hour,
+                                             char *err, size_t err_len)
+{
+    char stream_path[320], index_path[320];
+    char stream_gc[320], index_gc[320];
+    int index_hidden = 0;
+
+    if (!jmx_flow_event_hour_name_ok(hour)) {
+        if (err && err_len) snprintf(err, err_len, "invalid_hour_name");
+        return -1;
+    }
+    snprintf(stream_path, sizeof(stream_path), "%s/%s", JMX_FLOW_EVENT_STREAM_DIR, hour);
+    snprintf(index_path, sizeof(index_path), "%s/%s", JMX_FLOW_EVENT_INDEX_DIR, hour);
+    snprintf(stream_gc, sizeof(stream_gc), "%s/.gc-%s", JMX_FLOW_EVENT_STREAM_DIR, hour);
+    snprintf(index_gc, sizeof(index_gc), "%s/.gc-%s", JMX_FLOW_EVENT_INDEX_DIR, hour);
+    (void)unlink(stream_gc);
+    (void)unlink(index_gc);
+    if (rename(index_path, index_gc) == 0)
+        index_hidden = 1;
+    else if (errno != ENOENT) {
+        if (err && err_len) snprintf(err, err_len, "hide_index: %s", strerror(errno));
+        return -1;
+    }
+    if (rename(stream_path, stream_gc) != 0) {
+        int saved = errno;
+        if (index_hidden)
+            (void)rename(index_gc, index_path);
+        if (err && err_len) snprintf(err, err_len, "hide_stream: %s", strerror(saved));
+        return -1;
+    }
+    if (index_hidden && unlink(index_gc) != 0 && errno != ENOENT) {
+        if (err && err_len) snprintf(err, err_len, "unlink_index: %s", strerror(errno));
+        return -1;
+    }
+    if (unlink(stream_gc) != 0 && errno != ENOENT) {
+        if (err && err_len) snprintf(err, err_len, "unlink_stream: %s", strerror(errno));
+        return -1;
+    }
+    return 0;
+}
+
+static void jmx_flow_event_stream_prune(int64_t now)
+{
+    struct jmx_flow_stream_file *files;
+    size_t count = 0;
+    uint64_t total = 0;
+    uint64_t budget = jmx_flow_event_stream_budget_bytes();
+    uint64_t deleted_bytes = 0;
+    uint64_t deleted_files = 0;
+    uint64_t reclaimable = 0;
+    uint64_t closed_files = 0;
+    uint64_t identity_rows = 0;
+    uint64_t duplicate_rows = 0;
+    uint64_t undetermined_rows = 0;
+    uint64_t unknown_files = 0;
+    int64_t oldest = 0;
+    int64_t latest = 0;
+    int truncated = 0;
+    int errors = 0;
+    char current[16] = "";
+    char last_error[160] = "";
+
+    files = calloc(JMX_FLOW_EVENT_STREAM_MAX_FILES, sizeof(*files));
+    if (!files) {
+        pthread_mutex_lock(&g_flow_event.lock);
+        g_flow_event.stream_prune_errors++;
+        snprintf(g_flow_event.last_stream_prune_error,
+                 sizeof(g_flow_event.last_stream_prune_error), "out_of_memory");
+        pthread_mutex_unlock(&g_flow_event.lock);
+        return;
+    }
+    snprintf(current, sizeof(current), "%s", g_flow_stream_hour);
+    if (!current[0])
+        jmx_flow_event_stream_current_hour(now, current);
+    jmx_flow_event_stream_recover_tombstones();
+    jmx_flow_event_stream_dedupe_closed(current);
+    jmx_flow_event_stream_prune_orphan_indexes();
+    if (jmx_flow_event_stream_collect(files, JMX_FLOW_EVENT_STREAM_MAX_FILES,
+                                      &count, &total, &truncated, now) != 0) {
+        errors++;
+        snprintf(last_error, sizeof(last_error), "inventory: %s", strerror(errno));
+        goto done;
+    }
+    for (size_t i = 0; i < count; i++) {
+        struct jmx_flow_stream_file *file = &files[i];
+
+        if (!strcmp(file->name, current))
+            continue;
+        closed_files++;
+        if (!oldest || file->mtime < oldest) oldest = file->mtime;
+        if (!latest || file->mtime > latest) latest = file->mtime;
+        identity_rows += file->identity_rows;
+        duplicate_rows += file->identity_duplicate_rows;
+        undetermined_rows += file->identity_undetermined_rows;
+        if (file->format_version < JMX_FLOW_EVENT_STREAM_FORMAT_VERSION)
+            unknown_files++;
+        if (file->expired)
+            reclaimable += file->stream_bytes + file->index_bytes;
+    }
+    if (total > reclaimable && total - reclaimable > budget) {
+        uint64_t need = total - reclaimable - budget;
+
+        for (size_t i = 0; i < count && need > 0; i++) {
+            uint64_t bytes = files[i].stream_bytes + files[i].index_bytes;
+
+            if (!strcmp(files[i].name, current) || files[i].expired)
+                continue;
+            reclaimable += bytes;
+            need = bytes >= need ? 0 : need - bytes;
+        }
+    }
+    for (size_t pass = 0; pass < 2; pass++) {
+        for (size_t i = 0; i < count; i++) {
+            struct jmx_flow_stream_file *file = &files[i];
+            uint64_t bytes = file->stream_bytes + file->index_bytes;
+            int should_delete;
+
+            if (file->deleted || !strcmp(file->name, current))
+                continue;
+            should_delete = pass == 0 ? file->expired : total > budget;
+            if (!should_delete)
+                continue;
+            if (jmx_flow_event_stream_delete_pair(file->name, last_error,
+                                                  sizeof(last_error)) != 0) {
+                errors++;
+                continue;
+            }
+            file->deleted = 1;
+            deleted_files++;
+            deleted_bytes += bytes;
+            total = bytes >= total ? 0 : total - bytes;
+        }
+    }
+
+done:
+    pthread_mutex_lock(&g_flow_event.lock);
+    g_flow_event.stream_prune_runs++;
+    g_flow_event.stream_prune_files += deleted_files;
+    g_flow_event.stream_prune_bytes += deleted_bytes;
+    g_flow_event.stream_prune_errors += errors;
+    g_flow_event.stream_total_bytes_before_prune = total + deleted_bytes;
+    g_flow_event.stream_total_bytes_after_prune = total;
+    g_flow_event.stream_budget_bytes = budget;
+    g_flow_event.stream_reclaimable_bytes = reclaimable;
+    g_flow_event.stream_closed_files = closed_files;
+    g_flow_event.stream_identity_rows = identity_rows;
+    g_flow_event.stream_identity_duplicate_rows = duplicate_rows;
+    g_flow_event.stream_identity_undetermined_rows = undetermined_rows;
+    g_flow_event.stream_identity_unknown_files = unknown_files;
+    g_flow_event.stream_inventory_truncated = truncated;
+    g_flow_event.last_stream_prune_at = now;
+    g_flow_event.stream_oldest_closed_mtime = oldest;
+    g_flow_event.stream_latest_closed_mtime = latest;
+    snprintf(g_flow_event.last_stream_prune_error,
+             sizeof(g_flow_event.last_stream_prune_error), "%s",
+             errors ? (last_error[0] ? last_error : "cleanup_partial_failure") : "");
+    pthread_mutex_unlock(&g_flow_event.lock);
+    free(files);
+}
+
+static void jmx_flow_event_stream_index_load(const char *hour)
+{
+    struct jmx_flow_stream_stats stats;
+
+    if (!hour || !hour[0])
+        return;
+    if (jmx_flow_event_stream_index_read(hour, &stats, NULL) != 0)
+        return;
+    g_flow_stream_rows = stats.records;
+    g_flow_stream_tx_bytes = stats.tx_bytes;
+    g_flow_stream_rx_bytes = stats.rx_bytes;
+    g_flow_stream_tcp = stats.tcp;
+    g_flow_stream_udp = stats.udp;
+    g_flow_stream_icmp = stats.icmp;
+    g_flow_stream_other = stats.other;
+    g_flow_stream_identity_rows = stats.identity_rows;
+    g_flow_stream_identity_undetermined_rows = stats.identity_undetermined_rows;
 }
 
 static int jmx_flow_event_stream_open(int64_t now)
@@ -292,8 +1041,17 @@ static int jmx_flow_event_stream_open(int64_t now)
         return -1;
     if (!strftime(hour, sizeof(hour), "%Y%m%dT%H0000", &tmv))
         return -1;
-    if (g_flow_stream && !strcmp(hour, g_flow_stream_hour))
+    if (g_flow_stream && !strcmp(hour, g_flow_stream_hour)) {
+        int should_prune;
+
+        pthread_mutex_lock(&g_flow_event.lock);
+        should_prune = g_flow_event.last_stream_prune_at <= 0 ||
+                       now - g_flow_event.last_stream_prune_at >= 600;
+        pthread_mutex_unlock(&g_flow_event.lock);
+        if (should_prune)
+            jmx_flow_event_stream_prune(now);
         return 0;
+    }
 
     if (g_flow_stream) {
         fflush(g_flow_stream);
@@ -317,6 +1075,8 @@ static int jmx_flow_event_stream_open(int64_t now)
     g_flow_stream_udp = 0;
     g_flow_stream_icmp = 0;
     g_flow_stream_other = 0;
+    g_flow_stream_identity_rows = 0;
+    g_flow_stream_identity_undetermined_rows = 0;
     jmx_flow_event_stream_index_load(hour);
     jmx_flow_event_stream_prune(now);
 
@@ -329,6 +1089,7 @@ static int jmx_flow_event_stream_open(int64_t now)
 }
 
 static void jmx_flow_event_stream_write(const struct jmx_flow_tuple *t,
+                                        const char *flow_id,
                                         int64_t first_seen, int64_t last_seen,
                                         int64_t destroy_ts, uint32_t event_count,
                                         const char *direction,
@@ -345,7 +1106,8 @@ static void jmx_flow_event_stream_write(const struct jmx_flow_tuple *t,
 {
     int n;
 
-    if (!t || jmx_flow_event_stream_open(destroy_ts) != 0) {
+    if (!t || !flow_id || !flow_id[0] ||
+        jmx_flow_event_stream_open(destroy_ts) != 0) {
         pthread_mutex_lock(&g_flow_event.lock);
         g_flow_event.stream_write_errors++;
         snprintf(g_flow_event.last_stream_error,
@@ -354,9 +1116,9 @@ static void jmx_flow_event_stream_write(const struct jmx_flow_tuple *t,
         return;
     }
     n = fprintf(g_flow_stream,
-                "%lld\t%lld\t%lld\t%u\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t"
+                "v2\t%s\t%lld\t%lld\t%lld\t%u\t%s\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\t%s\t"
                 "%llu\t%llu\t%llu\t%llu\t%llu\t%llu\t%s\t%s\t%d\t%d\t%u\t%u\t%u\t%s\n",
-                (long long)destroy_ts, (long long)first_seen, (long long)last_seen,
+                flow_id, (long long)destroy_ts, (long long)first_seen, (long long)last_seen,
                 event_count, t->proto, t->src, t->sport, t->dst, t->dport,
                 direction, initiator, client_ip, remote_ip, service,
                 (unsigned long long)orig_packets, (unsigned long long)repl_packets,
@@ -375,6 +1137,7 @@ static void jmx_flow_event_stream_write(const struct jmx_flow_tuple *t,
         return;
     }
     g_flow_stream_rows++;
+    g_flow_stream_identity_rows++;
     g_flow_stream_tx_bytes += tx_bytes;
     g_flow_stream_rx_bytes += rx_bytes;
     if (!strcasecmp(t->proto, "tcp")) g_flow_stream_tcp++;
@@ -1084,6 +1847,10 @@ static void jmx_flow_event_extract_tuple(struct nf_conntrack *ct,
         t->route_rule_prio = (uint16_t)((t->mark >> 16) & 0xffff);
         t->route_wan_id = (uint16_t)(t->mark & 0xffff);
     }
+    if (nfct_attr_is_set(ct, ATTR_ID)) {
+        t->conntrack_id = nfct_get_attr_u32(ct, ATTR_ID);
+        t->conntrack_id_set = 1;
+    }
 }
 
 static void jmx_flow_event_make_key(const struct jmx_flow_tuple *t,
@@ -1362,7 +2129,7 @@ static void jmx_flow_event_db_close(void)
 static int jmx_flow_event_db_ensure(void)
 {
     static const char *insert_sql =
-        "INSERT OR REPLACE INTO audit_flow_event_lifecycle ("
+        "INSERT OR IGNORE INTO audit_flow_event_lifecycle ("
         "flow_id,flow_key,first_seen,last_seen,destroy_ts,event_count,"
         "proto,protocol,state,app_proto,service,src_ip,dst_ip,src_port,dst_port,"
         "source_ip,destination_ip,source_port,destination_port,client_ip,client_mac,remote_ip,destination_private,"
@@ -1380,6 +2147,8 @@ static int jmx_flow_event_db_ensure(void)
         "?56,?57,?58,?59,?60)";
     int rc;
 
+    if (jmx_device_role_is_ap() == 1)
+        return -1;
     if (g_flow_db && g_flow_insert)
         return 0;
 
@@ -1622,7 +2391,12 @@ static void jmx_flow_event_persist_destroy(const char *key,
         byte_counter_reason = "ctnetlink_destroy_no_counter_attrs";
     destination_private = jmx_flow_event_ip_private_or_local(remote_ip);
     jmx_flow_event_service_hint(t->proto, t->dport, service, sizeof(service));
-    snprintf(flow_id, sizeof(flow_id), "%s|%lld", key, (long long)first_seen);
+    if (t->conntrack_id_set)
+        snprintf(flow_id, sizeof(flow_id), "ctid:%u|%lld",
+                 t->conntrack_id, (long long)first_seen);
+    else
+        snprintf(flow_id, sizeof(flow_id), "legacy:%s|%lld",
+                 key, (long long)first_seen);
     policy_hit = t->mark_set && t->route_rule_prio > 0 && t->route_wan_id > 0;
     if (policy_hit) {
         snprintf(policy_id, sizeof(policy_id), "rule-%u", (unsigned)t->route_rule_prio);
@@ -1632,11 +2406,6 @@ static void jmx_flow_event_persist_destroy(const char *key,
         else
             snprintf(route_wan, sizeof(route_wan), "wan%u", (unsigned)t->route_wan_id);
     }
-
-    jmx_flow_event_stream_write(t, first_seen, last_seen, now, event_count,
-                                direction, initiator, client_ip, remote_ip,
-                                service, orig_packets, repl_packets,
-                                orig_bytes, repl_bytes, tx_bytes, rx_bytes);
 
     if (jmx_flow_event_db_ensure() != 0)
         return;
@@ -1720,14 +2489,27 @@ static void jmx_flow_event_persist_destroy(const char *key,
     sqlite3_bind_text(g_flow_insert, idx++, dest_app_name, -1, SQLITE_TRANSIENT);
 
     if (sqlite3_step(g_flow_insert) == SQLITE_DONE) {
+        int inserted = sqlite3_changes(g_flow_db) > 0;
+
         pthread_mutex_lock(&g_flow_event.lock);
-        g_flow_event.db_writes++;
-        g_flow_event.db_completed_rows++;
+        if (inserted) {
+            g_flow_event.db_writes++;
+            g_flow_event.db_completed_rows++;
+        } else {
+            g_flow_event.db_replays++;
+        }
         g_flow_event.last_db_write_at = now;
         g_flow_event.updated_at = now;
         pthread_mutex_unlock(&g_flow_event.lock);
         sqlite3_reset(g_flow_insert);
-        jmx_flow_event_prune_if_needed(now);
+        if (inserted) {
+            jmx_flow_event_stream_write(t, flow_id, first_seen, last_seen, now,
+                                        event_count, direction, initiator,
+                                        client_ip, remote_ip, service,
+                                        orig_packets, repl_packets, orig_bytes,
+                                        repl_bytes, tx_bytes, rx_bytes);
+            jmx_flow_event_prune_if_needed(now);
+        }
     } else {
         jmx_flow_event_set_db_error("insert lifecycle", g_flow_db);
     }
@@ -1742,6 +2524,11 @@ static int jmx_flow_event_cb(enum nf_conntrack_msg_type type,
     int64_t now = jmx_flow_event_now();
 
     (void)data;
+    if (jmx_device_role_is_ap() == 1) {
+        jmx_flow_event_set_state("disabled_by_role",
+                                 "ap_mode_no_local_audit", 0);
+        return NFCT_CB_STOP;
+    }
     jmx_flow_event_extract_tuple(ct, &tuple);
     jmx_flow_event_make_key(&tuple, key, sizeof(key));
 
@@ -1797,6 +2584,12 @@ static void *jmx_flow_event_thread_main(void *arg)
     snprintf(g_flow_event.reason, sizeof(g_flow_event.reason), "%s", "opening_ctnetlink");
     pthread_mutex_unlock(&g_flow_event.lock);
 
+    if (jmx_device_role_is_ap() == 1) {
+        jmx_flow_event_set_state("disabled_by_role",
+                                 "ap_mode_no_local_audit", 0);
+        goto stopped;
+    }
+
     /* Initialize the compressed lifecycle sink early so status can report it. */
     (void)jmx_flow_event_db_ensure();
 
@@ -1811,6 +2604,11 @@ static void *jmx_flow_event_thread_main(void *arg)
         }
         g_flow_event.last_open_at = jmx_flow_event_now();
         pthread_mutex_unlock(&g_flow_event.lock);
+        if (jmx_device_role_is_ap() == 1) {
+            jmx_flow_event_set_state("disabled_by_role",
+                                     "ap_mode_no_local_audit", 0);
+            break;
+        }
 
         /*
          * NEW/UPDATE/DESTROY are all lifecycle evidence.  DESTROY carries the
@@ -1875,6 +2673,30 @@ static void *jmx_flow_event_thread_main(void *arg)
         g_flow_event.updated_at = jmx_flow_event_now();
         pthread_mutex_unlock(&g_flow_event.lock);
 
+        /*
+         * B1 兜底断言：只订阅 NEW|DESTROY 后，持久化的字节记账依赖 DESTROY 事件自带
+         * 计数，而那要求 nf_conntrack_acct=1。正常路径它恒为 1；若被关掉，DESTROY 不带
+         * 计数、UPDATE（已不订阅）也帮不上（关 acct 时它同样不带计数），所以这不是本
+         * 改动引入的新风险，但要在 logread 里喊一声让运维可见。只读一次、只在关闭时告警。
+         */
+        {
+            static int acct_checked;
+            if (!acct_checked) {
+                FILE *af = fopen("/proc/sys/net/netfilter/nf_conntrack_acct", "r");
+                int acct = 1, v;
+                acct_checked = 1;
+                if (af) {
+                    if (fscanf(af, "%d", &v) == 1)
+                        acct = v;
+                    fclose(af);
+                }
+                if (acct == 0)
+                    fprintf(stderr, "[jmx_flow_event] WARN nf_conntrack_acct=0: "
+                            "DESTROY 事件无字节计数，流量记账将为 0（与是否订阅 "
+                            "UPDATE 无关）；请启用 nf_conntrack_acct\n");
+            }
+        }
+
         while (1) {
             pthread_mutex_lock(&g_flow_event.lock);
             if (g_flow_event.stop) {
@@ -1898,17 +2720,28 @@ static void *jmx_flow_event_thread_main(void *arg)
         sleep(1);
     }
 
+stopped:
     jmx_flow_event_db_close();
     if (g_flow_stream) {
         fflush(g_flow_stream);
-        jmx_flow_event_stream_index_write();
+        if (jmx_device_role_is_ap() != 1)
+            jmx_flow_event_stream_index_write();
         fclose(g_flow_stream);
         g_flow_stream = NULL;
     }
     pthread_mutex_lock(&g_flow_event.lock);
     g_flow_event.active = 0;
-    snprintf(g_flow_event.state, sizeof(g_flow_event.state), "%s", "stopped");
-    snprintf(g_flow_event.reason, sizeof(g_flow_event.reason), "%s", "stop_requested");
+    g_flow_event.thread_started = 0;
+    if (jmx_device_role_is_ap() == 1) {
+        snprintf(g_flow_event.state, sizeof(g_flow_event.state), "%s",
+                 "disabled_by_role");
+        snprintf(g_flow_event.reason, sizeof(g_flow_event.reason), "%s",
+                 "ap_mode_no_local_audit");
+    } else {
+        snprintf(g_flow_event.state, sizeof(g_flow_event.state), "%s", "stopped");
+        snprintf(g_flow_event.reason, sizeof(g_flow_event.reason), "%s",
+                 "stop_requested");
+    }
     g_flow_event.updated_at = jmx_flow_event_now();
     pthread_mutex_unlock(&g_flow_event.lock);
     return NULL;
@@ -1920,6 +2753,14 @@ int jmx_flow_event_collector_start(void)
     int disabled = v && (!strcmp(v, "0") || !strcasecmp(v, "false") ||
                          !strcasecmp(v, "no") || !strcasecmp(v, "off"));
     int rc;
+
+    if (jmx_device_role_is_ap() == 1) {
+        jmx_flow_event_set_state("disabled_by_role",
+                                 "ap_mode_no_local_audit", 0);
+        return 0;
+    }
+
+    jmx_flow_event_stream_prune(jmx_flow_event_now());
 
     if (disabled) {
         jmx_flow_event_set_state("disabled", "disabled_by_env", 0);
@@ -1961,6 +2802,9 @@ struct json_object *jmx_flow_event_status_json(void)
     struct json_object *track = json_object_new_object();
     struct jmx_flow_event_state s;
 
+    if (jmx_device_role_is_ap() == 1)
+        jmx_flow_event_set_state("disabled_by_role",
+                                 "ap_mode_no_local_audit", 0);
     pthread_mutex_lock(&g_flow_event.lock);
     s = g_flow_event;
     pthread_mutex_unlock(&g_flow_event.lock);
@@ -2004,6 +2848,7 @@ struct json_object *jmx_flow_event_status_json(void)
     json_object_object_add(o, "db_path", json_object_new_string(JMX_FLOW_EVENT_AUDIT_DB));
     json_object_object_add(o, "db_table", json_object_new_string("audit_flow_event_lifecycle"));
     json_object_object_add(o, "db_writes", json_object_new_int64((int64_t)s.db_writes));
+    json_object_object_add(o, "db_replays", json_object_new_int64((int64_t)s.db_replays));
     json_object_object_add(o, "db_write_errors", json_object_new_int64((int64_t)s.db_write_errors));
     json_object_object_add(o, "db_open_errors", json_object_new_int64((int64_t)s.db_open_errors));
     json_object_object_add(o, "completed_lifecycle_rows", json_object_new_int64((int64_t)s.db_completed_rows));
@@ -2026,6 +2871,12 @@ struct json_object *jmx_flow_event_status_json(void)
     json_object_object_add(o, "hour_index_dir", json_object_new_string(JMX_FLOW_EVENT_INDEX_DIR));
     json_object_object_add(o, "hour_stream_retention_sec",
                            json_object_new_int(JMX_FLOW_EVENT_STREAM_RETENTION_SEC));
+    json_object_object_add(o, "hour_stream_format_version",
+                           json_object_new_int(JMX_FLOW_EVENT_STREAM_FORMAT_VERSION));
+    json_object_object_add(o, "hour_stream_max_data_pct",
+                           json_object_new_int(JMX_FLOW_EVENT_STREAM_MAX_DATA_PCT));
+    json_object_object_add(o, "hour_stream_budget_bytes",
+                           json_object_new_int64((int64_t)s.stream_budget_bytes));
     json_object_object_add(o, "stream_writes", json_object_new_int64((int64_t)s.stream_writes));
     json_object_object_add(o, "stream_write_errors",
                            json_object_new_int64((int64_t)s.stream_write_errors));
@@ -2037,6 +2888,40 @@ struct json_object *jmx_flow_event_status_json(void)
                            json_object_new_int64(s.last_stream_write_at));
     json_object_object_add(o, "last_stream_error",
                            json_object_new_string(s.last_stream_error));
+    json_object_object_add(o, "stream_prune_runs",
+                           json_object_new_int64((int64_t)s.stream_prune_runs));
+    json_object_object_add(o, "stream_prune_files",
+                           json_object_new_int64((int64_t)s.stream_prune_files));
+    json_object_object_add(o, "stream_prune_bytes",
+                           json_object_new_int64((int64_t)s.stream_prune_bytes));
+    json_object_object_add(o, "stream_prune_errors",
+                           json_object_new_int64((int64_t)s.stream_prune_errors));
+    json_object_object_add(o, "stream_total_bytes_before_prune",
+                           json_object_new_int64((int64_t)s.stream_total_bytes_before_prune));
+    json_object_object_add(o, "stream_total_bytes_after_prune",
+                           json_object_new_int64((int64_t)s.stream_total_bytes_after_prune));
+    json_object_object_add(o, "stream_reclaimable_bytes",
+                           json_object_new_int64((int64_t)s.stream_reclaimable_bytes));
+    json_object_object_add(o, "stream_closed_files",
+                           json_object_new_int64((int64_t)s.stream_closed_files));
+    json_object_object_add(o, "stream_oldest_closed_mtime",
+                           json_object_new_int64(s.stream_oldest_closed_mtime));
+    json_object_object_add(o, "stream_latest_closed_mtime",
+                           json_object_new_int64(s.stream_latest_closed_mtime));
+    json_object_object_add(o, "stream_identity_rows",
+                           json_object_new_int64((int64_t)s.stream_identity_rows));
+    json_object_object_add(o, "stream_identity_duplicate_rows",
+                           json_object_new_int64((int64_t)s.stream_identity_duplicate_rows));
+    json_object_object_add(o, "stream_identity_undetermined_rows",
+                           json_object_new_int64((int64_t)s.stream_identity_undetermined_rows));
+    json_object_object_add(o, "stream_identity_unknown_files",
+                           json_object_new_int64((int64_t)s.stream_identity_unknown_files));
+    json_object_object_add(o, "stream_inventory_truncated",
+                           json_object_new_boolean(s.stream_inventory_truncated));
+    json_object_object_add(o, "last_stream_prune_at",
+                           json_object_new_int64(s.last_stream_prune_at));
+    json_object_object_add(o, "last_stream_prune_error",
+                           json_object_new_string(s.last_stream_prune_error));
     json_object_object_add(o, "writes_raw_conntrack_events", json_object_new_boolean(0));
     json_object_object_add(o, "writes_audit_flow_event", json_object_new_boolean(0));
     json_object_object_add(o, "writes_audit_flow_event_lifecycle", json_object_new_boolean(s.db_accounting_enabled));

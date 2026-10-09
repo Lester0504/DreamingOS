@@ -240,5 +240,38 @@ const char *jmx_domain_group_name(uint16_t group_id)
 	return "unknown";
 }
 
+uint32_t jmx_domain_group_list(jmx_domain_group_t *out, uint32_t max_out,
+			       uint32_t *entry_counts)
+{
+	uint32_t written = 0;
+	uint32_t i;
+
+	if (!out || max_out == 0)
+		return 0;
+	for (i = 0; i < g_group_count && written < max_out; i++)
+		out[written++] = g_groups[i];
+	if (!entry_counts)
+		return written;
+	/* Per-group domain totals. The entries are chained by hash bucket, not by
+	 * group, so a full walk is the only way to count them; the table caps at
+	 * JMX_DOMAIN_MAX_ENTRIES and this runs on an explicit stats request. */
+	memset(entry_counts, 0, sizeof(*entry_counts) * written);
+	for (i = 0; i < JMX_DOMAIN_HASH_BUCKETS; i++) {
+		jmx_domain_entry_t *e;
+
+		for (e = g_buckets[i]; e; e = e->next) {
+			uint32_t g;
+
+			for (g = 0; g < written; g++) {
+				if (out[g].id == e->group_id) {
+					entry_counts[g]++;
+					break;
+				}
+			}
+		}
+	}
+	return written;
+}
+
 uint32_t jmx_domain_count(void) { return g_entry_count; }
 uint32_t jmx_domain_group_count(void) { return g_group_count; }

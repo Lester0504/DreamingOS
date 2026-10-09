@@ -3,6 +3,7 @@
 #define DREAMINGWRT_AEGISXD_INTERNAL_H
 
 #include <errno.h>
+#include "jmx_dataset_path.h"
 #include <ctype.h>
 #include <inttypes.h>
 #include <signal.h>
@@ -29,6 +30,7 @@
 #include <libubox/uloop.h>
 #include <libubox/utils.h>
 #include <libubus.h>
+#include "../storage/storage_binding.h"
 
 #ifndef AEGISXD_CONFIG_DIR
 #define AEGISXD_CONFIG_DIR "/etc/dreamingwrt"
@@ -40,19 +42,22 @@
 #define AEGISXD_DB_PATH AEGISXD_CONFIG_DIR "/aegis.db"
 #endif
 #ifndef AEGISXD_CLIENT_DB_PATH
-#define AEGISXD_CLIENT_DB_PATH AEGISXD_CONFIG_DIR "/dreamingwrt.db"
+#define AEGISXD_CLIENT_DB_PATH jmx_dataset_path("core")
 #endif
 #ifndef AEGISXD_RUNTIME_DIR
 #define AEGISXD_RUNTIME_DIR "/run/dreamingwrt/aegis"
 #endif
 #ifndef AEGISXD_WORK_DIR
-#define AEGISXD_WORK_DIR "/opt/dreamingwrt/aegis"
+#define AEGISXD_WORK_DIR jmx_dataset_path("aegis_work")
+#define AEGISXD_WORK_CHILD(leaf) jmx_dataset_child("aegis_work", leaf)
+#else
+#define AEGISXD_WORK_CHILD(leaf) AEGISXD_WORK_DIR "/" leaf
 #endif
 #ifndef AEGISXD_PKI_DIR
 #define AEGISXD_PKI_DIR AEGISXD_CONFIG_DIR "/aegis-pki"
 #endif
 #ifndef AEGISXD_FEED_DIR
-#define AEGISXD_FEED_DIR AEGISXD_WORK_DIR "/feeds"
+#define AEGISXD_FEED_DIR AEGISXD_WORK_CHILD("feeds")
 #endif
 #ifndef AEGISXD_LEGACY_FEED_DIR
 #define AEGISXD_LEGACY_FEED_DIR "/tmp/dreamingwrt-aegisxd/feeds"
@@ -69,8 +74,8 @@
 #endif
 #define AEGISXD_CONTENT_NFT_PATH AEGISXD_RUNTIME_DIR "/content-scope.nft"
 #define AEGISXD_SURICATA_ACTIVE_PATH AEGISXD_RUNTIME_DIR "/suricata-active.json"
-#define AEGISXD_SURICATA_EVE_PATH AEGISXD_WORK_DIR "/suricata/eve.json"
-#define AEGISXD_SURICATA_LOG_DIR AEGISXD_WORK_DIR "/suricata"
+#define AEGISXD_SURICATA_EVE_PATH AEGISXD_WORK_CHILD("suricata/eve.json")
+#define AEGISXD_SURICATA_LOG_DIR AEGISXD_WORK_CHILD("suricata")
 #define AEGISXD_SURICATA_CONFIG_PATH AEGISXD_RUNTIME_DIR "/suricata.yaml"
 #define AEGISXD_SURICATA_PID_PATH AEGISXD_RUNTIME_DIR "/suricata.pid"
 #define AEGISXD_SURICATA_NFQ_TABLE "dreamingwrt_aegis_ids"
@@ -120,9 +125,16 @@ struct aegisxd_feed_manifest {
 
 extern sqlite3 *g_aegisxd_config_db;
 extern sqlite3 *g_aegisxd_db;
+extern char g_aegisxd_db_path[AEGISXD_MAX_PATH];
+extern int g_aegisxd_storage_frozen;
 extern struct ubus_context *g_aegisxd_ubus;
 extern struct blob_buf g_aegisxd_blob;
 
+void aegisxd_ad_dns_start(void);
+void aegisxd_ad_dns_stop(void);
+struct json_object *aegisxd_ad_dns_canonical(struct json_object *,int);
+struct json_object *aegisxd_ad_dns_json(struct json_object *body);
+struct json_object *aegisxd_content_dns_conflicts(struct json_object *body);
 int64_t aegisxd_now_s(void);
 int aegisxd_mkdir_p(const char *path, mode_t mode);
 void aegisxd_json_add_string(struct json_object *o, const char *key, const char *value);
@@ -137,7 +149,20 @@ const char *aegisxd_sqlite_text(sqlite3_stmt *st, int col, const char *def);
 sqlite3_stmt *aegisxd_config_prepare(const char *sql);
 sqlite3_stmt *aegisxd_prepare(const char *sql);
 int aegisxd_db_init(void);
+int aegisxd_db_reopen_path(const char *new_path);
 void aegisxd_db_close(void);
+int aegisxd_storage_authorizer(void *opaque, int action,
+                               const char *arg1, const char *arg2,
+                               const char *db_name, const char *trigger);
+int aegisxd_storage_freeze(void);
+int aegisxd_storage_unfreeze(void);
+/*
+ * Defined in aegisxd_feeds.c.  Declared here because the storage freeze path in
+ * aegisxd_db.c has to stop the scheduler before the database is swapped; it was
+ * previously reachable only through a local extern in aegisxd_main.c.
+ */
+void aegisxd_feed_scheduler_start(void);
+void aegisxd_feed_scheduler_stop(void);
 int aegisxd_settings_load(struct aegisxd_settings *out);
 int aegisxd_traffic_log_scope_valid(const char *scope);
 /* NULL scope / negative flag means "unchanged"; -2 signals an invalid scope. */

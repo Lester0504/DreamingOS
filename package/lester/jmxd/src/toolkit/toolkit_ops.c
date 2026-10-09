@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: GPL-2.0-or-later
 #include "toolkit_internal.h"
+#include "jmx_utils.h"
 
 #include <arpa/inet.h>
 #include <ctype.h>
@@ -53,14 +54,8 @@ static int toolkit_https_base_ok(const char *url)
 
 static int toolkit_lan_ifname_ok(const char *ifname)
 {
-    char path[256], raw[32] = "";
-    FILE *fp;
     if (!toolkit_ifname_ok(ifname)) return 0;
-    if (!strncmp(ifname, "br-", 3) || !strncmp(ifname, "lan", 3)) return 1;
-    snprintf(path, sizeof(path), "/sys/class/net/%s/master/uevent", ifname);
-    fp = fopen(path, "r");
-    if (fp) { fread(raw, 1, sizeof(raw) - 1, fp); fclose(fp); }
-    return strstr(raw, "INTERFACE=br-") != NULL;
+    return jmx_iface_is_lan(ifname);
 }
 
 static struct json_object *toolkit_capabilities(void)
@@ -116,7 +111,9 @@ static int toolkit_proc_running(const char *name)
     while ((e = readdir(dir))) {
         FILE *fp;
         if (e->d_type != DT_DIR || e->d_name[0] < '0' || e->d_name[0] > '9') continue;
-        snprintf(path, sizeof(path), "/proc/%s/comm", e->d_name);
+        if ((size_t)snprintf(path, sizeof(path), "/proc/%s/comm",
+                             e->d_name) >= sizeof(path))
+            continue;
         fp = fopen(path, "r");
         if (fp && fgets(comm, sizeof(comm), fp)) {
             comm[strcspn(comm, "\r\n")] = 0;
@@ -489,7 +486,9 @@ static int toolkit_iperf_pid_running(pid_t pid)
     snprintf(path, sizeof(path), "/proc/%ld/comm", (long)pid);
     fp = fopen(path, "r");
     if (!fp) return 0;
-    fgets(comm, sizeof(comm), fp); fclose(fp);
+    /* An unreadable comm cannot match "iperf3", so an empty buffer is correct. */
+    if (!fgets(comm, sizeof(comm), fp)) comm[0] = '\0';
+    fclose(fp);
     comm[strcspn(comm, "\r\n")] = 0;
     return !strcmp(comm, "iperf3");
 }

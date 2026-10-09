@@ -13,6 +13,7 @@
 #include <sqlite3.h>
 
 #include "gateway_ports.h"
+#include "dw_config_event.h"
 
 #define GP_DB_PATH "/etc/dreamingwrt/config.db"
 #define GP_CORE_OBJECT "dreamingwrt"
@@ -771,6 +772,8 @@ struct json_object *gateway_ports_apply(struct ubus_context *ctx,
         json_object_object_add(out, "rolled_back", json_object_new_boolean(rollback_ok));
         if (readback_data)
             json_object_object_add(out, "readback", json_object_get(readback_data));
+        dw_report_config_commit_failed("gateway_ports", provided_digest,
+                                       "runtime_readback_mismatch", rollback_ok);
         goto done;
     }
     memset(&after, 0, sizeof(after));
@@ -784,6 +787,8 @@ struct json_object *gateway_ports_apply(struct ubus_context *ctx,
             500);
         json_object_object_add(out, "applied", json_object_new_boolean(0));
         json_object_object_add(out, "rolled_back", json_object_new_boolean(rollback_ok));
+        dw_report_config_commit_failed("gateway_ports", provided_digest,
+                                       "post_commit_revision_failed", rollback_ok);
         goto done;
     }
     out = gp_ok();

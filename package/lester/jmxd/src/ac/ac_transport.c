@@ -5,8 +5,11 @@
 
 #ifndef AC_TRANSPORT_TEST_STANDALONE
 #include "ac_internal.h"
+#include "ac_secret_rotation.h"
 #endif
 #include "../ap_control_wire.h"
+#include "ac_certificate_lifecycle.h"
+#include "../ap_control_log_rpc.h"
 
 #include <arpa/inet.h>
 #include <errno.h>
@@ -52,6 +55,8 @@
 #define AC_TRANSPORT_HEARTBEAT_IDLE_MS 45000
 #define AC_TRANSPORT_REASON_MAX 128U
 #define AC_TRANSPORT_URI_PREFIX "urn:dreamingwrt:ap:"
+#define AC_TXPOWER_PENDING_MAX 8U
+#define AC_TXPOWER_WAIT_SECONDS 35
 
 #define AC_ARRAY_SIZE(value) (sizeof(value) / sizeof((value)[0]))
 
@@ -95,10 +100,14 @@ static const char *const ac_fields_session_hello_v3[] = {
 };
 static const char *const ac_fields_session_ready[] = {
     "protocol", "kind", "controller_id", "certificate_id", "ap_id",
-    "session_epoch"
+    "session_epoch", "unbind_required", "unbind_request_id"
 };
 static const char *const ac_fields_session_ready_v3[] = {
-    "protocol", "kind", "controller_id", "certificate_id", "ap_id", "session_epoch", "capabilities"
+    "protocol", "kind", "controller_id", "certificate_id", "ap_id", "session_epoch", "capabilities",
+    "unbind_required", "unbind_request_id"
+};
+static const char *const ac_fields_unbind_ack[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "request_id", "unpaired", "error_code"
 };
 static const char *const ac_fields_heartbeat[] = {
     "protocol", "kind", "ap_id", "session_epoch", "sequence", "timestamp"
@@ -112,6 +121,20 @@ static const char *const ac_fields_telemetry_snapshot[] = {
 };
 static const char *const ac_fields_telemetry_ack[] = {
     "protocol", "kind", "ap_id", "session_epoch", "sequence", "accepted"
+};
+
+static const char *const ac_fields_audit_event[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence",
+    "schema_version", "events"
+};
+
+static const char *const ac_fields_audit_event_ack[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence", "event_id",
+    "accepted", "persisted"
+};
+static const char *const ac_audit_event_fields[] = {
+    "event_id", "occurred_at", "actor", "actor_session", "source_ip",
+    "action", "risk", "target", "result", "failure_reason", "request_id"
 };
 static const char *const ac_fields_radio_job_poll[] = {
     "protocol", "kind", "ap_id", "session_epoch", "sequence"
@@ -179,7 +202,8 @@ static const char *const ac_fields_config_job_idle[] = {
 static const char *const ac_fields_config_job_offer[] = {
     "protocol", "kind", "ap_id", "session_epoch", "reply_to", "job_id",
     "attempt_id", "dispatch_generation", "request_digest",
-    "candidate_digest", "candidate", "controller_state"
+    "candidate_digest", "candidate", "operation", "rollback_of_job_id",
+    "controller_state"
 };
 static const char *const ac_fields_config_job_ack[] = {
     "protocol", "kind", "ap_id", "session_epoch", "reply_to", "job_id",
@@ -190,6 +214,35 @@ static const char *const ac_fields_config_job_finish_ack[] = {
     "protocol", "kind", "ap_id", "session_epoch", "reply_to", "job_id",
     "attempt_id", "dispatch_generation", "request_digest", "finish_id",
     "controller_state"
+};
+static const char *const ac_fields_secret_job_poll[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence"
+};
+static const char *const ac_fields_secret_job_prepare[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence", "job_id",
+    "request_digest", "outcome", "error_code", "secret_version",
+    "secret_configured"
+};
+static const char *const ac_fields_secret_job_commit[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence", "job_id",
+    "request_digest", "secret_version", "secret_configured"
+};
+static const char *const ac_fields_txpower_mode_poll[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence"
+};
+static const char *const ac_fields_txpower_mode_idle[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "reply_to"
+};
+static const char *const ac_fields_txpower_mode_offer[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "reply_to",
+    "operation", "mode", "confirm"
+};
+static const char *const ac_fields_txpower_mode_finish[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "sequence",
+    "operation", "mode", "confirm", "result"
+};
+static const char *const ac_fields_txpower_mode_finish_ack[] = {
+    "protocol", "kind", "ap_id", "session_epoch", "reply_to"
 };
 static const char *const ac_fields_wireless_snapshot[] = {
     "ok", "contract_version", "snapshot_version", "source", "backend",
@@ -215,6 +268,19 @@ struct ac_transport_peer {
     unsigned char fingerprint[SHA256_DIGEST_LENGTH];
 };
 
+struct ac_txpower_pending {
+    int active;
+    int completed;
+    char ap_id[AC_ENROLLMENT_ID_LEN + 1];
+    char session_epoch[AC_RADIO_JOB_SESSION_EPOCH_MAX + 1];
+    char operation[4];
+    char mode[12];
+    int confirm;
+    struct json_object *result;
+};
+
+struct ac_retired_pki { struct ac_pki *pki; struct ac_retired_pki *next; };
+
 struct ac_transport_state {
     pthread_mutex_t lock;
     pthread_mutex_t pki_lock;
@@ -226,6 +292,8 @@ struct ac_transport_state {
     size_t queue_head;
     size_t queue_count;
     pthread_cond_t queue_changed;
+    pthread_cond_t txpower_changed;
+    struct ac_txpower_pending txpower[AC_TXPOWER_PENDING_MAX];
     int listen_fd;
     int running;
     int listening;
@@ -235,13 +303,15 @@ struct ac_transport_state {
     const char *reason;
     char controller_id[AC_ENROLLMENT_ID_LEN + 1];
     SSL_CTX *ssl_context;
-    struct ac_pki *pki;
+    _Atomic(struct ac_pki *) pki;
+    struct ac_retired_pki *retired_pki;
 };
 
 static struct ac_transport_state g_ac_transport = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
     .pki_lock = PTHREAD_MUTEX_INITIALIZER,
     .queue_changed = PTHREAD_COND_INITIALIZER,
+    .txpower_changed = PTHREAD_COND_INITIALIZER,
     .listen_fd = -1,
     .reason = "not_started",
 };
@@ -587,6 +657,29 @@ static int ac_json_copy_boolean(struct json_object *object, const char *name,
     return 0;
 }
 
+static int ac_audit_uuid_valid(const char *value)
+{
+    static const int hyphen[] = {8, 13, 18, 23};
+    size_t i;
+    int h = 0;
+
+    if (!value || strlen(value) != 36 || value[14] != '4' ||
+        (value[19] != '8' && value[19] != '9' &&
+         value[19] != 'a' && value[19] != 'b'))
+        return 0;
+    for (i = 0; i < 36; i++) {
+        if (h < 4 && (int)i == hyphen[h]) {
+            if (value[i] != '-')
+                return 0;
+            h++;
+        } else if (!((value[i] >= '0' && value[i] <= '9') ||
+                     (value[i] >= 'a' && value[i] <= 'f'))) {
+            return 0;
+        }
+    }
+    return 1;
+}
+
 static int ac_model_report_parse(struct json_object *object,
                                  struct ac_device_model_report *out)
 {
@@ -843,12 +936,14 @@ static SSL_CTX *ac_tls_context_new(struct ac_pki *pki)
     SSL_CTX *context = NULL;
     X509 *server_certificate = NULL;
     X509 *ca_certificate = NULL;
+    X509 *alternate_ca = NULL;
     EVP_PKEY *server_key = NULL;
     X509_STORE *store;
 
     context = SSL_CTX_new(TLS_server_method());
     server_certificate = ac_pki_server_certificate_dup(pki);
     ca_certificate = ac_pki_ca_certificate_dup(pki);
+    alternate_ca = ac_pki_alternate_ca_dup(pki);
     server_key = ac_pki_server_private_key_dup(pki);
     if (!context || !server_certificate || !ca_certificate || !server_key ||
         SSL_CTX_set_min_proto_version(context, TLS1_3_VERSION) != 1 ||
@@ -857,7 +952,8 @@ static SSL_CTX *ac_tls_context_new(struct ac_pki *pki)
         SSL_CTX_use_PrivateKey(context, server_key) != 1 ||
         SSL_CTX_check_private_key(context) != 1 ||
         !(store = SSL_CTX_get_cert_store(context)) ||
-        X509_STORE_add_cert(store, ca_certificate) != 1)
+        X509_STORE_add_cert(store, ca_certificate) != 1 ||
+        (alternate_ca && X509_cmp(alternate_ca, ca_certificate) != 0 && X509_STORE_add_cert(store, alternate_ca) != 1))
         goto fail;
     SSL_CTX_set_verify(context, SSL_VERIFY_PEER | SSL_VERIFY_CLIENT_ONCE, NULL);
     SSL_CTX_set_verify_depth(context, 2);
@@ -866,14 +962,53 @@ static SSL_CTX *ac_tls_context_new(struct ac_pki *pki)
     SSL_CTX_set_alpn_select_cb(context, ac_alpn_select, NULL);
     X509_free(server_certificate);
     X509_free(ca_certificate);
+    X509_free(alternate_ca);
     EVP_PKEY_free(server_key);
     return context;
 fail:
     X509_free(server_certificate);
     X509_free(ca_certificate);
+    X509_free(alternate_ca);
     EVP_PKEY_free(server_key);
     SSL_CTX_free(context);
     return NULL;
+}
+
+int ac_transport_certificate_reload(void)
+{
+    struct ac_pki *next = NULL;
+    struct ac_retired_pki *retired = NULL;
+    SSL_CTX *context = NULL, *old_context = NULL;
+    X509 *old_cert = NULL, *new_cert = NULL, *old_ca = NULL, *new_ca = NULL;
+    int same = 0, rc = -1;
+    if (ac_pki_init(&next)) return -1;
+    pthread_mutex_lock(&g_ac_transport.pki_lock);
+    old_cert = ac_pki_server_certificate_dup(g_ac_transport.pki);
+    new_cert = ac_pki_server_certificate_dup(next);
+    old_ca = ac_pki_alternate_ca_dup(g_ac_transport.pki);
+    new_ca = ac_pki_alternate_ca_dup(next);
+    same = old_cert && new_cert && X509_cmp(old_cert, new_cert) == 0 &&
+        ((!old_ca && !new_ca) || (old_ca && new_ca && X509_cmp(old_ca, new_ca) == 0));
+    if (same) { rc = 0; goto done; }
+    context = ac_tls_context_new(next);
+    retired = calloc(1, sizeof(*retired));
+    if (!context || !retired) goto done;
+    pthread_mutex_lock(&g_ac_transport.lock);
+    if (!g_ac_transport.running || g_ac_transport.stopping) {
+        pthread_mutex_unlock(&g_ac_transport.lock); goto done;
+    }
+    old_context = g_ac_transport.ssl_context;
+    g_ac_transport.ssl_context = context; context = NULL;
+    retired->pki = g_ac_transport.pki; retired->next = g_ac_transport.retired_pki;
+    g_ac_transport.retired_pki = retired; retired = NULL;
+    g_ac_transport.pki = next; next = NULL;
+    pthread_mutex_unlock(&g_ac_transport.lock);
+    rc = 0;
+done:
+    pthread_mutex_unlock(&g_ac_transport.pki_lock);
+    X509_free(old_cert); X509_free(new_cert); X509_free(old_ca); X509_free(new_ca);
+    SSL_CTX_free(context); SSL_CTX_free(old_context); ac_pki_free(next); free(retired);
+    return rc;
 }
 
 static int ac_peer_identity(SSL *ssl, struct ac_transport_peer *out)
@@ -1131,6 +1266,20 @@ static int ac_enrollment_issue(SSL *ssl,
         g_ac_transport.pki, request->claim.ap_id, request->claim.public_key,
         request->claim.csr_der, request->claim.csr_der_len, &issued);
     pthread_mutex_unlock(&g_ac_transport.pki_lock);
+    /*
+     * A signing failure for a specific AP is operator-actionable (that AP
+     * cannot enroll), so surface it with the ap_id. Gate strictly on the
+     * issue call itself -- the post-processing checks below (DER/fingerprint/
+     * uuid) are internal marshalling, not a PKI fault. Runs on a transport
+     * worker thread; ac_report_device_event uses its own ephemeral ubus
+     * context and is safe off the main thread. dedupe keys on event+ap so a
+     * retrying AP collapses to one live alert.
+     */
+    if (commit_result != 0)
+        ac_report_device_event("AC_PKI_ERROR", "error", request->claim.ap_id,
+                               "issue_ap_certificate",
+                               "certificate_signing_failed",
+                               "AP certificate signing failed");
     if (commit_result != 0 || !issued ||
         !(issued_der = ac_pki_issued_certificate_der(issued,
                                                      &issued_der_length)) ||
@@ -1152,8 +1301,8 @@ static int ac_enrollment_issue(SSL *ssl,
     certificate.not_before = ac_pki_issued_certificate_not_before(issued);
     certificate.not_after = ac_pki_issued_certificate_not_after(issued);
     ac_db_enter();
-    commit_result = ac_db_enrollment_certificate_commit(&certificate,
-                                                        &committed);
+    commit_result = ac_certificate_lifecycle_enrollment_allowed(g_ac_db) ?
+        ac_db_enrollment_certificate_commit(&certificate, &committed) : AC_ENROLLMENT_ERROR;
     ac_db_leave();
     if (commit_result != AC_ENROLLMENT_OK &&
         commit_result != AC_ENROLLMENT_IDEMPOTENT) {
@@ -1596,6 +1745,209 @@ static int ac_radio_response_envelope(struct json_object *response,
         ac_json_add_int64(response, "reply_to", reply_to) != 0 ? -1 : 0;
 }
 
+static int ac_txpower_mode_valid(const char *mode)
+{
+    return mode && (!strcmp(mode, "calibrated") ||
+                    !strcmp(mode, "regulatory"));
+}
+
+static void ac_txpower_pending_clear(struct ac_txpower_pending *pending)
+{
+    if (!pending)
+        return;
+    json_object_put(pending->result);
+    memset(pending, 0, sizeof(*pending));
+}
+
+static struct ac_txpower_pending *ac_txpower_pending_find_locked(
+    const char *ap_id, const char *session_epoch)
+{
+    size_t i;
+
+    for (i = 0; i < AC_TXPOWER_PENDING_MAX; i++)
+        if (g_ac_transport.txpower[i].active &&
+            !strcmp(g_ac_transport.txpower[i].ap_id, ap_id) &&
+            !strcmp(g_ac_transport.txpower[i].session_epoch, session_epoch))
+            return &g_ac_transport.txpower[i];
+    return NULL;
+}
+
+static struct json_object *ac_txpower_error(const char *operation,
+                                             const char *reason)
+{
+    struct json_object *root = json_object_new_object();
+
+    if (!root)
+        return NULL;
+    json_object_object_add(root, "ok", json_object_new_boolean(0));
+    json_object_object_add(root, "operation",
+                           json_object_new_string(operation ? operation : "get"));
+    json_object_object_add(root, "error",
+                           json_object_new_string(reason ? reason :
+                                                  "transport_unavailable"));
+    json_object_object_add(root, "reason",
+                           json_object_new_string(reason ? reason :
+                                                  "transport_unavailable"));
+    return root;
+}
+
+struct json_object *ac_transport_txpower_mode_json(const char *ap_id,
+                                                    const char *mode,
+                                                    int confirm, int write)
+{
+    struct ac_txpower_pending *pending = NULL;
+    struct timespec deadline;
+    struct json_object *result = NULL;
+    size_t i;
+    int wait_rc = 0;
+
+    if (!ap_id || !ac_uuid_valid(ap_id) ||
+        (write && !ac_txpower_mode_valid(mode)))
+        return ac_txpower_error(write ? "set" : "get", "invalid_request");
+    if (clock_gettime(CLOCK_REALTIME, &deadline) != 0)
+        return ac_txpower_error(write ? "set" : "get",
+                                "transport_unavailable");
+    deadline.tv_sec += AC_TXPOWER_WAIT_SECONDS;
+
+    pthread_mutex_lock(&g_ac_transport.lock);
+    for (i = 0; i < AC_TXPOWER_PENDING_MAX; i++) {
+        if (!g_ac_transport.txpower[i].active) {
+            pending = &g_ac_transport.txpower[i];
+            break;
+        }
+    }
+    if (!pending) {
+        pthread_mutex_unlock(&g_ac_transport.lock);
+        return ac_txpower_error(write ? "set" : "get",
+                                "txpower_request_busy");
+    }
+    memset(pending, 0, sizeof(*pending));
+    pending->active = 1;
+    snprintf(pending->ap_id, sizeof(pending->ap_id), "%s", ap_id);
+    snprintf(pending->operation, sizeof(pending->operation), "%s",
+             write ? "set" : "get");
+    if (write) {
+        snprintf(pending->mode, sizeof(pending->mode), "%s", mode);
+        pending->confirm = confirm ? 1 : 0;
+    }
+    while (!pending->session_epoch[0] && wait_rc == 0)
+        wait_rc = pthread_cond_timedwait(&g_ac_transport.txpower_changed,
+                                         &g_ac_transport.lock, &deadline);
+    while (wait_rc == 0 && !pending->completed)
+        wait_rc = pthread_cond_timedwait(&g_ac_transport.txpower_changed,
+                                         &g_ac_transport.lock, &deadline);
+    if (pending->completed && pending->result)
+        result = json_object_get(pending->result);
+    ac_txpower_pending_clear(pending);
+    pthread_mutex_unlock(&g_ac_transport.lock);
+    return result ? result : ac_txpower_error(write ? "set" : "get",
+                                               "ap_transport_timeout");
+}
+
+static struct json_object *ac_txpower_poll_handle(
+    const char *ap_id, const char *session_epoch,
+    const struct ac_radio_job_request *request)
+{
+    struct ac_txpower_pending *pending;
+    struct json_object *response;
+
+    pthread_mutex_lock(&g_ac_transport.lock);
+    pending = ac_txpower_pending_find_locked(ap_id, session_epoch);
+    if (!pending) {
+        size_t i;
+
+        for (i = 0; i < AC_TXPOWER_PENDING_MAX; i++) {
+            if (g_ac_transport.txpower[i].active &&
+                !strcmp(g_ac_transport.txpower[i].ap_id, ap_id) &&
+                !g_ac_transport.txpower[i].session_epoch[0]) {
+                pending = &g_ac_transport.txpower[i];
+                snprintf(pending->session_epoch,
+                         sizeof(pending->session_epoch), "%s", session_epoch);
+                pthread_cond_broadcast(&g_ac_transport.txpower_changed);
+                break;
+            }
+        }
+    }
+    if (!pending) {
+        pthread_mutex_unlock(&g_ac_transport.lock);
+        response = ac_message_new("txpower_mode_idle");
+        if (!response || ac_radio_response_envelope(response, ap_id,
+                session_epoch, request->sequence) != 0 ||
+            ap_control_json_object_exact(response, ac_fields_txpower_mode_idle,
+                AC_ARRAY_SIZE(ac_fields_txpower_mode_idle),
+                ac_fields_txpower_mode_idle,
+                AC_ARRAY_SIZE(ac_fields_txpower_mode_idle)) !=
+                AP_CONTROL_WIRE_OK) {
+            json_object_put(response);
+            return NULL;
+        }
+        return response;
+    }
+    response = ac_message_new("txpower_mode_offer");
+    if (!response || ac_radio_response_envelope(response, ap_id, session_epoch,
+            request->sequence) != 0 ||
+        ac_json_add_string(response, "operation", pending->operation) != 0 ||
+        ac_json_add_string(response, "mode", pending->mode) != 0 ||
+        ac_json_add_boolean(response, "confirm", pending->confirm) != 0 ||
+        ap_control_json_object_exact(response, ac_fields_txpower_mode_offer,
+            AC_ARRAY_SIZE(ac_fields_txpower_mode_offer),
+            ac_fields_txpower_mode_offer,
+            AC_ARRAY_SIZE(ac_fields_txpower_mode_offer)) != AP_CONTROL_WIRE_OK) {
+        pthread_mutex_unlock(&g_ac_transport.lock);
+        json_object_put(response);
+        return NULL;
+    }
+    pthread_mutex_unlock(&g_ac_transport.lock);
+    return response;
+}
+
+static struct json_object *ac_txpower_finish_handle(
+    struct json_object *message, const char *ap_id, const char *session_epoch,
+    const struct ac_radio_job_request *request)
+{
+    struct ac_txpower_pending *pending;
+    struct json_object *result = NULL;
+    struct json_object *ack;
+    const char *operation = NULL;
+    const char *mode = NULL;
+    int confirm;
+
+    if (ap_control_json_get_string(message, "operation", &operation, 3, 3) !=
+            AP_CONTROL_WIRE_OK ||
+        (strcmp(operation, "get") && strcmp(operation, "set")) ||
+        ap_control_json_get_string(message, "mode", &mode, 0, 10) !=
+            AP_CONTROL_WIRE_OK ||
+        (!strcmp(operation, "set") && !ac_txpower_mode_valid(mode)) ||
+        (!strcmp(operation, "get") && mode[0]) ||
+        ac_json_copy_boolean(message, "confirm", &confirm) != 0 ||
+        !json_object_object_get_ex(message, "result", &result) || !result ||
+        !json_object_is_type(result, json_type_object))
+        return NULL;
+    pthread_mutex_lock(&g_ac_transport.lock);
+    pending = ac_txpower_pending_find_locked(ap_id, session_epoch);
+    if (!pending || strcmp(pending->operation, operation) ||
+        strcmp(pending->mode, mode) || pending->confirm != confirm) {
+        pthread_mutex_unlock(&g_ac_transport.lock);
+        return NULL;
+    }
+    pending->result = json_object_get(result);
+    pending->completed = 1;
+    pthread_cond_broadcast(&g_ac_transport.txpower_changed);
+    pthread_mutex_unlock(&g_ac_transport.lock);
+    ack = ac_message_new("txpower_mode_finish_ack");
+    if (!ack || ac_radio_response_envelope(ack, ap_id, session_epoch,
+            request->sequence) != 0 ||
+        ap_control_json_object_exact(ack, ac_fields_txpower_mode_finish_ack,
+            AC_ARRAY_SIZE(ac_fields_txpower_mode_finish_ack),
+            ac_fields_txpower_mode_finish_ack,
+            AC_ARRAY_SIZE(ac_fields_txpower_mode_finish_ack)) !=
+            AP_CONTROL_WIRE_OK) {
+        json_object_put(ack);
+        return NULL;
+    }
+    return ack;
+}
+
 static struct json_object *ac_radio_error_new(const char *ap_id,
                                                const char *session_epoch,
                                                int64_t reply_to,
@@ -2007,6 +2359,9 @@ static struct json_object *ac_config_poll_handle(
         ac_json_add_string(response, "candidate_digest",
                            job.candidate_digest) != 0 ||
         ac_json_add_string(response, "candidate", candidate) != 0 ||
+        ac_json_add_string(response, "operation", job.operation) != 0 ||
+        ac_json_add_string(response, "rollback_of_job_id",
+                           job.rollback_of_job_id) != 0 ||
         ac_json_add_string(response, "controller_state", job.state) != 0 ||
         ap_control_json_object_exact(response, ac_fields_config_job_offer,
             AC_ARRAY_SIZE(ac_fields_config_job_offer),
@@ -2135,6 +2490,20 @@ static struct json_object *ac_radio_message_handle(
         return ac_config_finish_handle(message, ap_id, session_epoch,
                                        request);
     }
+    if (!strcmp(kind, "txpower_mode_poll")) {
+        if (ac_radio_common_parse(message, ac_fields_txpower_mode_poll,
+                AC_ARRAY_SIZE(ac_fields_txpower_mode_poll), kind, ap_id,
+                session_epoch, 0, request) != 0)
+            return NULL;
+        return ac_txpower_poll_handle(ap_id, session_epoch, request);
+    }
+    if (!strcmp(kind, "txpower_mode_finish")) {
+        if (ac_radio_common_parse(message, ac_fields_txpower_mode_finish,
+                AC_ARRAY_SIZE(ac_fields_txpower_mode_finish), kind, ap_id,
+                session_epoch, 0, request) != 0)
+            return NULL;
+        return ac_txpower_finish_handle(message, ap_id, session_epoch, request);
+    }
     return NULL;
 }
 
@@ -2172,16 +2541,23 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
         .apply = 1,
         .readback = 1,
         .rollback = 1,
+        .secret_executor = 1,
+        .certificate_executor = 1,
     };
     int64_t sequence = 0;
     int64_t previous_sequence = -1;
     int64_t observed_at = 0;
     int64_t timestamp = 0;
     int write_capable = 0;
+    int secret_capable = 0;
+    int logs_capable = 0;
+    int unbind_required = 0;
+    struct ac_ap_unbind_request unbind_request;
     int rc = -1;
 
     memset(&model_report, 0, sizeof(model_report));
     memset(&radio_replay, 0, sizeof(radio_replay));
+    memset(&unbind_request, 0, sizeof(unbind_request));
     memset(session_epoch_raw, 0, sizeof(session_epoch_raw));
 
     if (ac_identity_hello_parse(hello,
@@ -2202,11 +2578,18 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
             ac_send_error(ssl, "invalid_request", "invalid_session_capabilities");
             goto denied;
         }
+        struct json_object *logs = NULL;
+        if (json_object_object_get_ex(capabilities, AP_LOG_CAPABILITY, &logs)) {
+            if (!json_object_is_type(logs, json_type_boolean)) goto done;
+            logs_capable = json_object_get_boolean(logs);
+        }
     }
     write_capable =
         ap_control_ssl_selected_alpn_version(ssl) == 3 &&
         ap_control_capabilities_all_true(&local_capabilities) &&
         ap_control_capabilities_all_true(&peer_capabilities);
+    secret_capable = write_capable && local_capabilities.secret_executor &&
+                     peer_capabilities.secret_executor;
     pthread_mutex_lock(&g_ac_transport.lock);
     g_ac_transport.write_capable = write_capable;
     pthread_mutex_unlock(&g_ac_transport.lock);
@@ -2222,29 +2605,36 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
         goto done;
     }
     ac_db_enter();
-    if (ac_db_ap_session_begin_with_capabilities(ap_id, session_epoch,
+    if (ac_db_ap_session_begin_with_capabilities_and_unbind(ap_id, session_epoch,
             !strcmp(g_ac_wire_protocol, AP_CONTROL_PROTOCOL_V3) ? 3 :
             (!strcmp(g_ac_wire_protocol, AC_TRANSPORT_PROTOCOL_V2) ? 2 : 1),
-            write_capable, ac_now_s()) != 0) {
+            write_capable, ac_now_s(), &unbind_request) != 0) {
         ac_db_leave();
         ac_transport_log_stage("session_rejected", "epoch_store");
         goto done;
     }
+    unbind_required = unbind_request.request_id[0] != '\0';
     ac_db_leave();
+    if (unbind_required && strcmp(unbind_request.certificate_id, certificate_id))
+        goto denied;
     response = ac_message_new("session_ready");
     if (!response || ac_json_add_string(response, "controller_id",
                 ac_pki_controller_id(g_ac_transport.pki)) != 0 ||
         ac_json_add_string(response, "certificate_id", certificate_id) != 0 ||
         ac_json_add_string(response, "ap_id", ap_id) != 0 ||
         ac_json_add_string(response, "session_epoch", session_epoch) != 0 ||
+        (unbind_required &&
+         (ac_json_add_boolean(response, "unbind_required", 1) != 0 ||
+          ac_json_add_string(response, "unbind_request_id",
+                             unbind_request.request_id) != 0)) ||
         (ap_control_ssl_selected_alpn_version(ssl) == 3 &&
-         ap_control_capabilities_add(response, &local_capabilities) !=
+         ap_log_capabilities_add(response, &local_capabilities) !=
              AP_CONTROL_WIRE_OK) ||
         ap_control_json_object_exact(response,
                 ap_control_ssl_selected_alpn_version(ssl) == 3 ? ac_fields_session_ready_v3 : ac_fields_session_ready,
                 ap_control_ssl_selected_alpn_version(ssl) == 3 ? AC_ARRAY_SIZE(ac_fields_session_ready_v3) : AC_ARRAY_SIZE(ac_fields_session_ready),
                 ap_control_ssl_selected_alpn_version(ssl) == 3 ? ac_fields_session_ready_v3 : ac_fields_session_ready,
-                ap_control_ssl_selected_alpn_version(ssl) == 3 ? AC_ARRAY_SIZE(ac_fields_session_ready_v3) : AC_ARRAY_SIZE(ac_fields_session_ready)) !=
+                (ap_control_ssl_selected_alpn_version(ssl) == 3 ? AC_ARRAY_SIZE(ac_fields_session_ready_v3) : AC_ARRAY_SIZE(ac_fields_session_ready)) - 2) !=
             AP_CONTROL_WIRE_OK ||
         ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, response) !=
             AP_CONTROL_WIRE_OK) {
@@ -2253,6 +2643,42 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
     }
     json_object_put(response);
     response = NULL;
+    if (unbind_required) {
+        const char *ack_ap_id = NULL;
+        const char *ack_epoch = NULL;
+        const char *ack_request_id = NULL;
+        int ack_unpaired = 0;
+        char error_code[AC_AP_UNBIND_ERROR_MAX + 1] = {0};
+
+        if (ac_wait_for_frame(ssl, AC_TRANSPORT_HEARTBEAT_IDLE_MS) != 0 ||
+            ap_control_ssl_read_json(ssl, AP_CONTROL_IO_TIMEOUT_MS,
+                                     &message) != AP_CONTROL_WIRE_OK ||
+            ac_message_expect(message, ac_fields_unbind_ack,
+                AC_ARRAY_SIZE(ac_fields_unbind_ack), "unbind_ack") != 0 ||
+            ap_control_json_get_string(message, "ap_id", &ack_ap_id, 36, 36) !=
+                AP_CONTROL_WIRE_OK || strcmp(ack_ap_id, ap_id) != 0 ||
+            ap_control_json_get_string(message, "session_epoch", &ack_epoch,
+                64, 64) != AP_CONTROL_WIRE_OK || strcmp(ack_epoch, session_epoch) != 0 ||
+            ap_control_json_get_string(message, "request_id", &ack_request_id,
+                36, 36) != AP_CONTROL_WIRE_OK || strcmp(ack_request_id, unbind_request.request_id) != 0 ||
+            ac_json_copy_boolean(message, "unpaired", &ack_unpaired) != 0 ||
+            ac_json_copy_string(message, "error_code", error_code,
+                                sizeof(error_code), 0, AC_AP_UNBIND_ERROR_MAX) != 0 ||
+            !ac_peer_authorize(certificate_id, ap_id, peer, 1))
+            goto denied;
+        ac_db_enter();
+        if (ac_db_ap_unbind_request_ack(ap_id, session_epoch,
+                unbind_request.request_id, ack_unpaired, error_code,
+                &unbind_request) != AC_AP_UNBIND_OK) {
+            ac_db_leave();
+            goto done;
+        }
+        ac_db_leave();
+        json_object_put(message);
+        message = NULL;
+        goto done;
+    }
+    ac_secret_rotation_session_begin(ap_id, secret_capable);
     while (!ac_transport_stopping()) {
         if (ac_wait_for_frame(ssl, AC_TRANSPORT_HEARTBEAT_IDLE_MS) != 0) {
             ac_transport_log_stage("session_closed", "frame_wait");
@@ -2263,12 +2689,106 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
             ac_transport_log_stage("session_closed", "frame_read");
             goto done;
         }
+        ac_db_enter();
+        int pending_unbind = ac_db_ap_unbind_request_pending(ap_id, &unbind_request);
+        ac_db_leave();
+        /* Reconnect into the cleanup-only handshake before processing more work. */
+        if (pending_unbind != AC_AP_UNBIND_NOT_FOUND)
+            goto done;
         if (ac_message_kind(message, &kind) != 0) {
             ac_transport_log_stage("session_closed", "frame_kind");
             goto done;
         }
-        if ((!strcmp(g_ac_wire_protocol, AC_TRANSPORT_PROTOCOL_V2) &&
+        if (!strcmp(kind, "certificate_poll")) {
+            static const char *const fields[] = {"protocol","kind","ap_id","session_epoch","sequence","csr_der","trust_fingerprint"};
+            const char *envelope_ap = NULL, *envelope_epoch = NULL, *csr_hex = NULL, *trust_hex = NULL;
+            unsigned char csr[8192], trust[32], server[32];
+            size_t csr_len = 0, trust_len = 0; unsigned int server_len = 0;
+            struct json_object *command = NULL;
+            if (!peer_capabilities.certificate_executor ||
+                ac_message_expect(message, fields, AC_ARRAY_SIZE(fields), kind) ||
+                ap_control_json_get_string(message, "ap_id", &envelope_ap, 36, 36) || strcmp(envelope_ap, ap_id) ||
+                ap_control_json_get_string(message, "session_epoch", &envelope_epoch, 64, 64) || strcmp(envelope_epoch, session_epoch) ||
+                ap_control_json_get_int64(message, "sequence", 1, INT64_MAX, &sequence) || sequence <= previous_sequence ||
+                ap_control_json_get_string(message, "csr_der", &csr_hex, 2, sizeof(csr)*2) ||
+                ap_control_hex_decode(csr_hex, csr, sizeof(csr), &csr_len) ||
+                ap_control_json_get_string(message, "trust_fingerprint", &trust_hex, 64, 64) ||
+                ap_control_hex_decode(trust_hex, trust, sizeof(trust), &trust_len) || trust_len != 32 ||
+                X509_digest(SSL_get_certificate(ssl), EVP_sha256(), server, &server_len) != 1 || server_len != 32 ||
+                !ac_peer_authorize(certificate_id, ap_id, peer, 1)) goto denied;
+            command = ac_certificate_lifecycle_poll(g_ac_db, ap_id, certificate_id, peer->fingerprint,
+                                                    server, trust, csr, csr_len);
+            response = ac_message_new("certificate_reply");
+            if (!command || !response) { json_object_put(command); goto done; }
+            ac_json_add_string(response, "ap_id", ap_id); ac_json_add_string(response, "session_epoch", session_epoch);
+            ac_json_add_int64(response, "sequence", sequence);
+            json_object_object_add(response, "command", command);
+            previous_sequence = sequence;
+            if (ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, response) != AP_CONTROL_WIRE_OK) goto done;
+            json_object_put(message); message = NULL; json_object_put(response); response = NULL;
+            continue;
+        }
+        if (!strcmp(g_ac_wire_protocol, AP_CONTROL_PROTOCOL_V3) &&
+            secret_capable &&
+            !strncmp(kind, "secret_job_", strlen("secret_job_"))) {
+            const char *envelope_ap_id = NULL;
+            const char *envelope_epoch = NULL;
+            const char *const *fields = NULL;
+            size_t field_count = 0;
+
+            if (!strcmp(kind, "secret_job_poll")) {
+                fields = ac_fields_secret_job_poll;
+                field_count = AC_ARRAY_SIZE(ac_fields_secret_job_poll);
+            } else if (!strcmp(kind, "secret_job_prepare")) {
+                fields = ac_fields_secret_job_prepare;
+                field_count = AC_ARRAY_SIZE(ac_fields_secret_job_prepare);
+            } else if (!strcmp(kind, "secret_job_commit")) {
+                fields = ac_fields_secret_job_commit;
+                field_count = AC_ARRAY_SIZE(ac_fields_secret_job_commit);
+            }
+            if (!fields || ac_message_expect(message, fields, field_count,
+                    kind) != 0 ||
+                ap_control_json_get_string(message, "ap_id", &envelope_ap_id,
+                    36, 36) != AP_CONTROL_WIRE_OK ||
+                ap_control_json_get_string(message, "session_epoch",
+                    &envelope_epoch, 64, 64) != AP_CONTROL_WIRE_OK ||
+                strcmp(envelope_ap_id, ap_id) ||
+                strcmp(envelope_epoch, session_epoch) ||
+                ap_control_json_get_int64(message, "sequence", 1, INT64_MAX,
+                    &sequence) != AP_CONTROL_WIRE_OK ||
+                sequence <= previous_sequence ||
+                !ac_peer_authorize(certificate_id, ap_id, peer, 1))
+                goto denied;
+            if (!strcmp(kind, "secret_job_poll"))
+                response = ac_secret_rotation_poll(ap_id, session_epoch,
+                                                   sequence);
+            else if (!strcmp(kind, "secret_job_prepare"))
+                response = ac_secret_rotation_prepare(message, ap_id,
+                                                       session_epoch, sequence);
+            else
+                response = ac_secret_rotation_commit(message, ap_id,
+                                                      session_epoch, sequence);
+            if (!response)
+                goto done;
+            if (ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS,
+                                          response) != AP_CONTROL_WIRE_OK) {
+                ac_secret_rotation_scrub_offer(response);
+                goto done;
+            }
+            ac_secret_rotation_scrub_offer(response);
+            previous_sequence = sequence;
+            json_object_put(message);
+            json_object_put(response);
+            message = NULL;
+            response = NULL;
+            continue;
+        }
+        if (((!strcmp(g_ac_wire_protocol, AC_TRANSPORT_PROTOCOL_V2) ||
+              !strcmp(g_ac_wire_protocol, AP_CONTROL_PROTOCOL_V3)) &&
              !strncmp(kind, "radio_job_", strlen("radio_job_"))) ||
+            ((!strcmp(g_ac_wire_protocol, AC_TRANSPORT_PROTOCOL_V2) ||
+              !strcmp(g_ac_wire_protocol, AP_CONTROL_PROTOCOL_V3)) &&
+             !strncmp(kind, "txpower_mode_", strlen("txpower_mode_"))) ||
             (!strcmp(g_ac_wire_protocol, AP_CONTROL_PROTOCOL_V3) &&
              write_capable &&
              !strncmp(kind, "config_job_", strlen("config_job_")))) {
@@ -2430,6 +2950,150 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
             response = NULL;
             continue;
         }
+        if (!strcmp(kind, "log_batch")) {
+            static const char *const fields[] = {
+                "protocol", "kind", "ap_id", "session_epoch", "sequence", "events"
+            };
+            const char *log_ap = NULL, *log_epoch = NULL;
+            struct json_object *events = json_object_object_get(message, "events");
+            struct json_object *stored, *value;
+            int persisted;
+            if (!logs_capable || ac_message_expect(message, fields, AC_ARRAY_SIZE(fields), "log_batch") != 0 ||
+                ap_control_json_get_string(message, "ap_id", &log_ap, 36, 36) != AP_CONTROL_WIRE_OK ||
+                strcmp(log_ap, ap_id) ||
+                ap_control_json_get_string(message, "session_epoch", &log_epoch, 64, 64) != AP_CONTROL_WIRE_OK ||
+                strcmp(log_epoch, session_epoch) ||
+                ap_control_json_get_int64(message, "sequence", 1, INT64_MAX, &sequence) != AP_CONTROL_WIRE_OK ||
+                sequence <= previous_sequence || !ap_log_batch_valid(events) ||
+                !ac_peer_authorize(certificate_id, ap_id, peer, 1)) goto denied;
+            /* ap_id is verified against this mTLS session, never taken on trust
+             * from the log record. The event DB follows the AC's data binding. */
+            stored = ap_log_rpc("ap_log_ingest", message);
+            value = stored ? json_object_object_get(stored, "persisted") : NULL;
+            persisted = value && json_object_is_type(value, json_type_boolean) && json_object_get_boolean(value);
+            response = ac_message_new("log_batch_ack");
+            ac_json_add_string(response, "ap_id", ap_id);
+            ac_json_add_string(response, "session_epoch", session_epoch);
+            ac_json_add_int64(response, "sequence", sequence);
+            json_object_object_add(response, "persisted", json_object_new_boolean(persisted));
+            ac_json_add_string(response, "error", persisted ? "" : "controller_log_unavailable");
+            json_object_put(stored);
+            previous_sequence = sequence;
+            if (ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS, response) != AP_CONTROL_WIRE_OK) goto done;
+            json_object_put(message); message = NULL;
+            json_object_put(response); response = NULL;
+            continue;
+        }
+        if (!strcmp(kind, "audit_event")) {
+            int64_t audit_sequence = 0;
+            int64_t audit_schema_version = 0;
+            int64_t occurred_at = 0;
+            char audit_ap_id[37] = {0};
+            char audit_epoch[65] = {0};
+            char event_id[37] = {0};
+            char actor[96] = {0};
+            char actor_session[129] = {0};
+            char source_ip[65] = {0};
+            char action[129] = {0};
+            char risk[16] = {0};
+            char target[513] = {0};
+            char result_value[65] = {0};
+            char failure_reason[257] = {0};
+            char request_id[65] = {0};
+            struct json_object *events = NULL;
+            struct json_object *event = NULL;
+
+            if (ac_message_expect(message, ac_fields_audit_event,
+                    AC_ARRAY_SIZE(ac_fields_audit_event),
+                    "audit_event") != 0 ||
+                ac_json_copy_string(message, "ap_id", audit_ap_id,
+                                    sizeof(audit_ap_id), 36, 36) != 0 ||
+                strcmp(audit_ap_id, ap_id) != 0 ||
+                ac_json_copy_string(message, "session_epoch", audit_epoch,
+                                    sizeof(audit_epoch), 64, 64) != 0 ||
+                strcmp(audit_epoch, session_epoch) != 0 ||
+                ap_control_json_get_int64(message, "sequence", 1, INT64_MAX,
+                                          &audit_sequence) != AP_CONTROL_WIRE_OK ||
+                audit_sequence <= previous_sequence ||
+                ap_control_json_get_int64(message, "schema_version", 1, 1,
+                                          &audit_schema_version) != AP_CONTROL_WIRE_OK ||
+                !json_object_object_get_ex(message, "events", &events) ||
+                !json_object_is_type(events, json_type_array) ||
+                json_object_array_length(events) != 1 ||
+                !ac_peer_authorize(certificate_id, ap_id, peer, 1))
+                goto denied;
+            event = json_object_array_get_idx(events, 0);
+            if (!event || !json_object_is_type(event, json_type_object) ||
+                ap_control_json_object_exact(event, ac_audit_event_fields,
+                    AC_ARRAY_SIZE(ac_audit_event_fields), ac_audit_event_fields,
+                    AC_ARRAY_SIZE(ac_audit_event_fields)) != AP_CONTROL_WIRE_OK ||
+                ac_json_copy_string(event, "event_id", event_id,
+                                    sizeof(event_id), 36, 36) != 0 ||
+                !ac_audit_uuid_valid(event_id) ||
+                ap_control_json_get_int64(event, "occurred_at", 1, INT64_MAX,
+                                          &occurred_at) != AP_CONTROL_WIRE_OK ||
+                ac_json_copy_string(event, "actor", actor, sizeof(actor),
+                                    1, 95) != 0 ||
+                ac_json_copy_string(event, "actor_session", actor_session,
+                                    sizeof(actor_session), 0, 128) != 0 ||
+                ac_json_copy_string(event, "source_ip", source_ip,
+                                    sizeof(source_ip), 0, 64) != 0 ||
+                ac_json_copy_string(event, "action", action, sizeof(action),
+                                    1, 128) != 0 ||
+                ac_json_copy_string(event, "risk", risk, sizeof(risk),
+                                    1, 15) != 0 ||
+                ac_json_copy_string(event, "target", target, sizeof(target),
+                                    1, 512) != 0 ||
+                ac_json_copy_string(event, "result", result_value,
+                                    sizeof(result_value), 6, 64) != 0 ||
+                (strcmp(result_value, "reserved") &&
+                 strcmp(result_value, "success") &&
+                 strcmp(result_value, "failed") &&
+                 strcmp(result_value, "denied")) ||
+                ac_json_copy_string(event, "failure_reason", failure_reason,
+                                    sizeof(failure_reason), 0, 256) != 0 ||
+                ac_json_copy_string(event, "request_id", request_id,
+                                    sizeof(request_id), 1, 64) != 0)
+                goto denied;
+            ac_db_enter();
+            if (ac_db_ap_audit_store(ap_id, event_id, occurred_at, audit_epoch,
+                    actor, actor_session, source_ip, action, risk, target,
+                    result_value, failure_reason, request_id,
+                    audit_schema_version) != 0) {
+                ac_db_leave();
+                ac_transport_log_stage("audit_rejected", "persist");
+                goto done;
+            }
+            ac_db_leave();
+
+            previous_sequence = audit_sequence;
+            json_object_put(message);
+            message = NULL;
+            response = ac_message_new("audit_event_ack");
+            if (!response ||
+                ac_json_add_string(response, "ap_id", ap_id) != 0 ||
+                ac_json_add_string(response, "session_epoch", session_epoch) != 0 ||
+                ac_json_add_int64(response, "sequence", audit_sequence) != 0 ||
+                ac_json_add_string(response, "event_id", event_id) != 0) {
+                goto done;
+            }
+            json_object_object_add(response, "accepted",
+                                   json_object_new_boolean(1));
+            json_object_object_add(response, "persisted",
+                                   json_object_new_boolean(1));
+            if (ap_control_json_object_exact(response, ac_fields_audit_event_ack,
+                    AC_ARRAY_SIZE(ac_fields_audit_event_ack),
+                    ac_fields_audit_event_ack,
+                    AC_ARRAY_SIZE(ac_fields_audit_event_ack)) !=
+                    AP_CONTROL_WIRE_OK ||
+                ap_control_ssl_write_json(ssl, AP_CONTROL_IO_TIMEOUT_MS,
+                                          response) != AP_CONTROL_WIRE_OK) {
+                goto done;
+            }
+            json_object_put(response);
+            response = NULL;
+            continue;
+        }
         if (strcmp(kind, "heartbeat") != 0 ||
             ac_message_expect(message, ac_fields_heartbeat,
                 AC_ARRAY_SIZE(ac_fields_heartbeat), "heartbeat") != 0 ||
@@ -2477,6 +3141,8 @@ static int ac_handle_session(SSL *ssl, struct json_object *hello,
 denied:
     ac_send_error(ssl, "session_denied", "certificate_not_authorized");
 done:
+    if (ap_id[0])
+        ac_secret_rotation_session_end(ap_id);
     if (ap_id[0] && session_epoch[0]) {
         ac_db_enter();
         (void)ac_db_ap_session_end(ap_id, session_epoch);
@@ -2499,7 +3165,9 @@ static void ac_connection_run(int fd)
     SSL *ssl = NULL;
 
     memset(&peer, 0, sizeof(peer));
+    pthread_mutex_lock(&g_ac_transport.lock);
     ssl = SSL_new(g_ac_transport.ssl_context);
+    pthread_mutex_unlock(&g_ac_transport.lock);
     if (!ssl) {
         ac_transport_log_stage("connection_rejected", "ssl_new");
         goto done;
@@ -2510,8 +3178,22 @@ static void ac_connection_run(int fd)
     }
     if (ap_control_ssl_handshake(ssl, 1, AP_CONTROL_IO_TIMEOUT_MS) !=
             AP_CONTROL_WIRE_OK) {
+        const char *hs_reason = ac_transport_handshake_reason(ssl);
+
         ac_transport_log_stage_reason("connection_rejected", "tls_handshake",
-                                      ac_transport_handshake_reason(ssl));
+                                      hs_reason);
+        /*
+         * Only our own certificate being outside its validity window is an
+         * operator-actionable transport fault -- it takes down every AP at once
+         * and looks like a network outage. A peer closing or failing its own
+         * handshake is routine churn and must not alert. The dedupe_key keys on
+         * the event (ap_id is not known yet at handshake time), so a reconnect
+         * storm folds to a single row and a single notify.
+         */
+        if (hs_reason && !strncmp(hs_reason, "server_certificate", 18))
+            ac_report_device_event("AC_TRANSPORT_ERROR", "error", NULL,
+                                   "tls_handshake", hs_reason,
+                                   "AP control TLS certificate invalid");
         goto done;
     }
     if (SSL_get_verify_result(ssl) != X509_V_OK) {
@@ -2826,11 +3508,32 @@ int ac_transport_start(void)
         ac_transport_set_reason("invalid_listen_port");
         return -1;
     }
-    if (ac_pki_init(&pki) != 0 ||
-        !(controller_id = ac_pki_controller_id(pki)) ||
+    if (ac_pki_init(&pki) != 0) {
+        /*
+         * Forward the PKI's own reason instead of collapsing every cause into
+         * "pki_init_failed". The supervisor restarts this process every few
+         * seconds, so the log line is the only diagnosis available in the
+         * field, and a directory mode problem needs a different response from a
+         * tampered key or an unsynced clock. The strings are literals owned by
+         * ac_pki.c, which is why storing the pointer is safe here.
+         */
+        ac_transport_set_reason(ac_pki_last_reason());
+        /*
+         * PKI init failing takes down every AP at once (no CA/server material
+         * means no TLS control plane), so it is an operator-actionable fault,
+         * not routine churn. No ap_id is known -- this is the aggregate init.
+         * Runs on the main thread before the workers are spawned.
+         */
+        ac_report_device_event("AC_PKI_ERROR", "error", NULL,
+                               "pki_init", ac_pki_last_reason(),
+                               "AP control PKI initialization failed");
+        ac_pki_free(pki);
+        return -1;
+    }
+    if (!(controller_id = ac_pki_controller_id(pki)) ||
         !ac_controller_id_valid(controller_id)) {
         ac_pki_free(pki);
-        ac_transport_set_reason("pki_init_failed");
+        ac_transport_set_reason("pki_controller_id_invalid");
         return -1;
     }
     context = ac_tls_context_new(pki);
@@ -2847,8 +3550,10 @@ int ac_transport_start(void)
         return -1;
     }
     signal(SIGPIPE, SIG_IGN);
-    pthread_mutex_lock(&g_ac_transport.lock);
+    pthread_mutex_lock(&g_ac_transport.pki_lock);
     g_ac_transport.pki = pki;
+    pthread_mutex_unlock(&g_ac_transport.pki_lock);
+    pthread_mutex_lock(&g_ac_transport.lock);
     g_ac_transport.ssl_context = context;
     g_ac_transport.listen_fd = listen_fd;
     g_ac_transport.port = actual_port;
@@ -2881,6 +3586,7 @@ int ac_transport_start(void)
     g_ac_transport.listening = 1;
     g_ac_transport.reason = "listening";
     pthread_mutex_unlock(&g_ac_transport.lock);
+    (void)ac_certificate_lifecycle_tick(g_ac_db);
     ac_transport_log("listening");
     return 0;
 
@@ -2892,8 +3598,10 @@ thread_fail:
     g_ac_transport.listen_fd = -1;
     g_ac_transport.port = 0;
     g_ac_transport.ssl_context = NULL;
-    g_ac_transport.pki = NULL;
     pthread_mutex_unlock(&g_ac_transport.lock);
+    pthread_mutex_lock(&g_ac_transport.pki_lock);
+    g_ac_transport.pki = NULL;
+    pthread_mutex_unlock(&g_ac_transport.pki_lock);
     SSL_CTX_free(context);
     ac_pki_free(pki);
     return -1;
@@ -2917,10 +3625,8 @@ void ac_transport_stop(void)
     pthread_mutex_lock(&g_ac_transport.lock);
     listen_fd = g_ac_transport.listen_fd;
     context = g_ac_transport.ssl_context;
-    pki = g_ac_transport.pki;
     g_ac_transport.listen_fd = -1;
     g_ac_transport.ssl_context = NULL;
-    g_ac_transport.pki = NULL;
     g_ac_transport.running = 0;
     g_ac_transport.listening = 0;
     g_ac_transport.stopping = 0;
@@ -2928,10 +3634,19 @@ void ac_transport_stop(void)
     g_ac_transport.port = 0;
     g_ac_transport.reason = "stopped";
     pthread_mutex_unlock(&g_ac_transport.lock);
+    pthread_mutex_lock(&g_ac_transport.pki_lock);
+    pki = g_ac_transport.pki;
+    g_ac_transport.pki = NULL;
+    pthread_mutex_unlock(&g_ac_transport.pki_lock);
     if (listen_fd >= 0)
         close(listen_fd);
     SSL_CTX_free(context);
     ac_pki_free(pki);
+    while (g_ac_transport.retired_pki) {
+        struct ac_retired_pki *retired = g_ac_transport.retired_pki;
+        g_ac_transport.retired_pki = retired->next;
+        ac_pki_free(retired->pki); free(retired);
+    }
     ac_transport_log("stopped");
 }
 
@@ -3022,4 +3737,37 @@ const char *ac_transport_controller_id(void)
     }
     pthread_mutex_unlock(&g_ac_transport.lock);
     return g_ac_transport_controller_id_copy;
+}
+
+int ac_transport_ca_pem(unsigned char **out, size_t *out_len)
+{
+    int rc = -1;
+
+    if (!out || !out_len)
+        return -1;
+    *out = NULL;
+    *out_len = 0;
+    pthread_mutex_lock(&g_ac_transport.pki_lock);
+    if (g_ac_transport.pki)
+        rc = ac_pki_ca_pem(g_ac_transport.pki, out, out_len);
+    pthread_mutex_unlock(&g_ac_transport.pki_lock);
+    return rc;
+}
+
+int ac_transport_bootstrap_ready(void)
+{
+    unsigned char *pem = NULL;
+    size_t pem_len = 0;
+    int ready;
+
+    pthread_mutex_lock(&g_ac_transport.lock);
+    ready = g_ac_transport.listening && g_ac_transport.port > 0 &&
+        g_ac_transport.controller_id[0] != '\0';
+    pthread_mutex_unlock(&g_ac_transport.lock);
+    if (!ready || ac_transport_ca_pem(&pem, &pem_len) != 0 || !pem_len) {
+        OPENSSL_free(pem);
+        return 0;
+    }
+    OPENSSL_clear_free(pem, pem_len);
+    return 1;
 }

@@ -913,7 +913,8 @@ int apd_db_init(void)
     }
     sqlite3_busy_timeout(g_apd_db, 5000);
     if (apd_exec("PRAGMA foreign_keys=ON") != 0 || apd_integrity_check() != 0 ||
-        apd_schema_migrate() != 0 || apd_identity_validate() != 0 ||
+        apd_schema_migrate() != 0 || apd_ble_db_init() != APD_BLE_DB_OK ||
+        apd_identity_validate() != 0 ||
         apd_pairing_validate() != 0 ||
         apd_validate_db_file(apd_db_path()) != 0) {
         fprintf(stderr, "[%s] identity database validation failed\n", APD_SERVICE_NAME);
